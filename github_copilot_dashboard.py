@@ -7,7 +7,7 @@ Cost model: the store records `total_nano_aiu` per request. Published model
 rates (e.g. Claude Opus 4.6: $5/M input, $6.25/M cache-write, $0.50/M cache-read,
 $25/M output) map to those values at 1e11 nano-AIU == 1 USD.
 
-Usage:  python copilot_cost_dashboard.py [--port 8787] [--db PATH]
+Usage:  python github_copilot_dashboard.py [--port 8787] [--db PATH]
 """
 
 import argparse
@@ -1608,7 +1608,7 @@ GitHub Copilot &mdash; daily digest</div>
 {"".join(parts)}
 <p style="margin:26px 0 0;font-size:11px;color:#8b949e;border-top:1px solid #e6e8eb;
 padding-top:10px">
-Generated locally by copilot_cost_dashboard.py. Rows marked EST are estimated from VS Code
+Generated locally by github_copilot_dashboard.py. Rows marked EST are estimated from VS Code
 transcripts; Copilot CLI figures are measured. Covers Copilot CLI on this machine and VS Code
 chat only &mdash; usage on github.com or other machines is not included.
 </p></div></body></html>"""

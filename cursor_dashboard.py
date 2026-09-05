@@ -1,0 +1,5204 @@
+"""Refreshable local Cursor chat cost dashboard.
+
+Reads Cursor's billed usage events (same metering as cursor.com/dashboard) using
+the IDE's logged-in session, then joins them to local chat titles and repos.
+
+Costs are Cursor's own `tokenUsage.totalCents` / `chargedCents` figures:
+included plan usage plus on-demand overage. Subscription invoices (Pro / Pro+
+monthly fee) are listed separately and are not model usage.
+
+Usage:  python cursor_dashboard.py [--port 8787] [--db PATH]
+
+A daily digest emails the signed-in Cursor license address on the first refresh
+of each day via the Gmail API (override with --email-to / --no-digest).
+"""
+
+import argparse
+import base64
+import collections
+import datetime
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
+
+CHARS_PER_TOKEN = 4
+CONTEXT_WINDOW_TOKENS = 200_000
+MIN_DAY, MAX_DAY = "0000-01-01", "9999-12-31"
+DEFAULT_BUDGET = 70.0  # USD, Pro Plus included usage; overridden by the billing API when available
+
+# (input, output, cache_read) USD per 1M tokens. Aliases are normalized separately.
+MODEL_RATES = {
+    "auto": (1.25, 6.00, 0.25),
+    "default": (1.25, 6.00, 0.25),
+    "composer-1.5": (3.50, 17.50, 0.35),
+    "composer-2": (0.50, 2.50, 0.20),
+    "composer-2-fast": (1.50, 7.50, 0.35),
+    "composer-2.5": (0.50, 2.50, 0.20),
+    "composer-2.5-fast": (1.50, 7.50, 0.35),
+    "claude-4-sonnet": (3.00, 15.00, 0.30),
+    "claude-4.5-sonnet": (3.00, 15.00, 0.30),
+    "claude-4.5-sonnet-thinking": (3.00, 15.00, 0.30),
+    "claude-4.6-sonnet": (3.00, 15.00, 0.30),
+    "claude-sonnet-4.6": (3.00, 15.00, 0.30),
+    "claude-sonnet-5": (3.00, 15.00, 0.30),
+    "claude-4.6-opus": (5.00, 25.00, 0.50),
+    "claude-opus-4.6": (5.00, 25.00, 0.50),
+    "claude-opus-5": (5.00, 25.00, 0.50),
+    "claude-opus-5-thinking": (5.00, 25.00, 0.50),
+    "claude-opus-5-thinking-high": (5.00, 25.00, 0.50),
+    "claude-haiku-4.5": (1.00, 5.00, 0.10),
+    "grok-4.5": (1.25, 6.00, 0.25),
+    "grok-4.6": (1.25, 6.00, 0.25),
+    "gpt-5": (1.25, 10.00, 0.125),
+    "gpt-4.1": (2.00, 8.00, 0.50),
+}
+RATE_DEFAULT = MODEL_RATES["auto"]
+
+
+def _cursor_user_dir():
+    home = os.path.expanduser("~")
+    appdata = os.environ.get("APPDATA")
+    candidates = []
+    if appdata:
+        candidates.append(os.path.join(appdata, "Cursor", "User"))
+    candidates += [
+        os.path.join(home, "Library", "Application Support", "Cursor", "User"),
+        os.path.join(home, ".config", "Cursor", "User"),
+    ]
+    for path in candidates:
+        if os.path.isdir(os.path.join(path, "globalStorage")):
+            return path
+    return candidates[0]
+
+
+def _default_db():
+    return os.path.join(_cursor_user_dir(), "globalStorage", "state.vscdb")
+
+
+DEFAULT_DB = _default_db()
+
+# --- Jira linking -----------------------------------------------------------
+JIRA_BASE_DEFAULT = os.environ.get("CURSOR_DASH_JIRA_BASE") or os.environ.get("COPILOT_DASH_JIRA_BASE", "")
+JIRA_KEY_ALLOW = {k.strip().upper()
+                  for k in (os.environ.get("CURSOR_DASH_JIRA_KEYS")
+                            or os.environ.get("COPILOT_DASH_JIRA_KEYS", "")).split(",")
+                  if k.strip()}
+JIRA_KEY_DENY = {"UTF", "CVE", "ISO", "RFC", "SHA", "AES", "RSA", "GPT", "API", "UTC",
+                 "TLS", "SSL", "HTTP", "SQL", "JSON", "YAML", "BASE", "X", "IPV", "MD",
+                 "ISO8601", "SOC", "PCI", "AD", "V", "PY", "NET", "SP", "EC", "AMD",
+                 "ARM", "GB", "MB", "KB", "TB", "US", "EU", "UK", "ID", "IPV4", "IPV6"}
+GH_RESERVED = {"settings", "orgs", "apps", "features", "marketplace", "repos", "enterprises",
+               "notifications", "pulls", "issues", "search", "topics", "sponsors", "users",
+               "collections", "codespaces", "login", "join", "about", "blog", "site",
+               "rest", "api", "raw", "gist", "www", "graphql", "assets", "avatars"}
+
+
+def _float_env(name, default=0.0):
+    raw = os.environ.get(name, "").replace(",", "").replace("_", "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
+def _int_env(name, default=0):
+    return int(_float_env(name, default))
+
+
+CREDIT_BUDGET = _float_env("CURSOR_DASH_BUDGET") or _float_env("COPILOT_DASH_AI_CREDITS")
+_BUDGET_OVERRIDDEN = False
+
+# --- Daily digest email -----------------------------------------------------
+# Default recipient is the signed-in Cursor license email. --email-to and
+# CURSOR_DASH_EMAIL_TO override it; --no-digest turns the feature off.
+# Delivery is the Gmail API (OAuth), not SMTP.
+EMAIL_TO = os.environ.get("CURSOR_DASH_EMAIL_TO", "")
+EMAIL_FROM = os.environ.get("CURSOR_DASH_EMAIL_FROM") or os.environ.get("COPILOT_DASH_EMAIL_FROM", "")
+GMAIL_CREDENTIALS = os.environ.get("CURSOR_DASH_GMAIL_CREDENTIALS", "")
+GMAIL_TOKEN_PATH = os.environ.get("CURSOR_DASH_GMAIL_TOKEN", "")
+GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+# Remembers which day's digest already went out, so a refresh only mails once.
+# Kept beside the Cursor store rather than in the repo: it is per-machine state.
+STATE_PATH = os.path.join(os.path.dirname(DEFAULT_DB), "cost-dashboard-state.json")
+DIGEST_LOCK = threading.Lock()
+DIGEST_STATUS = {"last_error": "", "sending": False}
+DIGEST_LOOKBACK_DAYS = 60
+DIGEST_AVG_DAYS = 7
+SCAN_LOCK = threading.Lock()
+API_ENABLED = True
+# Local bubble rows per composer — head+tail by time keeps refs/titles without full scans.
+BUBBLE_CAP_PER_COMPOSER = 300
+BUBBLE_HEAD_PER_COMPOSER = 150
+BUBBLE_TAIL_PER_COMPOSER = 150
+_BILLING_CACHE = {"at": 0, "data": None, "turns": {}}
+
+DB_PATH = DEFAULT_DB
+JIRA_BASE = JIRA_BASE_DEFAULT
+
+
+def connect(path=None):
+    path = path or DB_PATH
+    uri = "file:{}?mode=ro".format(path.replace("?", "%3f").replace("#", "%23"))
+    con = sqlite3.connect(uri, uri=True, timeout=15)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _loads(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+    return raw
+
+
+def _norm_model(model_id):
+    m = (model_id or "").split("/")[-1].strip().lower().replace(" ", "-")
+    return m or "auto"
+
+
+def _rates(model):
+    m = _norm_model(model)
+    if m in MODEL_RATES:
+        return MODEL_RATES[m]
+    for suffix in ("-thinking-high", "-thinking", "-max"):
+        if m.endswith(suffix):
+            base = m[: -len(suffix)]
+            if base in MODEL_RATES:
+                return MODEL_RATES[base]
+    return RATE_DEFAULT
+
+
+def _known_rate(model):
+    m = _norm_model(model)
+    if m in MODEL_RATES:
+        return True
+    for suffix in ("-thinking-high", "-thinking", "-max"):
+        if m.endswith(suffix) and m[: -len(suffix)] in MODEL_RATES:
+            return True
+    return False
+
+
+def _local_day(value):
+    """Bucket a Cursor timestamp onto the user's local calendar date."""
+    if not value:
+        return ""
+    try:
+        if isinstance(value, (int, float)) or (isinstance(value, str) and str(value).strip().isdigit()):
+            n = int(value)
+            # Cursor usage events are ms; some invoice fields are unix seconds.
+            dt = datetime.datetime.fromtimestamp(n / 1000.0 if n >= 10**12 else n)
+            return dt.strftime("%Y-%m-%d")
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return str(value)[:10]
+
+
+def _cost(t_in, t_out, t_cache, model):
+    rate_in, rate_out, rate_cache = _rates(model)
+    return (t_in * rate_in + t_out * rate_out + t_cache * rate_cache) / 1e6
+
+
+def _workspace_map():
+    """workspaceStorage/<id> -> friendly folder / workspace name."""
+    root = os.path.join(_cursor_user_dir(), "workspaceStorage")
+    out = {}
+    if not os.path.isdir(root):
+        return out
+    for name in os.listdir(root):
+        meta_path = os.path.join(root, name, "workspace.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except Exception:
+            continue
+        uri = unquote(meta.get("folder") or meta.get("workspace") or "")
+        if uri.startswith("file:///"):
+            uri = uri[8:]
+            if re.match(r"^/[A-Za-z]:", uri):
+                uri = uri[1:]
+            uri = uri.replace("/", os.sep)
+        out[name] = os.path.basename(uri.rstrip("\\/")) if uri else name
+    return out
+
+
+def _repo_from_path(path):
+    if not path:
+        return ""
+    base = os.path.basename(str(path).rstrip("\\/"))
+    if base.endswith(".code-workspace"):
+        return base
+    return base
+
+
+def _normalize_fs_path(path):
+    """Cursor stores fsPath as /c:/Users/... on Windows — normalize for open()."""
+    if not path:
+        return ""
+    p = str(path).strip()
+    if p.startswith("file:///"):
+        p = p[8:]
+    if re.match(r"^/[A-Za-z]:", p):
+        p = p[1:]
+    return p.replace("/", os.sep)
+
+
+def _parse_workspace_folders(workspace_path):
+    """Folder names from a .code-workspace file (multi-root workspace)."""
+    path = _normalize_fs_path(workspace_path)
+    if not path or not path.endswith(".code-workspace"):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    out = []
+    for folder in data.get("folders") or []:
+        if not isinstance(folder, dict):
+            continue
+        name = (folder.get("name") or "").strip()
+        if not name:
+            name = _repo_from_path(folder.get("path"))
+        if name and not name.endswith(".code-workspace"):
+            out.append(name)
+    return out
+
+
+def _tracked_folders_from_meta(meta_row):
+    """Local folder names from Cursor composer trackedGitRepos."""
+    if not meta_row:
+        return []
+    folders = list(meta_row.get("tracked_repos") or [])
+    if folders:
+        return folders
+    ws_path = meta_row.get("workspace_path") or ""
+    if _normalize_fs_path(ws_path).endswith(".code-workspace"):
+        return _parse_workspace_folders(ws_path)
+    repo = (meta_row.get("repository") or "").strip()
+    if repo and not repo.endswith(".code-workspace"):
+        return [repo]
+    return []
+
+
+def _known_repo_map(refs):
+    known = {}
+    for r in (refs or {}).values():
+        for it in (r or {}).get("repos") or []:
+            name = it.get("name") or ""
+            if "/" in name:
+                known[name.split("/")[-1].lower()] = name
+    return known
+
+
+def _github_owner_hint(refs):
+    counts = collections.Counter()
+    for r in (refs or {}).values():
+        for it in (r or {}).get("repos") or []:
+            name = it.get("name") or ""
+            if "/" in name:
+                counts[name.split("/")[0]] += 1
+    return counts.most_common(1)[0][0] if counts else ""
+
+
+def _canonical_repo_name(folder, known, owner_hint):
+    folder = (folder or "").strip()
+    if not folder or folder.endswith(".code-workspace"):
+        return ""
+    if "/" in folder:
+        return folder
+    hit = known.get(folder.lower())
+    if hit:
+        return hit
+    if owner_hint:
+        return f"{owner_hint}/{folder}"
+    return folder
+
+
+_REPO_FIRST_TS = {}
+
+
+def _repo_first_commit_ts(repo_path):
+    """Unix seconds of the earliest commit, or None if unknown / not a git repo."""
+    if not repo_path:
+        return None
+    if repo_path in _REPO_FIRST_TS:
+        return _REPO_FIRST_TS[repo_path]
+    ts = None
+    git_dir = os.path.join(repo_path, ".git")
+    if os.path.isdir(git_dir):
+        try:
+            r = subprocess.run(
+                ["git", "-C", repo_path, "log", "--reverse", "--format=%at", "-1"],
+                capture_output=True, text=True, timeout=15, check=False)
+            line = (r.stdout or "").strip().splitlines()
+            if line:
+                ts = int(line[0])
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            ts = None
+    _REPO_FIRST_TS[repo_path] = ts
+    return ts
+
+
+def _session_end_ts(session):
+    """End of the session's last active calendar day (local time)."""
+    last = session.get("last_day") or session.get("first_day") or ""
+    if not last:
+        return None
+    try:
+        d = datetime.datetime.strptime(last[:10], "%Y-%m-%d")
+        return int(d.replace(hour=23, minute=59, second=59).timestamp())
+    except ValueError:
+        return None
+
+
+def _paths_for_workspace_folders(row, ws_path):
+    """Folder basename -> absolute path from tracked paths and workspace file."""
+    paths = {}
+    for p in row.get("tracked_repo_paths") or []:
+        np = _normalize_fs_path(p)
+        if np:
+            paths[_repo_from_path(np)] = np
+    nws = _normalize_fs_path(ws_path)
+    if nws.endswith(".code-workspace"):
+        for fp in _parse_workspace_repo_paths(nws):
+            paths[_repo_from_path(fp)] = fp
+    return paths
+
+
+def _repo_existed_at(path, ts):
+    """True if repo had at least one commit on or before unix ts."""
+    if not path or not ts:
+        return bool(path)
+    first = _repo_first_commit_ts(path)
+    if first is None:
+        return not os.path.isdir(os.path.join(path, ".git"))
+    return first <= ts
+
+
+def _filter_folders_by_repo_age(folders, paths_by_folder, session_end_ts):
+    """Exclude repos that did not exist yet when the session ended."""
+    if not session_end_ts or not folders:
+        return folders
+    kept = []
+    for folder in folders:
+        path = paths_by_folder.get(folder) or paths_by_folder.get(_repo_from_path(folder))
+        if not path:
+            kept.append(folder)
+            continue
+        if not _repo_existed_at(path, session_end_ts):
+            continue
+        kept.append(folder)
+    return kept
+
+
+def _github_path_map(git_repos=None, meta=None):
+    m = {}
+    for r in git_repos or _discover_git_repos(meta or {}):
+        gh, path = r.get("github"), r.get("path")
+        if gh and path:
+            m[gh] = path
+    return m
+
+
+def _filter_session_refs_by_repo_age(session, refs_entry, path_by_github):
+    """Drop repo/PR refs for repos that did not exist when the session ended."""
+    if not refs_entry or not path_by_github:
+        return refs_entry
+    end_ts = _session_end_ts(session)
+    if not end_ts:
+        return refs_entry
+
+    def _existed(github_name):
+        path = path_by_github.get(github_name or "")
+        if not path:
+            return True
+        return _repo_existed_at(path, end_ts)
+
+    refs_entry["repos"] = [
+        r for r in (refs_entry.get("repos") or []) if _existed(r.get("name"))]
+    refs_entry["prs"] = [
+        p for p in (refs_entry.get("prs") or [])
+        if _existed(p.get("repo") or (p.get("key") or "").split("#")[0])]
+    return refs_entry
+
+
+def _sync_session_repo_labels(session, refs_entry):
+    """Refresh repository / repo_split after refs were filtered."""
+    weights = session.get("repo_weights") or {}
+    if weights:
+        primary = [name for name, w in weights.items() if w > 0]
+    else:
+        primary = [r["name"] for r in (refs_entry.get("repos") or [])
+                   if r.get("role") in ("primary", "inferred")]
+    if not primary:
+        return
+    if len(primary) == 1:
+        session["repository"] = primary[0]
+        session["workspace"] = primary[0]
+        session["repo_split"] = 0
+    else:
+        short = [n.split("/")[-1] for n in primary]
+        session["repository"] = " · ".join(short[:5]) + (
+            f" +{len(short) - 5}" if len(short) > 5 else "")
+        session["repo_split"] = len(primary)
+
+
+def _session_time_bounds(session, priced_all=None):
+    sid = session.get("session_id")
+    turns = (priced_all or {}).get(sid) or []
+    ts_list = [_parse_turn_ts(t.get("started_at")) for t in turns]
+    ts_list = [t for t in ts_list if t is not None]
+    if ts_list:
+        return min(ts_list), max(ts_list)
+    start = session.get("first_day") or ""
+    end = session.get("last_day") or start
+    if not start:
+        return None, None
+    try:
+        d0 = datetime.datetime.strptime(start[:10], "%Y-%m-%d")
+        d1 = datetime.datetime.strptime(end[:10], "%Y-%m-%d")
+        return (int(d0.replace(hour=0, minute=0, second=0).timestamp()),
+                int(d1.replace(hour=23, minute=59, second=59).timestamp()))
+    except ValueError:
+        return None, None
+
+
+def _activity_date_bounds(sessions, billing_events=None):
+    days = list(_billing_event_days(billing_events or []))
+    for s in sessions:
+        for key in ("first_day", "last_day"):
+            d = (s.get(key) or "")[:10]
+            if d:
+                days.append(d)
+    if not days:
+        return MIN_DAY, MAX_DAY
+    return min(days), max(days)
+
+
+def _git_weights_for_repos(session, repo_names, path_by_github, activities,
+                           priced_all=None, window=None):
+    """Weight repos by nearby git commits during this session (turn-level when possible)."""
+    if not activities or not repo_names:
+        return {}
+    if window is None:
+        window = GIT_CORR_WINDOW
+    names = set(repo_names)
+    weights = collections.Counter()
+    sid = session.get("session_id")
+    turns = (priced_all or {}).get(sid) or []
+
+    if turns:
+        for turn in turns:
+            ts = _parse_turn_ts(turn.get("started_at"))
+            if ts is None:
+                continue
+            mass = turn.get("cost_usd") or 1.0
+            best_per_repo = {}
+            for act in activities:
+                repo = act.get("repo")
+                if repo not in names:
+                    continue
+                repo_path = act.get("repo_path") or path_by_github.get(repo, "")
+                if repo_path and not _repo_existed_at(repo_path, ts):
+                    continue
+                dist = abs(act["ts"] - ts)
+                if dist > window:
+                    continue
+                prev = best_per_repo.get(repo)
+                if not prev or dist < prev[0]:
+                    best_per_repo[repo] = (dist, act)
+            if not best_per_repo:
+                continue
+            w_map = {repo: 1.0 / (dist + 300.0) for repo, (dist, _) in best_per_repo.items()}
+            total = sum(w_map.values()) or 1.0
+            for repo, w in w_map.items():
+                weights[repo] += mass * (w / total)
+    else:
+        t0, t1 = _session_time_bounds(session, priced_all)
+        if t0 is None:
+            return {}
+        for act in activities:
+            repo = act.get("repo")
+            if repo not in names:
+                continue
+            if t0 - window <= act["ts"] <= t1 + window:
+                weights[repo] += 1.0
+
+    if not weights:
+        return {}
+    total = sum(weights.values())
+    return {k: v / total for k, v in weights.items()}
+
+
+def _repo_has_session_activity(repo_name, session, priced_all, activities,
+                               path_by_github, window=None):
+    """True if repo had a commit/merge PR within ±window of a session turn (or in session dates)."""
+    if not activities or not repo_name:
+        return False
+    if window is None:
+        window = GIT_CORR_WINDOW
+    sid = session.get("session_id")
+    turns = (priced_all or {}).get(sid) or []
+    if turns:
+        for turn in turns:
+            ts = _parse_turn_ts(turn.get("started_at"))
+            if ts is None:
+                continue
+            repo_path = path_by_github.get(repo_name, "")
+            if repo_path and not _repo_existed_at(repo_path, ts):
+                continue
+            for act in activities:
+                if act.get("repo") != repo_name:
+                    continue
+                if abs(act["ts"] - ts) <= window:
+                    return True
+        return False
+    t0, t1 = _session_time_bounds(session, priced_all)
+    if t0 is None:
+        return False
+    for act in activities:
+        if act.get("repo") != repo_name:
+            continue
+        if t0 - window <= act["ts"] <= t1 + window:
+            return True
+    return False
+
+
+def _pr_has_session_activity(pr_key, session, priced_all, activities,
+                             path_by_github, window=None):
+    """True if a merge/PR commit for pr_key fell within ±window of a session turn."""
+    if not pr_key or not activities:
+        return False
+    if window is None:
+        window = GIT_CORR_WINDOW
+    repo = pr_key.split("#", 1)[0]
+    sid = session.get("session_id")
+    turns = (priced_all or {}).get(sid) or []
+    if turns:
+        for turn in turns:
+            ts = _parse_turn_ts(turn.get("started_at"))
+            if ts is None:
+                continue
+            repo_path = path_by_github.get(repo, "")
+            if repo_path and not _repo_existed_at(repo_path, ts):
+                continue
+            for act in activities:
+                if act.get("pr") != pr_key:
+                    continue
+                if abs(act["ts"] - ts) <= window:
+                    return True
+        return False
+    t0, t1 = _session_time_bounds(session, priced_all)
+    if t0 is None:
+        return False
+    for act in activities:
+        if act.get("pr") != pr_key:
+            continue
+        if t0 - window <= act["ts"] <= t1 + window:
+            return True
+    return False
+
+
+def _turn_pr_git_costs(ts, cost, activities, window, path_by_github):
+    """Per-PR turn cost shares from nearby merge commits (same weighting as repos)."""
+    if ts is None or not cost or not activities:
+        return {}
+    best_per_pr = {}
+    for act in activities:
+        if not act.get("pr"):
+            continue
+        repo_path = act.get("repo_path") or path_by_github.get(act.get("repo") or "", "")
+        if repo_path and not _repo_existed_at(repo_path, ts):
+            continue
+        dist = abs(act["ts"] - ts)
+        if dist > window:
+            continue
+        pk = act["pr"]
+        prev = best_per_pr.get(pk)
+        if not prev or dist < prev[0]:
+            best_per_pr[pk] = (dist, act)
+    if not best_per_pr:
+        return {}
+    weights = {pk: 1.0 / (dist + 300.0) for pk, (dist, _act) in best_per_pr.items()}
+    total_w = sum(weights.values()) or 1.0
+    return {pk: cost * (w / total_w) for pk, w in weights.items()}
+
+
+def _pr_text_turn_costs(sid, items, turn_prs, turn_cost):
+    """Turn-segment costs when a PR is mentioned in that turn's transcript."""
+    anchors = sorted((turn_prs or {}).get(sid) or [])
+    if not anchors:
+        return {}
+    billable = {p["key"] for p in items
+                if not p.get("inferred") and p.get("role") != "skipped"}
+    costs_map = (turn_cost or {}).get(sid) or {}
+    out = collections.Counter()
+    prev = -1
+    for a in anchors:
+        seg = [t for t in costs_map if prev < t <= a]
+        prev = a
+        keys = turn_prs[sid][a]
+        seg_cost = sum(costs_map[t][0] for t in seg)
+        if seg_cost <= 0:
+            continue
+        mentioned = [k for k in keys if k in billable]
+        if not mentioned:
+            continue
+        share = seg_cost / len(mentioned)
+        for k in mentioned:
+            out[k] += share
+    return dict(out)
+
+
+def _pr_cost_entries(session, refs_entry, turn_prs=None, turn_cost=None):
+    """Return [(pr_item, cost_usd)] from turn text, git merge correlation, or both."""
+    items = [p for p in (refs_entry.get("prs") or []) if p.get("role") != "skipped"]
+    if not items:
+        return []
+
+    sid = session.get("session_id")
+    gc_prs = {
+        p["key"]: p.get("cost_usd") or 0
+        for p in (session.get("git_correlation") or {}).get("prs") or []
+    }
+    git_costs = session.get("pr_turn_costs") or {}
+    text_costs = _pr_text_turn_costs(sid, items, turn_prs, turn_cost)
+    out = []
+    seen = set()
+    for p in items:
+        k = p.get("key")
+        if not k or k in seen:
+            continue
+        if p.get("inferred"):
+            abs_cost = gc_prs.get(k) or git_costs.get(k) or 0
+        else:
+            abs_cost = text_costs.get(k) or gc_prs.get(k) or git_costs.get(k) or 0
+        if abs_cost <= 0:
+            continue
+        out.append((p, abs_cost))
+        seen.add(k)
+    return out
+
+
+def _apply_git_activity_gate(sessions, refs, priced_all, activities, path_by_github):
+    """Drop repo attribution when the repo had no commits/PRs during the session."""
+    if not activities:
+        return
+    for s in sessions:
+        sid = s["session_id"]
+        r = refs.get(sid)
+        if not r:
+            continue
+        kept = []
+        for x in r.get("repos") or []:
+            role = x.get("role")
+            if role not in ("primary", "inferred"):
+                kept.append(x)
+                continue
+            name = x.get("name") or ""
+            if _repo_has_session_activity(
+                    name, s, priced_all, activities, path_by_github):
+                kept.append(x)
+            else:
+                kept.append({**x, "role": "shared-skipped"})
+        r["repos"] = kept
+        weights = s.get("repo_weights") or {}
+        if weights:
+            active = {x.get("name") for x in kept
+                      if x.get("role") in ("primary", "inferred")}
+            weights = {k: v for k, v in weights.items() if k in active}
+            if weights:
+                total = sum(weights.values()) or 1.0
+                s["repo_weights"] = {k: v / total for k, v in weights.items()}
+            else:
+                s["repo_weights"] = {}
+        billable = [x for x in kept if x.get("role") in ("primary", "inferred")]
+        if not billable:
+            s.pop("shared_attribution", None)
+            s["repository"] = ""
+            s["workspace"] = ""
+            s["repo_split"] = 0
+        else:
+            _sync_session_repo_labels(s, r)
+
+        kept_prs = []
+        for p in r.get("prs") or []:
+            pk = p.get("key") or ""
+            repo = p.get("repo") or (pk.split("#")[0] if pk else "")
+            if p.get("inferred"):
+                if _pr_has_session_activity(
+                        pk, s, priced_all, activities, path_by_github):
+                    kept_prs.append(p)
+                continue
+            if (_pr_has_session_activity(pk, s, priced_all, activities, path_by_github)
+                    or _repo_has_session_activity(
+                        repo, s, priced_all, activities, path_by_github)):
+                kept_prs.append(p)
+            else:
+                kept_prs.append({**p, "role": "skipped"})
+        r["prs"] = kept_prs
+
+
+def _apply_git_pr_discovery(sessions, refs, priced_all, activities, path_by_github):
+    """Discover PRs from merge commits near billed turns; add to refs + pr_turn_costs."""
+    if not activities:
+        return
+    for s in sessions:
+        sid = s["session_id"]
+        if sid == "_unattributed":
+            continue
+        turns = (priced_all or {}).get(sid) or []
+        if not turns:
+            continue
+        costs = collections.Counter()
+        for turn in turns:
+            ts = _parse_turn_ts(turn.get("started_at"))
+            cost = turn.get("cost_usd") or 0
+            for pk, share in _turn_pr_git_costs(
+                    ts, cost, activities, GIT_CORR_WINDOW, path_by_github).items():
+                costs[pk] += share
+        gc = s.get("git_correlation") or {}
+        for gp in gc.get("prs") or []:
+            pk = gp.get("key")
+            c = gp.get("cost_usd") or 0
+            if pk and c > 0:
+                costs[pk] += c
+        if not costs:
+            continue
+        r = refs.setdefault(sid, {"jira": [], "prs": [], "repos": []})
+        existing = {p["key"]: dict(p) for p in r.get("prs") or []}
+        for pk, pcost in costs.items():
+            if pcost <= 0:
+                continue
+            if pk not in existing:
+                existing[pk] = {
+                    "key": pk, "repo": pk.split("#")[0],
+                    "number": int(pk.split("#")[1]),
+                    "created": False, "inferred": True,
+                }
+            elif not existing[pk].get("created"):
+                existing[pk]["inferred"] = True
+        r["prs"] = sorted(existing.values(), key=lambda p: (p["repo"], p["number"]))
+        refs[sid] = r
+        s["pr_turn_costs"] = {k: round(v, 4) for k, v in costs.items() if v > 0}
+
+
+def _apply_git_weighted_shared_repos(sessions, refs, priced_all, activities, path_by_github):
+    """Replace equal multi-root splits with git-activity-weighted attribution."""
+    if not activities:
+        return
+    for s in sessions:
+        sid = s["session_id"]
+        r = refs.get(sid)
+        if not r:
+            continue
+        primaries = [x["name"] for x in r.get("repos", []) if x.get("role") == "primary"]
+        if len(primaries) <= 1 and not (s.get("repo_split") or 0) > 1:
+            continue
+
+        weights = _git_weights_for_repos(
+            s, primaries, path_by_github, activities, priced_all)
+        if not weights:
+            s["repo_weights"] = {}
+            s["shared_attribution"] = "unconfirmed"
+            for x in r.get("repos", []):
+                if x.get("role") == "primary":
+                    x["role"] = "shared-unconfirmed"
+            continue
+
+        s["repo_weights"] = {k: round(v, 6) for k, v in weights.items()}
+        s["shared_attribution"] = "git-weighted"
+        for x in r.get("repos", []):
+            name = x.get("name") or ""
+            w = weights.get(name, 0.0)
+            if x.get("role") == "primary":
+                if w > 0:
+                    x["role"] = "primary"
+                    x["weight"] = round(w, 4)
+                else:
+                    x["role"] = "shared-skipped"
+        _sync_session_repo_labels(s, r)
+
+
+def _repo_cost_shares(session, refs_entry):
+    """Return [(repo_item, fraction)] for rollup cost allocation."""
+    items = refs_entry.get("repos") or []
+    if not items:
+        return []
+    weights = session.get("repo_weights") or {}
+    if weights:
+        alloc = [(it, weights.get(it.get("name") or "", 0.0))
+                 for it in items if weights.get(it.get("name") or "", 0.0) > 0]
+        if alloc:
+            total = sum(w for _, w in alloc) or 1.0
+            return [(it, w / total) for it, w in alloc]
+        return []
+    billable = [it for it in items
+                if it.get("role") in ("primary", "inferred")
+                and it.get("role") not in ("shared-skipped", "shared-unconfirmed")]
+    if not billable:
+        return []
+    if len(billable) == 1:
+        return [(billable[0], 1.0)]
+    share = 1.0 / len(billable)
+    return [(it, share) for it in billable]
+
+
+def _apply_repo_age_filters(sessions, refs, path_by_github):
+    """Final pass: strip impossible repo refs and fix session labels."""
+    for s in sessions:
+        sid = s["session_id"]
+        r = refs.get(sid)
+        if not r:
+            continue
+        _filter_session_refs_by_repo_age(s, r, path_by_github)
+        _sync_session_repo_labels(s, r)
+        s["refs"] = r
+        refs[sid] = r
+
+
+def _attach_tracked_repos(sessions, meta, refs):
+    """Attribute sessions to trackedGitRepos; multi-root splits refined by git activity later."""
+    known = _known_repo_map(refs)
+    owner = _github_owner_hint(refs)
+
+    for s in sessions:
+        sid = s["session_id"]
+        m = meta.get(sid) or {}
+        row = {
+            **m,
+            "tracked_repos": s.get("tracked_repos") or m.get("tracked_repos"),
+            "workspace_path": s.get("workspace_path") or m.get("workspace_path") or "",
+            "repository": s.get("repository") or m.get("repository") or "",
+        }
+        folders = _tracked_folders_from_meta(row)
+        ws_path = row.get("workspace_path") or ""
+        paths_by_folder = _paths_for_workspace_folders(row, ws_path)
+        session_end_ts = _session_end_ts(s)
+        folders = _filter_folders_by_repo_age(folders, paths_by_folder, session_end_ts)
+        multi = len(folders) > 1 or _normalize_fs_path(ws_path).endswith(".code-workspace") or (
+            (s.get("repository") or "").endswith(".code-workspace"))
+        names = []
+        for folder in folders:
+            cn = _canonical_repo_name(folder, known, owner)
+            if cn and cn not in names:
+                names.append(cn)
+        if not names:
+            continue
+
+        r = refs.get(sid) or {"jira": [], "prs": [], "repos": []}
+        merged = {x["name"]: x.get("role") or "mentioned" for x in r.get("repos") or []}
+        for name in names:
+            if name not in merged:
+                merged[name] = "primary"
+            elif multi and merged[name] == "mentioned":
+                merged[name] = "primary"
+        r["repos"] = sorted(
+            ({"name": k, "role": v} for k, v in merged.items()),
+            key=lambda x: (x["role"] != "primary", x["name"]))
+        refs[sid] = r
+
+        if len(names) == 1:
+            s["repository"] = names[0]
+            s["workspace"] = names[0]
+        else:
+            short = [n.split("/")[-1] for n in names]
+            s["repository"] = " · ".join(short[:5]) + (f" +{len(short) - 5}" if len(short) > 5 else "")
+            s["workspace"] = _repo_from_path(_normalize_fs_path(ws_path)) if _normalize_fs_path(ws_path).endswith(".code-workspace") else s["repository"]
+        s["tracked_repos"] = folders
+        s["repo_split"] = len(names) if len(names) > 1 else 0
+
+
+# --------------------------------------------------------------------------
+# Git activity correlation for billing-only sessions (no local chat / no ID).
+# --------------------------------------------------------------------------
+
+GIT_CORR_WINDOW = 8 * 3600  # seconds — match billed turns to nearby commits
+_GIT_CACHE = {}
+RE_MERGE_PR = re.compile(r"Merge pull request #(\d+)", re.I)
+RE_GH_REMOTE = re.compile(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", re.I)
+COMMON_WORKSPACE_NAMES = ("mwtorq.code-workspace",)
+
+
+def _parse_workspace_repo_paths(workspace_path):
+    """Absolute local paths for each folder in a .code-workspace file."""
+    path = _normalize_fs_path(workspace_path)
+    if not path or not path.endswith(".code-workspace"):
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+    base = os.path.dirname(path)
+    out = []
+    for folder in data.get("folders") or []:
+        if not isinstance(folder, dict):
+            continue
+        rel = (folder.get("path") or "").strip()
+        if not rel:
+            continue
+        full = os.path.normpath(os.path.join(base, rel))
+        if os.path.isdir(full):
+            out.append(full)
+    return out
+
+
+def _git_remote_github(repo_path):
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo_path, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10, check=False)
+        url = (r.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    m = RE_GH_REMOTE.search(url.replace("\\", "/"))
+    if not m:
+        return ""
+    return clean_repo(m.group(1), m.group(2)) or ""
+
+
+def _discover_git_repos(meta):
+    """Local git repos from composer trackedGitRepos and multi-root workspaces."""
+    by_path = {}
+    for m in (meta or {}).values():
+        for p in m.get("tracked_repo_paths") or []:
+            np = _normalize_fs_path(p)
+            if np:
+                by_path[np] = by_path.get(np) or _repo_from_path(np)
+        ws = _normalize_fs_path(m.get("workspace_path") or "")
+        if ws.endswith(".code-workspace"):
+            for fp in _parse_workspace_repo_paths(ws):
+                by_path[fp] = by_path.get(fp) or _repo_from_path(fp)
+    if not by_path:
+        parent = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        for ws_name in COMMON_WORKSPACE_NAMES:
+            ws = os.path.join(parent, ws_name)
+            if os.path.isfile(ws):
+                for fp in _parse_workspace_repo_paths(ws):
+                    by_path[fp] = by_path.get(fp) or _repo_from_path(fp)
+    repos = []
+    for path, folder in by_path.items():
+        if not os.path.isdir(os.path.join(path, ".git")):
+            continue
+        gh = _git_remote_github(path)
+        repos.append({"path": path, "folder": folder, "github": gh or folder})
+    return repos
+
+
+def _parse_turn_ts(started_at):
+    if not started_at:
+        return None
+    try:
+        text = str(started_at).strip()
+        if text.isdigit():
+            n = int(text)
+            return n // 1000 if n >= 10**12 else n
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return int(dt.timestamp())
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _bubble_sort_key(row):
+    """Sort key for (created, type, bubble_id) tuples."""
+    created, _text, btype, bid = row
+    ts = _parse_turn_ts(created)
+    return (ts if ts is not None else 0, btype != 1, bid)
+
+
+def _sample_bubble_rows(rows, cap=BUBBLE_CAP_PER_COMPOSER):
+    """Keep earliest + latest bubbles when a composer exceeds the cap."""
+    if len(rows) <= cap:
+        return rows
+    head = min(BUBBLE_HEAD_PER_COMPOSER, cap // 2)
+    tail = cap - head
+    rows = sorted(rows, key=_bubble_sort_key)
+    if tail <= 0:
+        return rows[:head]
+    return rows[:head] + rows[-tail:]
+
+
+def _bubble_ts_from_raw(raw):
+    """Extract createdAt from bubble JSON without a full parse."""
+    if raw is None:
+        return 0
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    try:
+        idx = raw.find('"createdAt"')
+        if idx < 0:
+            return 0
+        rest = raw[idx + len('"createdAt"'):].lstrip(": \t")
+        if rest.startswith('"'):
+            end = rest.find('"', 1)
+            return _parse_turn_ts(rest[1:end]) or 0
+        digits = []
+        for ch in rest:
+            if ch.isdigit():
+                digits.append(ch)
+            elif digits:
+                break
+        if digits:
+            return _parse_turn_ts(int("".join(digits))) or 0
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
+def _sample_cid_bubble_raws(con, cid, cap=BUBBLE_CAP_PER_COMPOSER):
+    """Return [(key, raw)] for a composer, chronologically head+tail sampled."""
+    prefix = f"bubbleId:{cid}:"
+    n = con.execute(
+        "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE ?",
+        (prefix + "%",)).fetchone()[0]
+    if n == 0:
+        return []
+    if n <= cap:
+        rows = con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
+            (prefix + "%",)).fetchall()
+        rows.sort(key=lambda r: (_bubble_ts_from_raw(r[1]), r[0].split(":")[-1]))
+        return rows
+    head = min(BUBBLE_HEAD_PER_COMPOSER, cap // 2)
+    tail = cap - head
+    if n > cap * 10:
+        keys = [r[0] for r in con.execute(
+            "SELECT key FROM cursorDiskKV WHERE key LIKE ? ORDER BY key LIMIT ?",
+            (prefix + "%", head))]
+        keys += [r[0] for r in con.execute(
+            "SELECT key FROM cursorDiskKV WHERE key LIKE ? ORDER BY key DESC LIMIT ?",
+            (prefix + "%", tail))]
+        out = []
+        for key in keys:
+            raw = con.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)).fetchone()
+            if raw:
+                out.append((key, raw[0]))
+        out.sort(key=lambda r: (_bubble_ts_from_raw(r[1]), r[0].split(":")[-1]))
+        return out
+    entries = []
+    for key, raw in con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
+            (prefix + "%",)):
+        entries.append((_bubble_ts_from_raw(raw), key.split(":")[-1], key, raw))
+    entries.sort(key=lambda e: (e[0], e[1]))
+    chosen = entries[:head] + entries[-tail:]
+    return [(e[2], e[3]) for e in chosen]
+
+
+def _bubble_dict_from_raw(key, raw):
+    parts = key.split(":")
+    if len(parts) < 3:
+        return None
+    blob = _loads(raw)
+    if not isinstance(blob, dict) or blob.get("isRefunded"):
+        return None
+    tc = blob.get("tokenCount") or {}
+    mi = blob.get("modelInfo") if isinstance(blob.get("modelInfo"), dict) else {}
+    text = _bubble_text(blob)
+    inn = float(tc.get("inputTokens") or 0)
+    out = float(tc.get("outputTokens") or 0)
+    btype = blob.get("type") or 2
+    if not text and not inn and not out and btype != 1:
+        return None
+    owner = blob.get("repoOwner") or ""
+    owner_uid = owner.split("|")[-1] if isinstance(owner, str) and "user_" in owner else ""
+    return {
+        "id": parts[-1],
+        "type": btype,
+        "created": blob.get("createdAt") or "",
+        "text": text,
+        "inn": inn,
+        "out": out,
+        "model": _norm_model(mi.get("modelName") or "") if mi.get("modelName") else "",
+        "owner_uid": owner_uid,
+    }
+
+
+def _rows_to_bubbles(rows):
+    return [{
+        "id": r["id"],
+        "type": r["type"],
+        "created": r["created"],
+        "text": r["text"],
+        "inn": r["inn"],
+        "out": r["out"],
+        "model": r["model"],
+    } for r in rows]
+
+
+def _load_bubbles_for_cid(con, cid, cap=BUBBLE_CAP_PER_COMPOSER):
+    """Load one composer's bubbles in time order, sampling head+tail if over cap."""
+    parsed = []
+    owners = collections.Counter()
+    for key, raw in _sample_cid_bubble_raws(con, cid, cap=cap):
+        row = _bubble_dict_from_raw(key, raw)
+        if not row:
+            continue
+        if row.get("owner_uid"):
+            owners[row["owner_uid"]] += 1
+        parsed.append(row)
+    parsed.sort(key=lambda r: _bubble_sort_key((r["created"], r["text"], r["type"], r["id"])))
+    return _rows_to_bubbles(parsed), owners
+
+
+def _load_bubble_text_one(db_path, cid, cap=BUBBLE_CAP_PER_COMPOSER):
+    with connect(db_path) as con:
+        kept = []
+        for key, raw in _sample_cid_bubble_raws(con, cid, cap=cap):
+            row = _bubble_dict_from_raw(key, raw)
+            if row and (row["text"] or row["type"] == 1):
+                kept.append(row)
+        if not kept:
+            return cid, "", [], 0
+        kept.sort(key=lambda r: _bubble_sort_key((r["created"], r["text"], r["type"], r["id"])))
+        text = "\n".join(r["text"] for r in kept if r["text"])
+        return cid, text, kept, len(kept)
+
+
+def _load_bubble_texts_for_cids(con, cids, cap=BUBBLE_CAP_PER_COMPOSER):
+    """Chat text for billed composers — per-cid query, no local cost rebuild."""
+    del con  # callers hold a connection; workers open their own for SQLite threading
+    work = [c for c in cids if c and c not in ("_unattributed", "empty-state-draft")]
+    if not work:
+        return {}, {}, 0
+    texts = {}
+    rows_by_cid = {}
+    loaded = 0
+    workers = min(6, len(work))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for cid, text, kept, n in pool.map(
+                lambda c: _load_bubble_text_one(DB_PATH, c, cap), work):
+            if kept:
+                texts[cid] = text
+                rows_by_cid[cid] = kept
+                loaded += n
+    return texts, rows_by_cid, loaded
+
+
+def _attach_text_to_priced_turns(priced, bubble_rows):
+    """Map bubble text onto billed turns by timestamp."""
+    if not priced or not bubble_rows:
+        return
+    turn_ts = [_parse_turn_ts(t.get("started_at")) or 0 for t in priced]
+    chunks = [[] for _ in priced]
+    ti = 0
+    for row in bubble_rows:
+        bts = _parse_turn_ts(row.get("created")) or 0
+        while ti + 1 < len(turn_ts) and bts > turn_ts[ti + 1]:
+            ti += 1
+        text = row.get("text") or ""
+        if text:
+            chunks[ti].append(text)
+    for i, turn in enumerate(priced):
+        if chunks[i]:
+            turn["text"] = "\n".join(chunks[i])[:12000]
+
+
+def _merge_ref_dicts(base, extra):
+    """Merge jira/pr/repo refs from a second _build_refs pass."""
+    if not extra:
+        return base or {"jira": [], "prs": [], "repos": []}
+    if not base:
+        return extra
+    jira = {k: True for k in base.get("jira") or []}
+    for k in extra.get("jira") or []:
+        jira[k] = True
+    prs = {p["key"]: dict(p) for p in base.get("prs") or []}
+    for p in extra.get("prs") or []:
+        pk = p["key"]
+        if pk in prs:
+            prs[pk]["created"] = prs[pk].get("created") or p.get("created")
+            prs[pk]["inferred"] = prs[pk].get("inferred") or p.get("inferred")
+        else:
+            prs[pk] = dict(p)
+    repos = {r["name"]: dict(r) for r in base.get("repos") or []}
+    for r in extra.get("repos") or []:
+        name = r["name"]
+        if name in repos:
+            if repos[name].get("role") != "primary" and r.get("role") == "primary":
+                repos[name]["role"] = "primary"
+        else:
+            repos[name] = dict(r)
+    return {
+        "jira": sorted(jira, key=lambda k: (k.split("-")[0], int(k.split("-")[1]))),
+        "prs": sorted(prs.values(), key=lambda p: (p["repo"], p["number"])),
+        "repos": sorted(repos.values(), key=lambda r: (r["role"] != "primary", r["name"])),
+    }
+
+
+def _fetch_git_activities(repos, since_day, until_day):
+    if not repos or not since_day or not until_day:
+        return []
+    key = (tuple(sorted(r["path"] for r in repos)), since_day, until_day)
+    now = time.time()
+    cached = _GIT_CACHE.get(key)
+    if cached and now - cached[0] < 600:
+        return cached[1]
+    since = f"{since_day} 00:00:00"
+    until = f"{until_day} 23:59:59"
+    activities = []
+
+    def _git_log_one(repo):
+        path = repo["path"]
+        gh = repo["github"]
+        out = []
+        try:
+            r = subprocess.run(
+                ["git", "-C", path, "log",
+                 f"--since={since}", f"--until={until}",
+                 "--format=%H|%at|%s|%ae"],
+                capture_output=True, text=True, timeout=90, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return out
+        for line in (r.stdout or "").splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("|", 3)
+            if len(parts) < 4:
+                continue
+            sha, ts_s, subj, author = parts[0], parts[1], parts[2], parts[3]
+            try:
+                ts = int(ts_s)
+            except ValueError:
+                continue
+            act = {
+                "repo_path": path,
+                "repo": gh,
+                "sha": sha[:8],
+                "ts": ts,
+                "subject": subj[:120],
+                "author": author,
+                "pr": None,
+            }
+            m = RE_MERGE_PR.search(subj)
+            if m and "/" in gh:
+                act["pr"] = f"{gh}#{m.group(1)}"
+            out.append(act)
+        return out
+
+    workers = min(6, max(1, len(repos)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for chunk in pool.map(_git_log_one, repos):
+            activities.extend(chunk)
+    activities.sort(key=lambda a: a["ts"])
+    _GIT_CACHE[key] = (now, activities)
+    return activities
+
+
+def _git_nearby_for_turn(ts, activities, window=GIT_CORR_WINDOW, limit=3, path_by_github=None):
+    if ts is None:
+        return []
+    hits = []
+    for act in activities:
+        repo_path = act.get("repo_path") or ""
+        if path_by_github and repo_path and not _repo_existed_at(repo_path, ts):
+            continue
+        dist = abs(act["ts"] - ts)
+        if dist <= window:
+            hits.append({
+                "repo": act["repo"],
+                "sha": act["sha"],
+                "subject": act["subject"],
+                "pr": act.get("pr"),
+                "delta_sec": act["ts"] - ts,
+            })
+    hits.sort(key=lambda x: abs(x["delta_sec"]))
+    seen = set()
+    out = []
+    for h in hits:
+        k = (h["repo"], h["sha"])
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(h)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _correlate_git_to_sessions(sessions, priced_all, refs, turns_api, activities,
+                               window=GIT_CORR_WINDOW, path_by_github=None):
+    if not activities:
+        return
+    targets = [s for s in sessions if s.get("unattributed") or s.get("orphan_billed")]
+    if not targets:
+        return
+    for sess in targets:
+        sid = sess["session_id"]
+        turns = priced_all.get(sid) or []
+        if not turns:
+            continue
+        repo_hits = collections.Counter()
+        repo_commits = collections.defaultdict(list)
+        pr_hits = collections.Counter()
+        pr_commits = collections.defaultdict(list)
+        day_rows = collections.defaultdict(lambda: {"cost_usd": 0.0, "repos": set()})
+
+        for turn in turns:
+            ts = _parse_turn_ts(turn.get("started_at") or "")
+            cost = turn.get("cost_usd") or 0
+            day = (turn.get("started_at") or "")[:10]
+            if day:
+                day_rows[day]["cost_usd"] += cost
+            nearby = _git_nearby_for_turn(ts, activities, window=window, limit=3,
+                                          path_by_github=path_by_github)
+            if nearby:
+                turn["git_nearby"] = nearby
+                best_per_repo = {}
+                for act in activities:
+                    if ts is None:
+                        break
+                    repo_path = act.get("repo_path") or ""
+                    if repo_path and not _repo_existed_at(repo_path, ts):
+                        continue
+                    dist = abs(act["ts"] - ts)
+                    if dist > window:
+                        continue
+                    repo = act["repo"]
+                    prev = best_per_repo.get(repo)
+                    if not prev or dist < prev[0]:
+                        best_per_repo[repo] = (dist, act)
+                weights = {repo: 1.0 / (dist + 300.0)
+                           for repo, (dist, _act) in best_per_repo.items()}
+                total_w = sum(weights.values()) or 1.0
+                for repo, w in weights.items():
+                    dist, act = best_per_repo[repo]
+                    share = cost * (w / total_w)
+                    repo_hits[repo] += share
+                    repo_commits[repo].append({
+                        "repo": act["repo"], "sha": act["sha"], "subject": act["subject"],
+                        "pr": act.get("pr"), "delta_sec": act["ts"] - ts,
+                    })
+                    if act.get("pr"):
+                        pr_hits[act["pr"]] += share
+                        pr_commits[act["pr"]].append({
+                            "repo": act["repo"], "sha": act["sha"], "subject": act["subject"],
+                            "pr": act["pr"], "delta_sec": act["ts"] - ts,
+                        })
+                if day:
+                    day_rows[day]["repos"].update(best_per_repo.keys())
+
+        if turns_api.get(sid):
+            api_by_idx = {t["turn_index"]: t for t in turns_api[sid]}
+            for turn in turns:
+                gn = turn.get("git_nearby")
+                if gn and turn["turn_index"] in api_by_idx:
+                    api_by_idx[turn["turn_index"]]["git_nearby"] = gn
+
+        if not repo_hits:
+            sess["git_correlation"] = {
+                "matched": False,
+                "window_hours": window / 3600,
+                "repos_scanned": len({a["repo"] for a in activities}),
+            }
+            continue
+
+        r = refs.get(sid) or {"jira": [], "prs": [], "repos": []}
+        merged_repos = {x["name"]: x.get("role") or "mentioned" for x in r.get("repos") or []}
+        for repo in repo_hits:
+            if repo not in merged_repos:
+                merged_repos[repo] = "inferred"
+        r["repos"] = sorted(
+            ({"name": k, "role": v} for k, v in merged_repos.items()),
+            key=lambda x: (x["role"] not in ("primary", "inferred"), x["name"]))
+        existing_prs = {p["key"]: dict(p) for p in r.get("prs") or []}
+        for pk, pcost in pr_hits.items():
+            if pcost <= 0:
+                continue
+            if pk not in existing_prs:
+                existing_prs[pk] = {
+                    "key": pk, "repo": pk.split("#")[0],
+                    "number": int(pk.split("#")[1]),
+                    "created": False, "inferred": True,
+                }
+            else:
+                existing_prs[pk]["inferred"] = True
+        r["prs"] = sorted(existing_prs.values(), key=lambda p: (p["repo"], p["number"]))
+        refs[sid] = r
+        sess["refs"] = r
+
+        matched_cost = sum(repo_hits.values())
+        sess_cost = sess.get("cost_usd") or 0
+        top_repos = []
+        for repo, cost in repo_hits.most_common(8):
+            commits = repo_commits.get(repo, [])
+            top_repos.append({
+                "name": repo,
+                "cost_usd": round(cost, 4),
+                "turn_matches": len(commits),
+                "unique_commits": len({c["sha"] for c in commits}),
+                "sample": [{
+                    "sha": c["sha"],
+                    "subject": c["subject"],
+                    "delta_h": round(c["delta_sec"] / 3600, 1),
+                } for c in commits[:3]],
+                "prs": sorted({c["pr"] for c in commits if c.get("pr")}),
+            })
+
+        top_prs = []
+        for pk, pcost in pr_hits.most_common(8):
+            commits = pr_commits.get(pk, [])
+            top_prs.append({
+                "key": pk,
+                "repo": pk.split("#")[0],
+                "number": int(pk.split("#")[1]),
+                "cost_usd": round(pcost, 4),
+                "inferred": True,
+                "turn_matches": len(commits),
+                "unique_commits": len({c["sha"] for c in commits}),
+                "sample": [{
+                    "sha": c["sha"],
+                    "subject": c["subject"],
+                    "delta_h": round(c["delta_sec"] / 3600, 1),
+                } for c in commits[:3]],
+            })
+
+        sess["git_correlation"] = {
+            "matched": True,
+            "window_hours": window / 3600,
+            "matched_cost_usd": round(matched_cost, 4),
+            "unmatched_cost_usd": round(max(0.0, sess_cost - matched_cost), 4),
+            "repos": top_repos,
+            "prs": top_prs,
+            "days": sorted(
+                [{"day": d, "cost_usd": round(v["cost_usd"], 4),
+                  "repos": sorted(v["repos"])}
+                 for d, v in day_rows.items() if v["repos"]],
+                key=lambda x: x["day"]),
+        }
+        parts = []
+        for row in top_repos[:5]:
+            label = row["name"].split("/")[-1]
+            extra = f", {len(row['prs'])} PR" if row["prs"] else ""
+            parts.append(f"{label} ${row['cost_usd']:.2f}{extra}")
+        if parts:
+            hint = (
+                f" Nearby git activity (±{window // 3600}h) suggests: "
+                + "; ".join(parts) + ". Inferred from commit timestamps — not from Cursor metadata."
+            )
+            sess["billing_note"] = (sess.get("billing_note") or "") + hint
+
+
+def _billing_event_days(events):
+    days = []
+    for ev in events or []:
+        ms = int(ev.get("timestamp") or 0)
+        if not ms:
+            continue
+        dt = datetime.datetime.fromtimestamp(ms / 1000.0, tz=datetime.timezone.utc)
+        days.append(dt.strftime("%Y-%m-%d"))
+    return days
+
+
+def _plain_from_rich(node, acc, depth=0):
+    if depth > 16 or node is None:
+        return
+    if isinstance(node, dict):
+        text = node.get("text")
+        if node.get("type") == "text" and isinstance(text, str):
+            acc.append(text)
+        elif isinstance(node.get("mentionName"), str):
+            acc.append(node["mentionName"])
+        for val in node.values():
+            if val is text:
+                continue
+            _plain_from_rich(val, acc, depth + 1)
+    elif isinstance(node, list):
+        for val in node:
+            _plain_from_rich(val, acc, depth + 1)
+    elif isinstance(node, str) and node[:1] in "{[":
+        try:
+            _plain_from_rich(json.loads(node), acc, depth + 1)
+        except ValueError:
+            pass
+
+
+def _bubble_text(blob):
+    text = blob.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    acc = []
+    _plain_from_rich(blob.get("richText"), acc)
+    think = blob.get("allThinkingBlocks") or []
+    if isinstance(think, list):
+        for block in think:
+            if isinstance(block, dict):
+                acc.append(block.get("text") or "")
+            elif isinstance(block, str):
+                acc.append(block)
+    return " ".join(a for a in acc if a).strip()
+
+
+def _logical_stamp():
+    """Cheap invalidation key. Ignores checkpoint/WAL churn that is not a new chat."""
+    with connect() as con:
+        try:
+            headers = tuple(con.execute(
+                "SELECT COUNT(*), COALESCE(MAX(lastUpdatedAt),0) FROM composerHeaders"
+            ).fetchone())
+        except sqlite3.OperationalError:
+            headers = (0, 0)
+        composers = con.execute(
+            "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+        ).fetchone()[0]
+        row = con.execute(
+            "SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
+        email = str(row["value"]).strip() if row and row["value"] else ""
+    return (headers, composers, email)
+
+
+_CACHE = {"stamp": None, "data": None, "at": 0}
+
+
+def _cursor_session_cookie(con):
+    """Build the Cursor dashboard session cookie from the IDE's stored JWT."""
+    token = None
+    for key in ("cursorAuth/accessToken", "cursorAuth/cachedAccessToken"):
+        row = con.execute("SELECT value FROM ItemTable WHERE key = ?", (key,)).fetchone()
+        if row and row["value"]:
+            token = str(row["value"]).strip()
+            break
+    if not token:
+        return None
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        user = str(payload.get("sub") or "").split("|")[-1]
+    except Exception:
+        return None
+    if not user:
+        return None
+    return f"WorkosCursorSessionToken={user}::{token}"
+
+
+def _jwt_sub(token):
+    try:
+        payload_b64 = token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return str(payload.get("sub") or "").split("|")[-1]
+    except Exception:
+        return ""
+
+
+def _signed_in_account(con):
+    """Currently signed-in Cursor email, plus git author email if it differs."""
+    email = ""
+    row = con.execute("SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
+    if row and row["value"]:
+        email = str(row["value"]).strip()
+    git_email = ""
+    row = con.execute("SELECT value FROM ItemTable WHERE key='vscode.git'").fetchone()
+    if row and row["value"]:
+        try:
+            raw = row["value"]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", "replace")
+            git_email = (json.loads(raw) or {}).get("userAndEmailCacher.gitAuthorEmail") or ""
+        except Exception:
+            git_email = ""
+    user_id = ""
+    for key in ("cursorAuth/accessToken", "cursorAuth/cachedAccessToken"):
+        row = con.execute("SELECT value FROM ItemTable WHERE key = ?", (key,)).fetchone()
+        if row and row["value"]:
+            user_id = _jwt_sub(str(row["value"]).strip())
+            if user_id:
+                break
+    previous = git_email.strip() if git_email and git_email.lower() != email.lower() else ""
+    return {"email": email, "git_email": git_email.strip(), "user_id": user_id,
+            "previous_email": previous}
+
+
+def _cursor_license_email(path=None):
+    """Email on the currently signed-in Cursor license / subscription."""
+    try:
+        with connect(path) as con:
+            return (_signed_in_account(con).get("email") or "").strip()
+    except Exception:
+        return ""
+
+
+def _api(cookie, method, path, body=None, timeout=60):
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {
+        "Cookie": cookie,
+        "Origin": "https://cursor.com",
+        "User-Agent": "Mozilla/5.0 (Cursor dashboard)",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        "https://cursor.com" + path, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as exc:
+        snippet = exc.read()[:240].decode("utf-8", "replace")
+        raise RuntimeError(f"Cursor API {exc.code} {path}: {snippet}") from exc
+    return json.loads(raw) if raw else {}
+
+
+def _event_cents(ev):
+    kind = (ev.get("kind") or "").upper()
+    if "ERRORED" in kind:
+        return 0.0
+    tu = ev.get("tokenUsage") or {}
+    if tu.get("totalCents") is not None:
+        return float(tu["totalCents"])
+    if ev.get("chargedCents") is not None:
+        return float(ev["chargedCents"])
+    return 0.0
+
+
+def _event_kind_label(kind):
+    k = (kind or "").upper()
+    if "USAGE_BASED" in k:
+        return "on-demand"
+    if "INCLUDED" in k:
+        return "included"
+    if "ERRORED" in k:
+        return "errored"
+    return (kind or "usage").replace("USAGE_EVENT_KIND_", "").replace("_", " ").lower()
+
+
+def _cents_usd(value):
+    try:
+        return float(value or 0) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+PLAN_FEE_LABELS = {
+    2000: "Pro",
+    6000: "Pro Plus",
+    20000: "Ultra",
+}
+
+
+RE_INV_CYCLE = re.compile(r"cycle starting ([A-Za-z]+ \d+(?:,\s*\d{4})?)", re.I)
+
+
+def _parse_month_day(text, fallback_iso_day=""):
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return ""
+    if re.search(r"\d{4}", text):
+        for fmt in ("%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+    if fallback_iso_day:
+        try:
+            year = int(str(fallback_iso_day)[:4])
+            for fmt in ("%B %d", "%b %d"):
+                try:
+                    d = datetime.datetime.strptime(text, fmt).replace(year=year)
+                    return d.strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+        except ValueError:
+            pass
+    return ""
+
+
+def _invoice_usage_cycle_start(inv):
+    """Billing cycle the usage charge is for (from invoice description), not charge date."""
+    m = RE_INV_CYCLE.search(inv.get("description") or "")
+    if m:
+        return _parse_month_day(m.group(1), inv.get("day"))
+    return ""
+
+
+def _usage_invoice_in_view(inv, start, end, cycle_starts=None):
+    """Usage invoices belong to the billing cycle they describe, not the Stripe charge date."""
+    net = inv.get("net_usd") or 0
+    if net <= 0.004:
+        return False
+    cycle = inv.get("usage_cycle_start") or _invoice_usage_cycle_start(inv)
+    if not cycle:
+        day = inv.get("day") or ""
+        return bool(day and start <= day <= end)
+    try:
+        cs = datetime.date.fromisoformat(cycle)
+        ce = cs + datetime.timedelta(days=31)
+        for s in sorted(cycle_starts or []):
+            try:
+                nxt = datetime.date.fromisoformat(s)
+            except ValueError:
+                continue
+            if nxt > cs:
+                ce = nxt - datetime.timedelta(days=1)
+                break
+        vs = datetime.date.fromisoformat(start)
+        ve = datetime.date.fromisoformat(end)
+        return cs <= ve and ce >= vs
+    except ValueError:
+        return start <= cycle <= end
+
+
+def _invoice_kind(inv):
+    desc = (inv.get("description") or "").strip().lower()
+    if inv.get("isMidMonthInvoice"):
+        return "usage"
+    if any(s in desc for s in ("usage", "on-demand", "correction")):
+        return "usage"
+    return "subscription"
+
+
+def _plan_fee_label(amount_cents):
+    try:
+        return PLAN_FEE_LABELS.get(int(amount_cents), "Subscription")
+    except (TypeError, ValueError):
+        return "Subscription"
+
+
+def _public_invoices(raw):
+    out = []
+    for inv in raw or []:
+        gross = _cents_usd(inv.get("amountCents"))
+        refund = _cents_usd(inv.get("refundAmount"))
+        out.append({
+            "day": _local_day(inv.get("date")),
+            "kind": _invoice_kind(inv),
+            "usage_cycle_start": _invoice_usage_cycle_start({
+                "description": (inv.get("description") or "").strip(),
+                "day": _local_day(inv.get("date")),
+            }),
+            "gross_usd": round(gross, 4),
+            "refund_usd": round(refund, 4),
+            "net_usd": round(gross - refund, 4),
+            "status": inv.get("status") or "",
+            "description": (inv.get("description") or "").strip(),
+            "plan": _plan_fee_label(inv.get("amountCents")),
+            "account": (inv.get("_account_email") or "").strip(),
+        })
+    return out
+
+
+def _fetch_invoices(cookie):
+    invoices, page = [], 1
+    while True:
+        body = {"page": page} if page > 1 else {}
+        chunk = _api(cookie, "POST", "/api/dashboard/list-invoices", body)
+        invoices.extend(chunk.get("invoices") or [])
+        if not chunk.get("hasMore"):
+            break
+        page += 1
+        if page > 20:
+            break
+    return invoices
+
+
+BILLING_START = datetime.datetime(2025, 11, 29, tzinfo=datetime.timezone.utc)
+LEGACY_INVOICE_EMAIL = "mw@timberwilde.net"
+LEGACY_INVOICE_TOTAL = 435.04  # user-reported Stripe total since BILLING_START
+
+
+def _cursor_sessions_path():
+    appdata = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(appdata, "cursor-dashboard", "cursor-sessions.json")
+
+
+def _load_cursor_sessions():
+    path = _cursor_sessions_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_cursor_sessions(data):
+    path = _cursor_sessions_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _remember_cursor_session(email, cookie, user_id=""):
+    email = (email or "").strip()
+    cookie = (cookie or "").strip()
+    if not email or not cookie or "@" not in email:
+        return
+    data = _load_cursor_sessions()
+    accounts = data.setdefault("accounts", {})
+    accounts[email.lower()] = {
+        "email": email,
+        "cookie": cookie,
+        "user_id": user_id or "",
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_cursor_sessions(data)
+
+
+def _env_session_cookies():
+    out = []
+    for name in ("CURSOR_SESSION_TOKEN", "CURSOR_LEGACY_SESSION_TOKEN"):
+        raw = (os.environ.get(name) or "").strip()
+        if not raw:
+            continue
+        cookie = raw if raw.startswith("WorkosCursorSessionToken=") else (
+            "WorkosCursorSessionToken=" + raw)
+        out.append(cookie)
+    return out
+
+
+def _billing_cache_path():
+    return os.path.join(os.path.dirname(_cursor_sessions_path()), "billing-cache.json")
+
+
+def _load_billing_cache():
+    path = _billing_cache_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_billing_cache(email, one):
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    data = _load_billing_cache()
+    accounts = data.setdefault("accounts", {})
+    accounts[email] = {
+        "email": one.get("email") or email,
+        "user_id": one.get("user_id") or "",
+        "fetched_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "events": one.get("events") or [],
+        "invoices": one.get("invoices") or [],
+    }
+    path = _billing_cache_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+
+
+def _cached_account_billing(email):
+    email = (email or "").strip().lower()
+    entry = (_load_billing_cache().get("accounts") or {}).get(email)
+    if not entry or not entry.get("events"):
+        return None
+    email = entry.get("email") or email
+    for ev in entry["events"]:
+        ev["_account_email"] = ev.get("_account_email") or email
+    for inv in entry.get("invoices") or []:
+        inv["_account_email"] = inv.get("_account_email") or email
+    return {
+        "me": {"email": email, "id": entry.get("user_id")},
+        "email": email,
+        "user_id": entry.get("user_id") or "",
+        "summary": {},
+        "period": {},
+        "events": entry["events"],
+        "invoices": entry.get("invoices") or [],
+        "cookie": "",
+        "cached_at": entry.get("fetched_at") or "",
+    }
+
+
+def _fetch_account_billing(cookie, fallback_email="", fallback_user_id=""):
+    me = _api(cookie, "GET", "/api/auth/me")
+    email = (me.get("email") or me.get("primaryEmail") or fallback_email).strip()
+    user_id = me.get("id") or me.get("userId") or fallback_user_id
+    if not user_id:
+        raise RuntimeError("Could not resolve Cursor user id.")
+    summary = _api(cookie, "GET", "/api/usage-summary")
+    period = _api(cookie, "POST", "/api/dashboard/get-current-period-usage", {})
+    start = BILLING_START
+    end = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+    events, page = [], 1
+    while True:
+        chunk = _api(cookie, "POST", "/api/dashboard/get-filtered-usage-events", {
+            "teamId": 0,
+            "userId": int(user_id),
+            "startDate": str(int(start.timestamp() * 1000)),
+            "endDate": str(int(end.timestamp() * 1000)),
+            "page": page,
+            "pageSize": 200,
+        })
+        batch = chunk.get("usageEventsDisplay") or []
+        events.extend(batch)
+        total = int(chunk.get("totalUsageEventsCount") or 0)
+        if not batch or len(events) >= total:
+            break
+        page += 1
+        if page > 100:
+            break
+    invoices = []
+    try:
+        invoices = _fetch_invoices(cookie)
+    except Exception as exc:
+        print(f"  invoices unavailable for {email or user_id} ({exc})", flush=True)
+    for ev in events:
+        ev["_account_email"] = email
+    for inv in invoices:
+        inv["_account_email"] = email
+    return {
+        "me": me,
+        "email": email,
+        "user_id": user_id,
+        "summary": summary,
+        "period": period,
+        "events": events,
+        "invoices": invoices,
+        "cookie": cookie,
+    }
+
+
+def fetch_billing(con, force=False):
+    """Pull billed usage + invoices for every Cursor account we have a session for."""
+    now = time.time()
+    account = _signed_in_account(con)
+    current_email = (account.get("email") or "").strip()
+    if ((not force) and _BILLING_CACHE["data"]
+            and now - _BILLING_CACHE["at"] < 120
+            and _BILLING_CACHE.get("email") == current_email):
+        return _BILLING_CACHE["data"]
+    current_cookie = _cursor_session_cookie(con)
+    if current_cookie:
+        _remember_cursor_session(current_email, current_cookie, account.get("user_id") or "")
+    jobs = []
+    seen = set()
+    saved = (_load_cursor_sessions().get("accounts") or {})
+    for info in saved.values():
+        cookie = (info.get("cookie") or "").strip()
+        if cookie and cookie not in seen:
+            seen.add(cookie)
+            jobs.append((info.get("email") or "", cookie, info.get("user_id") or ""))
+    if current_cookie and current_cookie not in seen:
+        seen.add(current_cookie)
+        jobs.append((current_email, current_cookie, account.get("user_id") or ""))
+    for cookie in _env_session_cookies():
+        if cookie not in seen:
+            seen.add(cookie)
+            jobs.append(("", cookie, ""))
+    if not jobs:
+        raise RuntimeError("Cursor is not signed in on this machine (no access token).")
+    merged_events, merged_invoices = [], []
+    emails, stale, cached_used = [], [], []
+    primary = None
+    for label, cookie, saved_uid in jobs:
+        one = None
+        try:
+            one = _fetch_account_billing(cookie, fallback_email=label, fallback_user_id=saved_uid)
+        except Exception as exc:
+            who = label or "saved session"
+            print(f"  billing for {who} failed ({exc})", flush=True)
+            if label:
+                one = _cached_account_billing(label)
+                if one:
+                    cached_used.append(label)
+                    print(f"  using cached billing for {label} "
+                          f"(saved {one.get('cached_at') or 'unknown'})", flush=True)
+                else:
+                    stale.append(label)
+            if not one:
+                continue
+        email = (one.get("email") or label or "").strip()
+        if email and cookie:
+            for ev in one["events"]:
+                ev["_account_email"] = ev.get("_account_email") or email
+            for inv in one["invoices"]:
+                inv["_account_email"] = inv.get("_account_email") or email
+            if not one.get("cached_at"):
+                _remember_cursor_session(email, cookie, str(one.get("user_id") or ""))
+                _save_billing_cache(email, one)
+            emails.append(email)
+        print(f"  {email or 'account'}: {len(one['events'])} billed events, "
+              f"{len(one['invoices'])} invoices", flush=True)
+        if email.lower() == LEGACY_INVOICE_EMAIL:
+            inv_net = sum(
+                _cents_usd(i.get("amountCents")) - _cents_usd(i.get("refundAmount"))
+                for i in one["invoices"])
+            print(f"  {email} invoiced since {BILLING_START.date()}: "
+                  f"${inv_net:,.2f} (expected ${LEGACY_INVOICE_TOTAL:,.2f})", flush=True)
+        merged_events.extend(one["events"])
+        merged_invoices.extend(one["invoices"])
+        if current_email and email.lower() == current_email.lower():
+            primary = one
+        elif primary is None:
+            primary = one
+    if not primary:
+        raise RuntimeError("Could not load Cursor billed usage for any saved account.")
+    if stale:
+        print("  re-sign into Cursor as " + " / ".join(stale)
+              + " once to refresh billing (saved to disk for future merges)", flush=True)
+    if cached_used:
+        print("  merged cached billing for " + " / ".join(cached_used), flush=True)
+    _BILLING_CACHE["data"] = {
+        "me": primary["me"],
+        "summary": primary["summary"],
+        "period": primary["period"],
+        "events": merged_events,
+        "invoices": merged_invoices,
+        "emails": emails,
+        "fetched_at": now,
+    }
+    _BILLING_CACHE["turns"] = {}
+    _BILLING_CACHE["at"] = now
+    _BILLING_CACHE["email"] = current_email
+    return _BILLING_CACHE["data"]
+
+
+def _turns_from_events(evs):
+    priced = []
+    for ev in evs:
+        kind = ev.get("kind") or ""
+        tu = ev.get("tokenUsage") or {}
+        inn = int(tu.get("inputTokens") or 0)
+        out = int(tu.get("outputTokens") or 0)
+        cwrite = int(tu.get("cacheWriteTokens") or 0)
+        cread = int(tu.get("cacheReadTokens") or 0)
+        ms = int(ev.get("timestamp") or 0)
+        started = datetime.datetime.fromtimestamp(
+            ms / 1000.0, tz=datetime.timezone.utc).isoformat() if ms else ""
+        priced.append({
+            "turn_index": len(priced),
+            "started_at": started,
+            "model": _norm_model(ev.get("model") or "unknown"),
+            "requests": 1,
+            "input_tokens": inn,
+            "output_tokens": out,
+            "cache_read_tokens": cread,
+            "cache_write_tokens": cwrite,
+            "total_tokens": inn + out + cwrite + cread,
+            "cost_usd": _event_cents(ev) / 100.0,
+            "est": False,
+            "on_demand": "USAGE_BASED" in kind.upper(),
+            "kind": _event_kind_label(kind),
+            "text": "",
+        })
+    return priced
+
+
+def _billing_match_notes(cid, local, evs):
+    """Explain billed usage that can't be matched to a local chat title."""
+    if cid == "_unattributed":
+        n = len(evs)
+        headless = sum(1 for e in evs if e.get("isHeadless"))
+        models = collections.Counter(e.get("model") or "?" for e in evs)
+        top = ", ".join(f"{m} ({c})" for m, c in models.most_common(3))
+        note = (
+            f"{n} billed API events with no conversation ID — Cursor did not link these "
+            f"calls to a specific chat, so they cannot be matched to titles in your local store. "
+            f"Common causes: cloud/background agents, API or headless usage, chats on another "
+            f"machine, or older invoices before chat IDs were attached."
+        )
+        if headless:
+            note += f" {headless} of {n} were marked headless by Cursor."
+        if top:
+            note += f" Models: {top}."
+        return {"unattributed": True, "billing_note": note}
+    if not local:
+        short = (cid[:20] + "…") if len(cid) > 22 else cid
+        note = (
+            f"Billed to conversation {short} but no matching chat is in this machine's Cursor "
+            f"store — likely a cloud agent, another device, or cleared local history."
+        )
+        return {"orphan_billed": True, "billing_note": note}
+    return {}
+
+
+def _sessions_from_billing(events, local_by_id, meta, ws_names):
+    """One session per billed conversationId; titles/repos from the local store."""
+    groups = collections.defaultdict(list)
+    for ev in events:
+        cid = ev.get("conversationId") or ev.get("composerId") or "_unattributed"
+        groups[cid].append(ev)
+    sessions, turns_api, priced_all = [], {}, {}
+    for cid, evs in groups.items():
+        evs.sort(key=lambda e: int(e.get("timestamp") or 0))
+        priced = _turns_from_events(evs)
+        if not priced:
+            continue
+        local = local_by_id.get(cid) or {}
+        info = dict(meta.get(cid) or {})
+        if local.get("title") and local["title"] != "(untitled)":
+            info["title"] = local["title"]
+        elif cid == "_unattributed":
+            info["title"] = "Other billed usage"
+        if local.get("repository"):
+            info["repository"] = local["repository"]
+        if local.get("branch"):
+            info["branch"] = local["branch"]
+        if local.get("subtitle"):
+            info["subtitle"] = local["subtitle"]
+        sess = _session_from_turns(cid, info, priced, ws_names)
+        if sess is None:
+            continue
+        sess["billed"] = True
+        sess["est"] = False
+        sess["source"] = "cursor-billed"
+        sess["account_label"] = (evs[0].get("_account_email") or "")
+        sess.update(_billing_match_notes(cid, local, evs))
+        if local.get("text"):
+            sess["text"] = local["text"]
+        sessions.append(sess)
+        priced_all[cid] = priced
+        turns_api[cid] = [{k: t[k] for k in (
+            "turn_index", "started_at", "model", "requests", "input_tokens",
+            "output_tokens", "cache_read_tokens", "cache_write_tokens",
+            "total_tokens", "cost_usd", "est", "kind", "on_demand")} for t in priced]
+    sessions.sort(key=lambda s: s["cost_usd"], reverse=True)
+    return sessions, turns_api, priced_all
+
+
+def _header_meta(con):
+    """composerId -> metadata from the composerHeaders table and composerData rows."""
+    meta = {}
+    try:
+        rows = con.execute("SELECT composerId, workspaceId, createdAt, lastUpdatedAt, "
+                           "isArchived, isSubagent, value FROM composerHeaders").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    for row in rows:
+        blob = _loads(row["value"]) or {}
+        cid = row["composerId"]
+        ws = blob.get("workspaceIdentifier") or {}
+        uri = (ws.get("uri") or ws.get("configPath") or {})
+        repos = blob.get("trackedGitRepos") or []
+        tracked_paths = [r.get("repoPath") for r in repos if isinstance(r, dict) and r.get("repoPath")]
+        tracked_folders = [_repo_from_path(p) for p in tracked_paths]
+        repo = ""
+        branch = ""
+        if tracked_folders:
+            repo = tracked_folders[0]
+            if len(tracked_folders) > 1:
+                repo = _repo_from_path(uri.get("fsPath") or uri.get("path") or "") or repo
+            branches = []
+            if repos and isinstance(repos[0], dict):
+                branches = repos[0].get("branches") or []
+            if branches and isinstance(branches[0], dict):
+                branch = branches[0].get("branchName") or ""
+        elif repos and isinstance(repos[0], dict):
+            repo = _repo_from_path(repos[0].get("repoPath"))
+            branches = repos[0].get("branches") or []
+            if branches and isinstance(branches[0], dict):
+                branch = branches[0].get("branchName") or ""
+        meta[cid] = {
+            "title": blob.get("name") or "",
+            "subtitle": blob.get("subtitle") or "",
+            "workspace_id": row["workspaceId"] or (ws.get("id") or ""),
+            "workspace_path": uri.get("fsPath") or uri.get("path") or "",
+            "repository": repo,
+            "branch": branch,
+            "tracked_repos": tracked_folders,
+            "tracked_repo_paths": tracked_paths,
+            "created_ms": row["createdAt"] or blob.get("createdAt") or 0,
+            "updated_ms": row["lastUpdatedAt"] or blob.get("lastUpdatedAt") or 0,
+            "mode": blob.get("unifiedMode") or "",
+            "subagent": bool(row["isSubagent"] or blob.get("isBestOfNSubcomposer")),
+            "draft": bool(blob.get("isDraft")),
+            "archived": bool(row["isArchived"] or blob.get("isArchived")),
+        }
+    for key, raw in con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"):
+        cid = key.split(":", 1)[-1]
+        blob = _loads(raw) or {}
+        mc = blob.get("modelConfig") or {}
+        entry = meta.setdefault(cid, {
+            "title": "", "subtitle": "", "workspace_id": "", "workspace_path": "",
+            "repository": "", "branch": "", "tracked_repos": [], "tracked_repo_paths": [],
+            "created_ms": 0, "updated_ms": 0,
+            "mode": "", "subagent": False, "draft": False, "archived": False,
+        })
+        entry["title"] = entry["title"] or blob.get("name") or ""
+        entry["created_ms"] = entry["created_ms"] or blob.get("createdAt") or 0
+        entry["updated_ms"] = entry["updated_ms"] or blob.get("lastUpdatedAt") or 0
+        entry["mode"] = entry["mode"] or blob.get("unifiedMode") or ""
+        entry["model"] = _norm_model(mc.get("modelName") or "auto")
+        entry["max_mode"] = bool(mc.get("maxMode"))
+        if blob.get("isAgentic") and not entry["mode"]:
+            entry["mode"] = "agent"
+    return meta
+
+
+def _turns_from_bubbles(bubbles, default_model):
+    """Group bubbles into user-turns and cost each one."""
+    bubbles.sort(key=lambda b: (b["created"] or "", b["type"] != 1, b["id"]))
+    turns, current = [], None
+
+    def close():
+        nonlocal current
+        if current is None:
+            return
+        if current["input_tokens"] or current["output_tokens"] or current["text"].strip() \
+                or current["user_text"].strip():
+            turns.append(current)
+        current = None
+
+    for bub in bubbles:
+        if bub["type"] == 1:
+            close()
+            current = {
+                "turn_index": len(turns),
+                "started_at": bub["created"],
+                "model": bub["model"] or default_model,
+                "user_text": bub["text"],
+                "text": bub["text"],
+                "input_tokens": 0.0,
+                "output_tokens": 0.0,
+                "measured_in": None,
+                "measured_out": None,
+                "requests": 1,
+            }
+            continue
+        if current is None:
+            current = {
+                "turn_index": len(turns),
+                "started_at": bub["created"],
+                "model": bub["model"] or default_model,
+                "user_text": "",
+                "text": "",
+                "input_tokens": 0.0,
+                "output_tokens": 0.0,
+                "measured_in": None,
+                "measured_out": None,
+                "requests": 1,
+            }
+        if bub["model"]:
+            current["model"] = bub["model"]
+        if bub["text"]:
+            current["text"] += ("\n" if current["text"] else "") + bub["text"]
+        if bub["inn"] or bub["out"]:
+            current["measured_in"] = (current["measured_in"] or 0) + bub["inn"]
+            current["measured_out"] = (current["measured_out"] or 0) + bub["out"]
+    close()
+
+    ctx = 0.0
+    prev_prompt = 0.0
+    priced = []
+    for turn in turns:
+        model = turn["model"] or default_model
+        if turn["measured_in"] is not None and turn["measured_out"] is not None:
+            prompt = float(turn["measured_in"])
+            t_out = float(turn["measured_out"])
+            t_cache = min(prev_prompt, prompt)
+            t_in = max(prompt - t_cache, 0.0)
+            prev_prompt = prompt
+            ctx = prompt + t_out
+            est = False
+        else:
+            t_in = len(turn["user_text"]) / CHARS_PER_TOKEN
+            t_out = len(turn["text"][len(turn["user_text"]):].lstrip()
+                        if turn["text"].startswith(turn["user_text"])
+                        else turn["text"]) / CHARS_PER_TOKEN
+            if not turn["user_text"] and not t_out:
+                continue
+            t_cache = min(ctx, CONTEXT_WINDOW_TOKENS)
+            prev_prompt = t_in + t_cache
+            ctx += t_in + t_out
+            est = True
+        priced.append({
+            "turn_index": len(priced),
+            "started_at": turn["started_at"],
+            "model": model,
+            "requests": 1,
+            "input_tokens": t_in,
+            "output_tokens": t_out,
+            "cache_read_tokens": t_cache,
+            "cache_write_tokens": 0,
+            "total_tokens": t_in + t_out + t_cache,
+            "cost_usd": _cost(t_in, t_out, t_cache, model),
+            "est": est,
+            "text": (turn["user_text"] + "\n" + turn["text"])[:12000],
+        })
+    return priced
+
+
+def _session_from_turns(cid, meta, turns, ws_names):
+    if not turns:
+        return None
+    days = collections.defaultdict(lambda: collections.Counter())
+    by_model_day = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    used = collections.Counter()
+    blob = []
+    for turn in turns:
+        day = _local_day(turn["started_at"]) or ""
+        d = days[day]
+        d["requests"] += turn["requests"]
+        d["cost_usd"] += turn["cost_usd"]
+        d["est_usd"] += turn["cost_usd"] if turn["est"] else 0.0
+        d["input_tokens"] += turn["input_tokens"]
+        d["output_tokens"] += turn["output_tokens"]
+        d["cache_read_tokens"] += turn["cache_read_tokens"]
+        d["cache_write_tokens"] += turn.get("cache_write_tokens") or 0
+        d["total_tokens"] += turn["total_tokens"]
+        d["measured_tokens"] += 0 if turn["est"] else turn["total_tokens"]
+        d["on_demand_usd"] += turn["cost_usd"] if turn.get("on_demand") else 0.0
+        m = by_model_day[day][turn["model"]]
+        m["requests"] += turn["requests"]
+        m["cost_usd"] += turn["cost_usd"]
+        m["input_tokens"] += turn["input_tokens"]
+        m["output_tokens"] += turn["output_tokens"]
+        m["cache_read_tokens"] += turn["cache_read_tokens"]
+        m["cache_write_tokens"] += turn.get("cache_write_tokens") or 0
+        used[turn["model"]] += turn["requests"]
+        blob.append(turn.get("text") or "")
+    title = (meta.get("title") or "").strip()
+    if not title:
+        for turn in turns:
+            typed = (turn.get("text") or "").strip().split("\n", 1)[0]
+            if typed:
+                title = " ".join(typed.split())[:90]
+                break
+    title = title or "(untitled)"
+    repo = meta.get("repository") or _repo_from_path(meta.get("workspace_path")) \
+        or ws_names.get(meta.get("workspace_id") or "", "")
+    mode = meta.get("mode") or ""
+    extra = []
+    if mode:
+        extra.append(mode)
+    if meta.get("subagent"):
+        extra.append("subagent")
+    branch = meta.get("branch") or " · ".join(extra)
+    if extra and meta.get("branch"):
+        branch = meta["branch"] + " · " + " · ".join(extra)
+    s = {
+        "session_id": cid,
+        "title": title,
+        "repository": repo,
+        "workspace": repo,
+        "branch": branch,
+        "subtitle": meta.get("subtitle") or "",
+        "tracked_repos": list(meta.get("tracked_repos") or []),
+        "workspace_path": meta.get("workspace_path") or "",
+        "days": {d: dict(c) for d, c in days.items()},
+        "by_model_day": {d: {k: dict(c) for k, c in mm.items()}
+                         for d, mm in by_model_day.items()},
+        "text": " ".join(blob),
+        "subagent": bool(meta.get("subagent")),
+        "draft": bool(meta.get("draft")),
+    }
+    return _fill_totals(s)
+
+
+def _fill_totals(base):
+    days = base.get("days") or {}
+    by_model_day = base.get("by_model_day") or {}
+    agg = collections.Counter()
+    for c in days.values():
+        for k, v in c.items():
+            agg[k] += v
+    models = collections.defaultdict(lambda: collections.Counter())
+    for mm in by_model_day.values():
+        for name, c in mm.items():
+            for key, val in c.items():
+                models[name][key] += val
+    dates = sorted(d for d in days if d)
+    top = max(models.items(), key=lambda kv: kv[1]["requests"])[0] if models else "auto"
+    est = agg["est_usd"] > 0.0
+    return dict(base, **{
+        "top_model": top,
+        "models": len(models),
+        "by_model": {k: dict(c) for k, c in models.items()},
+        "turns": int(agg["requests"]),
+        "requests": int(agg["requests"]),
+        "input_tokens": round(agg["input_tokens"]),
+        "output_tokens": round(agg["output_tokens"]),
+        "cache_read_tokens": round(agg["cache_read_tokens"]),
+        "cache_write_tokens": round(agg["cache_write_tokens"]),
+        "total_tokens": round(agg["total_tokens"]),
+        "measured_tokens": round(agg["measured_tokens"]),
+        "cost_usd": agg["cost_usd"],
+        "est_usd": agg["est_usd"],
+        "on_demand_usd": agg["on_demand_usd"],
+        "est": est,
+        "first_day": dates[0] if dates else "",
+        "last_day": dates[-1] if dates else "",
+    })
+
+
+def _clip(session, start, end):
+    first, last = session.get("first_day") or "", session.get("last_day") or ""
+    if start <= first and last <= end:
+        return session
+    days = {d: c for d, c in (session.get("days") or {}).items()
+            if d and start <= d <= end}
+    if not days:
+        return None
+    bmd = {d: c for d, c in (session.get("by_model_day") or {}).items() if d in days}
+    keep = {"session_id", "title", "repository", "workspace", "branch", "subtitle",
+            "text", "subagent", "draft", "refs", "billed", "source", "account_label",
+            "unattributed", "orphan_billed", "billing_note", "tracked_repos",
+            "workspace_path", "repo_split", "git_correlation", "repo_weights",
+            "shared_attribution"}
+    base = {k: session[k] for k in keep if k in session}
+    base["days"] = days
+    base["by_model_day"] = bmd
+    return _fill_totals(base)
+
+
+def _turn_maps_from_priced(priced_by_sid, refs=None, sessions_by_id=None):
+    """priced_by_sid: {sid: [turns with text, cost_usd, total_tokens, turn_index]}"""
+    turn_prs = {}
+    turn_cost = {}
+    for sid, turns in priced_by_sid.items():
+        if not turns:
+            continue
+        sess = (sessions_by_id or {}).get(sid) or {}
+        hints = _repo_hints(sess, refs.get(sid) if refs else None)
+        prs = {}
+        costs = {}
+        for turn in turns:
+            ti = turn["turn_index"]
+            costs[ti] = (turn["cost_usd"] or 0, turn.get("total_tokens") or 0)
+            text = turn.get("text") or ""
+            created_here = bool(RE_CREATED.search(text))
+            found = {}
+            for owner, repo, num in RE_PR.findall(text):
+                name = clean_repo(owner, repo)
+                if not name:
+                    continue
+                k = f"{name}#{num}"
+                found[k] = found.get(k, False) or created_here
+            for owner, repo, num in RE_PR_SHORT.findall(text):
+                name = clean_repo(owner, repo)
+                if not name:
+                    continue
+                k = f"{name}#{num}"
+                found[k] = found.get(k, False) or created_here
+            for num_s in RE_PR_BARE.findall(text):
+                num = int(num_s)
+                for repo in hints:
+                    k = f"{repo}#{num}"
+                    found[k] = found.get(k, False) or created_here
+            if found:
+                prs[ti] = found
+        turn_prs[sid] = prs
+        turn_cost[sid] = costs
+    return turn_prs, turn_cost
+
+
+def _billed_composer_ids(billing):
+    ids = set()
+    for ev in (billing or {}).get("events") or []:
+        cid = ev.get("conversationId") or ev.get("composerId")
+        if cid:
+            ids.add(cid)
+    return ids
+
+
+def _session_stub_from_meta(cid, meta, ws_names):
+    """Title/repo fields from composerHeaders without reading chat bubbles."""
+    info = meta.get(cid) or {}
+    repo = info.get("repository") or _repo_from_path(info.get("workspace_path")) \
+        or ws_names.get(info.get("workspace_id") or "", "")
+    return {
+        "session_id": cid,
+        "title": (info.get("title") or "").strip(),
+        "subtitle": info.get("subtitle") or "",
+        "repository": repo,
+        "workspace": repo,
+        "branch": info.get("branch") or "",
+        "workspace_path": info.get("workspace_path") or "",
+        "tracked_repos": info.get("tracked_repos") or [],
+        "text": "",
+        "subagent": bool(info.get("subagent")),
+    }
+
+
+def _load_bubbles(con, meta, skip_cids=None, cap=BUBBLE_CAP_PER_COMPOSER):
+    """One pass over bubbleId rows; heavy composers reload head+tail in time order."""
+    skip_cids = skip_cids or set()
+    load_cids = {cid for cid in meta if cid and cid not in skip_cids
+                 and cid != "empty-state-draft"}
+    bubbles = collections.defaultdict(list)
+    composer_owners = collections.defaultdict(collections.Counter)
+    key_counts = collections.Counter()
+    loaded = 0
+    for row in con.execute(
+            "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"):
+        key = row[0]
+        parts = key.split(":")
+        if len(parts) < 3:
+            continue
+        cid = parts[1]
+        if cid not in load_cids:
+            continue
+        key_counts[cid] += 1
+    heavy = {cid for cid, n in key_counts.items() if n > cap}
+    for key, raw in con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"):
+        parts = key.split(":")
+        if len(parts) < 3:
+            continue
+        cid = parts[1]
+        if cid not in load_cids or cid in heavy:
+            continue
+        row = _bubble_dict_from_raw(key, raw)
+        if not row:
+            continue
+        if row.get("owner_uid"):
+            composer_owners[cid][row["owner_uid"]] += 1
+        bubbles[cid].append({
+            "id": row["id"],
+            "type": row["type"],
+            "created": row["created"],
+            "text": row["text"],
+            "inn": row["inn"],
+            "out": row["out"],
+            "model": row["model"],
+        })
+        loaded += 1
+    for cid in heavy:
+        bubs, owners = _load_bubbles_for_cid(con, cid, cap=cap)
+        if bubs:
+            bubbles[cid] = bubs
+            composer_owners[cid].update(owners)
+            loaded += len(bubs)
+    for cid in load_cids:
+        meta.setdefault(cid, {
+            "title": "", "subtitle": "", "workspace_id": "", "workspace_path": "",
+            "repository": "", "branch": "", "tracked_repos": [], "tracked_repo_paths": [],
+            "created_ms": 0, "updated_ms": 0,
+            "mode": "", "subagent": False, "draft": False, "archived": False,
+            "model": "auto",
+        })
+    return bubbles, composer_owners, loaded
+
+
+def scan_cursor(force=False):
+    now = time.time()
+    if not force and _CACHE["data"] is not None and (now - _CACHE["at"]) < 120:
+        return _CACHE["data"]
+    stamp = _logical_stamp()
+    if not force and _CACHE["stamp"] == stamp and _CACHE["data"] is not None:
+        return _CACHE["data"]
+    with SCAN_LOCK:
+        if not force and _CACHE["data"] is not None and (time.time() - _CACHE["at"]) < 120:
+            return _CACHE["data"]
+        if not force and _CACHE["stamp"] == stamp and _CACHE["data"] is not None:
+            return _CACHE["data"]
+        print("Scanning Cursor chat store...", flush=True)
+        t_scan = time.perf_counter()
+        skip_bubbles = set()
+        billed_text_rows = 0
+        ws_names = _workspace_map()
+        account = {"email": "", "git_email": "", "user_id": "", "previous_email": ""}
+        billing_error = None
+        billing = None
+        with connect() as con:
+            account = _signed_in_account(con)
+            meta = _header_meta(con)
+            t_meta = time.perf_counter()
+            t_billing = t_meta
+            if API_ENABLED:
+                try:
+                    billing = fetch_billing(con, force=force)
+                except Exception as exc:
+                    billing_error = str(exc)
+                    print(f"  billing API unavailable ({exc}); using local transcript estimates",
+                          flush=True)
+            t_billing = time.perf_counter()
+            skip_bubbles = _billed_composer_ids(billing) if billing else set()
+            bubbles, composer_owners, bubble_rows = _load_bubbles(
+                con, meta, skip_cids=skip_bubbles)
+            billed_texts, billed_rows, billed_text_rows = {}, {}, 0
+            if skip_bubbles:
+                billed_texts, billed_rows, billed_text_rows = _load_bubble_texts_for_cids(
+                    con, skip_bubbles)
+        t_bubbles = time.perf_counter()
+        if skip_bubbles:
+            print(f"  billed chat text: {len(billed_texts)} composer(s), "
+                  f"{billed_text_rows} bubble rows (costs from API)", flush=True)
+
+        sessions, turns_api, priced_all, texts_by_cid = [], {}, {}, {}
+        for cid, bubs in bubbles.items():
+            info = meta.get(cid) or {}
+            if cid == "empty-state-draft" or (info.get("draft") and not bubs):
+                continue
+            priced = _turns_from_bubbles(bubs, info.get("model") or "auto")
+            sess = _session_from_turns(cid, info, priced, ws_names)
+            if sess is None:
+                continue
+            sessions.append(sess)
+            priced_all[cid] = priced
+            turns_api[cid] = [{k: t[k] for k in (
+                "turn_index", "started_at", "model", "requests", "input_tokens",
+                "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                "total_tokens", "cost_usd", "est")} for t in priced]
+            texts_by_cid[cid] = (sess.get("title") or "") + " " + (sess.get("subtitle") or "") \
+                + " " + " ".join(t.get("text") or "" for t in priced)
+
+        refs = {}
+        if billing:
+            local_by_id = {s["session_id"]: s for s in sessions}
+            for cid in skip_bubbles:
+                stub = _session_stub_from_meta(cid, meta, ws_names)
+                if cid in billed_texts:
+                    stub["text"] = billed_texts[cid]
+                local_by_id[cid] = stub
+                if billed_texts.get(cid):
+                    texts_by_cid[cid] = (
+                        (stub.get("title") or "") + " " + (stub.get("subtitle") or "")
+                        + " " + billed_texts[cid])
+            local_turns, local_priced = turns_api, priced_all
+            billed_sessions, turns_api, priced_all = _sessions_from_billing(
+                billing["events"], local_by_id, meta, ws_names)
+            for sess in billed_sessions:
+                cid = sess["session_id"]
+                if cid in billed_rows and cid in priced_all:
+                    _attach_text_to_priced_turns(priced_all[cid], billed_rows[cid])
+                    if cid in turns_api:
+                        for src, dst in zip(priced_all[cid], turns_api[cid]):
+                            if src.get("text"):
+                                dst["text"] = src["text"]
+                if cid in billed_texts:
+                    sess["text"] = billed_texts[cid]
+            billed_ids = {s["session_id"] for s in billed_sessions}
+            current_uid = account.get("user_id") or ""
+            prev_email = account.get("previous_email") or "previous Cursor account"
+            other = []
+            for local in sessions:
+                cid = local["session_id"]
+                if cid in billed_ids or cid == "empty-state-draft":
+                    continue
+                title = (local.get("title") or "").strip()
+                real = title and title != "(untitled)"
+                if not real and (local.get("requests") or 0) < 5 and (local.get("cost_usd") or 0) < 0.25:
+                    continue
+                owners = composer_owners.get(cid) or {}
+                top_uid = owners.most_common(1)[0][0] if owners else ""
+                if top_uid and current_uid and top_uid != current_uid:
+                    label = prev_email
+                elif top_uid and current_uid and top_uid == current_uid:
+                    continue
+                else:
+                    label = prev_email or "not on signed-in account"
+                extra = dict(local)
+                extra["billed"] = False
+                extra["est"] = True
+                extra["source"] = "local-other-account"
+                extra["account_label"] = label
+                other.append(extra)
+                if cid in local_turns:
+                    turns_api[cid] = local_turns[cid]
+                if cid in local_priced:
+                    priced_all[cid] = local_priced[cid]
+            sessions = billed_sessions
+            for sess in sessions:
+                local = local_by_id.get(sess["session_id"])
+                sess["account_label"] = sess.get("account_label") or account.get("email") or ""
+                if local and local.get("title") and local["title"] != "(untitled)":
+                    sess["title"] = local["title"]
+                if local:
+                    if local.get("tracked_repos"):
+                        sess["tracked_repos"] = local["tracked_repos"]
+                    if local.get("workspace_path"):
+                        sess["workspace_path"] = local["workspace_path"]
+                    if local.get("repository") and not local.get("repo_split"):
+                        sess["repository"] = local["repository"]
+                        sess["workspace"] = local.get("workspace") or local["repository"]
+                else:
+                    mm = meta.get(sess["session_id"]) or {}
+                    if mm.get("workspace_path"):
+                        sess["workspace_path"] = mm["workspace_path"]
+                    if mm.get("tracked_repos"):
+                        sess["tracked_repos"] = mm["tracked_repos"]
+            other.sort(key=lambda s: s["cost_usd"], reverse=True)
+            sessions = sessions + other
+            print(f"  billed {len(billed_sessions)} conversations"
+                  + (f"; {len(other)} local chats not on {account.get('email') or 'this account'}"
+                     if other else ""), flush=True)
+
+        allow = JIRA_KEY_ALLOW | _dynamic_jira_keys(texts_by_cid.values())
+        sess_repo = {s["session_id"]: s["repository"] for s in sessions if s.get("repository")}
+        refs = _build_refs(list(texts_by_cid.items()), sess_repo, allow)
+        _attach_tracked_repos(sessions, meta, refs)
+        path_by_github = _github_path_map(meta=meta)
+        _apply_repo_age_filters(sessions, refs, path_by_github)
+        _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github)
+        for sess in sessions:
+            sess["refs"] = refs.get(sess["session_id"], {"jira": [], "prs": [], "repos": []})
+
+        sessions.sort(key=lambda s: (0 if s.get("billed") else 1, -(s.get("cost_usd") or 0)))
+        git_repos = _discover_git_repos(meta)
+        git_since, git_until = _activity_date_bounds(
+            sessions, (billing or {}).get("events") if billing else None)
+        git_acts = _fetch_git_activities(git_repos, git_since, git_until) if git_repos else []
+        _apply_repo_age_filters(sessions, refs, path_by_github)
+        if billing and git_acts:
+            _correlate_git_to_sessions(
+                sessions, priced_all, refs, turns_api, git_acts,
+                path_by_github=path_by_github)
+            print(f"  git correlation: {len(git_repos)} repos, "
+                  f"{len(git_acts)} commits ({git_since}..{git_until})",
+                  flush=True)
+        _apply_git_weighted_shared_repos(
+            sessions, refs, priced_all, git_acts, path_by_github)
+        _apply_git_pr_discovery(
+            sessions, refs, priced_all, git_acts, path_by_github)
+        _apply_git_activity_gate(
+            sessions, refs, priced_all, git_acts, path_by_github)
+        for sess in sessions:
+            sess["refs"] = refs.get(sess["session_id"], sess.get("refs"))
+        turn_prs, turn_cost = _turn_maps_from_priced(
+            priced_all, refs, {s["session_id"]: s for s in sessions})
+        git_pr_catalog = _git_pr_catalog(git_acts) if git_acts else {}
+        data = {
+            "sessions": sessions,
+            "turns": turns_api,
+            "turn_prs": turn_prs,
+            "turn_cost": turn_cost,
+            "refs": refs,
+            "git_pr_catalog": git_pr_catalog,
+            "db": DB_PATH,
+            "billed": bool(billing),
+            "billing_error": billing_error,
+            "billing_summary": (billing or {}).get("summary"),
+            "billing_period": (billing or {}).get("period"),
+            "billing_email": account.get("email") or "",
+            "billing_emails": (billing or {}).get("emails") or (
+                [account.get("email")] if account.get("email") else []),
+            "previous_email": account.get("previous_email") or "",
+            "invoices": _public_invoices((billing or {}).get("invoices")),
+        }
+        _CACHE["stamp"], _CACHE["data"], _CACHE["at"] = stamp, data, time.time()
+        t_done = time.perf_counter()
+        print(f"  indexed {len(sessions)} chats · {bubble_rows + billed_text_rows} bubble rows · "
+              f"{t_done - t_scan:.1f}s "
+              f"(meta {t_meta - t_scan:.1f}s, billing {t_billing - t_meta:.1f}s, "
+              f"bubbles {t_bubbles - t_billing:.1f}s, rest {t_done - t_bubbles:.1f}s)",
+              flush=True)
+        return data
+
+# --------------------------------------------------------------------------
+# Reference extraction: Jira tickets, GitHub repos and pull requests mentioned
+# (or created) inside each chat's turn text.
+# --------------------------------------------------------------------------
+
+RE_JIRA_URL = re.compile(r"https?://([\w.-]+\.atlassian\.net)/browse/([A-Z][A-Z0-9]{1,9}-\d+)")
+RE_JIRA_ANY = re.compile(r"atlassian\.net/browse/([A-Z][A-Z0-9]{1,9}-\d+)")
+RE_JIRA_BARE = re.compile(r"\b([A-Z][A-Z0-9]{1,9})-(\d+)\b")
+RE_PR = re.compile(r"(?<![\w.])github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)")
+RE_PR_SHORT = re.compile(r"(?<![\w./])([\w.-]+)/([\w.-]+)#(\d+)")
+RE_PR_BARE = re.compile(r"\b(?:PR|pull request)\s*#?\s*(\d+)\b", re.I)
+RE_REPO_URL = re.compile(r"(?<![\w.])github\.com/([\w.-]+)/([\w.-]+)")
+RE_CREATED = re.compile(
+    r"(gh pr create|(?:created|opened|raised|submitted)\s+(?:a\s+|the\s+|new\s+|draft\s+)*"
+    r"(?:pull request|PR)\b|(?:pull request|PR)\s+(?:#\d+\s+)?(?:was\s+)?(?:successfully\s+)?"
+    r"(?:created|opened))", re.I)
+
+
+def clean_repo(owner, repo):
+    repo = (repo or "").rstrip(".").removesuffix(".git")
+    owner = (owner or "").strip()
+    if not repo or not owner or owner.lower() in GH_RESERVED or repo.lower() in GH_RESERVED:
+        return None
+    if repo.lower() == "pull" or "..." in owner or "..." in repo:
+        return None
+    if not re.match(r"^[\w.-]+$", owner) or not re.match(r"^[\w.-]+$", repo):
+        return None
+    return f"{owner}/{repo}"
+
+
+def _repo_hints(session, refs_entry, path_by_github=None):
+    """GitHub repo names for resolving bare PR #123 mentions in chat text."""
+    hints = set()
+    end_ts = _session_end_ts(session) if session else None
+    for x in (refs_entry or {}).get("repos") or []:
+        name = x.get("name") or ""
+        if "/" not in name or x.get("role") in ("shared-skipped",):
+            continue
+        if path_by_github and end_ts:
+            path = path_by_github.get(name, "")
+            if path and not _repo_existed_at(path, end_ts):
+                continue
+        hints.add(name)
+    for p in (refs_entry or {}).get("prs") or []:
+        if p.get("role") == "skipped":
+            continue
+        repo = p.get("repo") or (p.get("key") or "").split("#")[0]
+        if repo and "/" in repo:
+            hints.add(repo)
+    if hints:
+        return sorted(hints)
+    for tr in (session or {}).get("tracked_repos") or []:
+        if tr and "/" in tr:
+            if path_by_github and end_ts:
+                path = path_by_github.get(tr, "")
+                if path and not _repo_existed_at(path, end_ts):
+                    continue
+            hints.add(tr)
+    return sorted(hints)
+
+
+def _git_pr_catalog(activities):
+    """All merge PRs seen in git log for the active date range."""
+    catalog = {}
+    for act in activities or []:
+        pk = act.get("pr")
+        if not pk:
+            continue
+        repo = pk.split("#")[0]
+        num = int(pk.split("#")[1])
+        entry = catalog.setdefault(pk, {
+            "key": pk, "repo": repo, "number": num,
+            "cost_usd": 0.0, "on_demand_usd": 0.0, "total_tokens": 0,
+            "chats": 0, "titles": [], "created": False,
+            "role": "git", "inferred": True, "est": False,
+        })
+        entry["merge_ts"] = min(entry.get("merge_ts") or act["ts"], act["ts"])
+    return catalog
+
+
+def _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github=None):
+    """Resolve bare 'PR #17' mentions using session repo context."""
+    for s in sessions:
+        sid = s["session_id"]
+        text = texts_by_cid.get(sid) or s.get("text") or ""
+        if not text:
+            continue
+        hints = _repo_hints(s, refs.get(sid), path_by_github)
+        if not hints:
+            continue
+        r = refs.setdefault(sid, {"jira": [], "prs": [], "repos": []})
+        existing = {p["key"]: dict(p) for p in r.get("prs") or []}
+        created_here = bool(RE_CREATED.search(text))
+        for num_s in RE_PR_BARE.findall(text):
+            num = int(num_s)
+            for repo in hints:
+                k = f"{repo}#{num}"
+                if k not in existing:
+                    existing[k] = {
+                        "key": k, "repo": repo, "number": num, "created": created_here,
+                    }
+                else:
+                    existing[k]["created"] = existing[k].get("created") or created_here
+        r["prs"] = sorted(existing.values(), key=lambda p: (p["repo"], p["number"]))
+
+
+def _dynamic_jira_keys(texts):
+    global JIRA_BASE
+    keys, hosts = set(), collections.Counter()
+    for t in texts:
+        for host, tk in RE_JIRA_URL.findall(t):
+            hosts[host] += 1
+            keys.add(tk.split("-")[0])
+        for tk in RE_JIRA_ANY.findall(t):
+            keys.add(tk.split("-")[0])
+    if not JIRA_BASE and hosts:
+        JIRA_BASE = "https://" + hosts.most_common(1)[0][0]
+    return keys
+
+
+def _build_refs(rows, sess_repo, allow):
+    out = {}
+    for sid, text in rows:
+        d = out.setdefault(sid, {"jira": {}, "prs": {}, "repos": {}})
+        for tk in RE_JIRA_ANY.findall(text):
+            d["jira"][tk] = True
+        for prefix, num in RE_JIRA_BARE.findall(text):
+            if prefix in allow and prefix not in JIRA_KEY_DENY:
+                d["jira"].setdefault(f"{prefix}-{num}", False)
+        created_here = bool(RE_CREATED.search(text))
+        for owner, repo, num in RE_PR.findall(text):
+            name = clean_repo(owner, repo)
+            if not name:
+                continue
+            k = f"{name}#{num}"
+            d["prs"][k] = d["prs"].get(k, False) or created_here
+            d["repos"].setdefault(name, "mentioned")
+        for owner, repo, num in RE_PR_SHORT.findall(text):
+            name = clean_repo(owner, repo)
+            if not name:
+                continue
+            k = f"{name}#{num}"
+            d["prs"][k] = d["prs"].get(k, False) or created_here
+            d["repos"].setdefault(name, "mentioned")
+        for owner, repo in RE_REPO_URL.findall(text):
+            name = clean_repo(owner, repo)
+            if name:
+                d["repos"].setdefault(name, "mentioned")
+
+    for sid, repo in (sess_repo or {}).items():
+        d = out.setdefault(sid, {"jira": {}, "prs": {}, "repos": {}})
+        if "/" in repo:
+            d["repos"][repo] = "primary"
+
+    data = {}
+    for sid, d in out.items():
+        data[sid] = {
+            "jira": sorted(d["jira"], key=lambda k: (k.split("-")[0], int(k.split("-")[1]))),
+            "prs": sorted(
+                ({"key": k, "repo": k.split("#")[0], "number": int(k.split("#")[1]),
+                  "created": v} for k, v in d["prs"].items()),
+                key=lambda p: (p["repo"], p["number"])),
+            "repos": sorted(({"name": k, "role": v} for k, v in d["repos"].items()),
+                            key=lambda r: (r["role"] != "primary", r["name"])),
+        }
+    return data
+
+
+def _attach_folder_repos(sessions, refs):
+    """Legacy helper — superseded by _attach_tracked_repos."""
+    return
+
+
+def _matches(s, q):
+    r = s.get("refs") or {}
+    parts = [s.get("title") or "", s.get("repository") or "", s.get("workspace") or "",
+             s.get("branch") or "", s.get("top_model") or "", s.get("session_id") or "",
+             s.get("subtitle") or ""]
+    parts += list(r.get("jira", []))
+    parts += [p["key"] for p in r.get("prs", [])]
+    parts += [x["name"] for x in r.get("repos", [])]
+    return q in " ".join(parts).lower()
+
+
+def _group_label(keys):
+    repos = {k.split("#")[0] for k in keys}
+    if len(repos) == 1:
+        repo = repos.pop()
+        nums = sorted((int(k.split("#")[1]) for k in keys))
+        return f"{repo}#" + ", #".join(str(n) for n in nums)
+    return ", ".join(keys)
+
+
+def pr_segments(session_titles, turn_prs, turn_cost):
+    out = {}
+    for sid, title in session_titles.items():
+        anchors = sorted(turn_prs.get(sid, {}))
+        if not anchors:
+            continue
+        costs = turn_cost.get(sid, {})
+        prev = -1
+        for a in anchors:
+            seg = [t for t in costs if prev < t <= a]
+            prev = a
+            keys = turn_prs[sid][a]
+            gk = tuple(sorted(keys))
+            e = out.setdefault(gk, {"keys": list(gk), "key": _group_label(gk),
+                                    "cost_usd": 0.0, "total_tokens": 0, "chats": 0,
+                                    "titles": [], "created": False,
+                                    "role": "mentioned", "turns": 0, "est": False})
+            e["cost_usd"] += sum(costs[t][0] for t in seg)
+            e["total_tokens"] += sum(costs[t][1] for t in seg)
+            e["turns"] += len(seg)
+            e["chats"] += 1
+            e["created"] = e["created"] or any(keys.values())
+            if title not in e["titles"] and len(e["titles"]) < 5:
+                e["titles"].append(title)
+    return sorted(out.values(), key=lambda x: -x["cost_usd"])
+
+
+def _unattributed(sessions, refs, tabs):
+    tot_c = sum(s["cost_usd"] or 0 for s in sessions)
+    tot_od = sum(s.get("on_demand_usd") or 0 for s in sessions)
+    tot_t = sum(s["total_tokens"] or 0 for s in sessions)
+    kinds = {"jira": "jira", "prs": "prs", "repos": "repos"}
+    out = {}
+    for tab, items in tabs.items():
+        cost = tot_c - sum(i["cost_usd"] for i in items)
+        od = tot_od - sum(i.get("on_demand_usd") or 0 for i in items)
+        toks = tot_t - sum(i["total_tokens"] or 0 for i in items)
+        kind = kinds.get(tab)
+        chats = sum(1 for s in sessions
+                    if not (refs.get(s["session_id"]) or {}).get(kind)) if kind else 0
+        out[tab] = {"cost_usd": max(0.0, cost), "on_demand_usd": max(0.0, od),
+                    "total_tokens": max(0, round(toks)),
+                    "chats": chats, "total_usd": tot_c}
+    return out
+
+
+def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None):
+    jira, repos = {}, {}
+    for s in sessions:
+        r = refs.get(s["session_id"])
+        if not r:
+            continue
+        cost, toks = s["cost_usd"] or 0, s["total_tokens"] or 0
+        od = s.get("on_demand_usd") or 0
+        jira_items = r.get("jira") or []
+        if jira_items:
+            share_c, share_t = cost / len(jira_items), toks / len(jira_items)
+            share_od = od / len(jira_items)
+            for tk in jira_items:
+                e = jira.setdefault(tk, {"key": tk, "cost_usd": 0.0, "on_demand_usd": 0.0,
+                                           "total_tokens": 0,
+                                           "chats": 0, "titles": [], "created": False,
+                                           "role": "mentioned", "est": False})
+                e["cost_usd"] += share_c
+                e["on_demand_usd"] += share_od
+                e["total_tokens"] += share_t
+                e["chats"] += 1
+                e["est"] = e["est"] or bool(s.get("est"))
+                if len(e["titles"]) < 5:
+                    e["titles"].append(s["title"])
+        gc = s.get("git_correlation") or {}
+        if gc.get("matched") and gc.get("repos") and not s.get("repo_weights"):
+            for repo_row in gc["repos"]:
+                k = repo_row["name"]
+                share_c = repo_row.get("cost_usd") or 0
+                if share_c <= 0:
+                    continue
+                frac = share_c / cost if cost else 0
+                e = repos.setdefault(k, {"key": k, "cost_usd": 0.0, "on_demand_usd": 0.0,
+                                         "total_tokens": 0,
+                                         "chats": 0, "titles": [], "created": False,
+                                         "role": "inferred", "est": False})
+                e["cost_usd"] += share_c
+                e["on_demand_usd"] += od * frac
+                e["total_tokens"] += int(toks * frac)
+                e["chats"] += 1
+                e["est"] = e["est"] or bool(s.get("est"))
+                if len(e["titles"]) < 5:
+                    e["titles"].append(s["title"])
+        else:
+            repo_shares = _repo_cost_shares(s, r)
+            if repo_shares:
+                for it, frac in repo_shares:
+                    k = it["name"]
+                    e = repos.setdefault(k, {"key": k, "cost_usd": 0.0, "on_demand_usd": 0.0,
+                                             "total_tokens": 0,
+                                             "chats": 0, "titles": [], "created": False,
+                                             "role": "mentioned", "est": False})
+                    e["cost_usd"] += cost * frac
+                    e["on_demand_usd"] += od * frac
+                    e["total_tokens"] += toks * frac
+                    e["chats"] += 1
+                    e["est"] = e["est"] or bool(s.get("est"))
+                    if len(e["titles"]) < 5:
+                        e["titles"].append(s["title"])
+                    if it.get("role") == "primary":
+                        e["role"] = "primary"
+                    elif it.get("role") == "inferred" and e["role"] != "primary":
+                        e["role"] = "inferred"
+    srt = lambda d: sorted(d.values(), key=lambda x: -x["cost_usd"])
+    sess = [{"key": s["title"], "cost_usd": s["cost_usd"] or 0,
+             "on_demand_usd": s.get("on_demand_usd") or 0,
+             "total_tokens": s["total_tokens"] or 0, "chats": s["turns"] or 0,
+             "titles": [x for x in [s["repository"]] if x],
+             "created": False, "role": "mentioned", "est": bool(s.get("est")),
+             "session_id": s["session_id"]}
+            for s in sessions]
+    sess.sort(key=lambda x: -x["cost_usd"])
+    titles = {s["session_id"]: s["title"] for s in sessions}
+    billed = any(s.get("billed") for s in sessions)
+    if billed:
+        prs_map = {}
+        for s in sessions:
+            r = refs.get(s["session_id"]) or {}
+            entries = _pr_cost_entries(s, r, turn_prs, turn_cost)
+            if not entries:
+                continue
+            cost, toks = s["cost_usd"] or 0, s["total_tokens"] or 0
+            od = s.get("on_demand_usd") or 0
+            for it, share_c in entries:
+                frac = share_c / cost if cost else 0
+                share_t = int(toks * frac)
+                share_od = od * frac
+                k = it["key"] if isinstance(it, dict) else it
+                e = prs_map.setdefault(k, {"key": k, "cost_usd": 0.0, "on_demand_usd": 0.0,
+                                           "total_tokens": 0,
+                                           "chats": 0, "titles": [], "created": False,
+                                           "role": "mentioned", "est": False})
+                e["cost_usd"] += share_c
+                e["on_demand_usd"] += share_od
+                e["total_tokens"] += share_t
+                e["chats"] += 1
+                if len(e["titles"]) < 5:
+                    e["titles"].append(s["title"])
+                if isinstance(it, dict) and it.get("created"):
+                    e["created"] = True
+                if isinstance(it, dict) and it.get("inferred"):
+                    e["inferred"] = True
+        for pk, cat in (git_pr_catalog or {}).items():
+            if pk not in prs_map:
+                prs_map[pk] = dict(cat)
+        prs = sorted(prs_map.values(), key=lambda x: (-x["cost_usd"], x["key"]))
+    else:
+        prs = pr_segments(titles, turn_prs, turn_cost)
+    out = {"jira": srt(jira), "prs": prs, "repos": srt(repos), "sessions": sess}
+    out["unattributed"] = _unattributed(sessions, refs, out)
+    return out
+
+
+def _public_session(s):
+    skip = {"days", "by_model_day", "by_model", "text"}
+    return {k: v for k, v in s.items() if k not in skip}
+
+
+def _aggregate(sessions):
+    models = collections.defaultdict(lambda: collections.Counter())
+    daily = collections.defaultdict(lambda: collections.Counter())
+    for s in sessions:
+        for name, c in (s.get("by_model") or {}).items():
+            m = models[name]
+            for key, val in c.items():
+                m[key] += val
+            m["est"] = m["est"] or (1 if s.get("est") else 0)
+        for day, c in (s.get("days") or {}).items():
+            d = daily[day]
+            for key, val in c.items():
+                d[key] += val
+            d["sessions"] += 1
+    model_rows = sorted(
+        ({"model": k,
+          "requests": int(c["requests"]),
+          "input_tokens": round(c["input_tokens"]),
+          "output_tokens": round(c["output_tokens"]),
+          "cache_read_tokens": round(c["cache_read_tokens"]),
+          "cache_write_tokens": round(c["cache_write_tokens"]),
+          "cost_usd": c["cost_usd"],
+          "on_demand_usd": c["on_demand_usd"],
+          "est": bool(c["est"]),
+          "known_rate": True if any(s.get("billed") for s in sessions) else _known_rate(k)}
+         for k, c in models.items()),
+        key=lambda m: -m["cost_usd"])
+    daily_rows = [{"day": d, "requests": int(c["requests"]),
+                   "sessions": int(c["sessions"]),
+                   "total_tokens": round(c["total_tokens"]),
+                   "cost_usd": c["cost_usd"],
+                   "est_usd": c["est_usd"],
+                   "on_demand_usd": c["on_demand_usd"]}
+                  for d, c in sorted(daily.items())]
+    return model_rows, daily_rows
+
+
+def _fmt_day(d):
+    if os.name == "nt":
+        return d.strftime("%b %#d, %Y")
+    return d.strftime("%b %-d, %Y")
+
+
+def _billing_cycles(data):
+    """Current and previous billing cycle date ranges from usage-summary."""
+    summary = data.get("billing_summary") or {}
+    cur_start = _local_day(summary.get("billingCycleStart"))
+    cur_end = _local_day(summary.get("billingCycleEnd"))
+    if not cur_start:
+        return None
+    out = {"current": {"start": cur_start, "end": cur_end or cur_start}}
+    try:
+        cs = datetime.date.fromisoformat(cur_start)
+        ce = datetime.date.fromisoformat(cur_end) if cur_end else cs
+        span = max(1, (ce - cs).days)
+        last_end = cs - datetime.timedelta(days=1)
+        last_start = last_end - datetime.timedelta(days=span - 1)
+        out["last"] = {"start": last_start.isoformat(), "end": last_end.isoformat()}
+    except ValueError:
+        pass
+    return out
+
+
+def _cycle_historical(sessions, start, end, plan="", included_limit=0.0):
+    """Closed-cycle totals from billed events (no live allowance API)."""
+    rows = [c for c in (_clip(s, start, end) for s in sessions if s.get("billed")) if c]
+    od = sum(s.get("on_demand_usd") or 0 for s in rows)
+    cost = sum(s["cost_usd"] or 0 for s in rows)
+    included = max(0.0, cost - od)
+    return {
+        "which": "last",
+        "start": start,
+        "end": end,
+        "billed": True,
+        "historical": True,
+        "plan": plan,
+        "sessions": len(rows),
+        "requests": sum(s["requests"] or 0 for s in rows),
+        "total_tokens": sum(s["total_tokens"] or 0 for s in rows),
+        "cost_usd": round(cost, 4),
+        "included_usd": round(included, 4),
+        "on_demand_usd": round(od, 4),
+        "included_limit": included_limit,
+        "included_remaining": max(0.0, included_limit - included) if included_limit else None,
+        "bonus_usd": 0.0,
+        "on_demand_limit": None,
+        "on_demand_remaining": None,
+        "budget": included_limit,
+        "pct": (included / included_limit * 100) if included_limit else None,
+        "remaining": max(0.0, included_limit - included) if included_limit else None,
+    }
+
+
+def _cycle_mtd(data, today):
+    """Current Cursor billing cycle from usage-summary + get-current-period-usage."""
+    summary = data.get("billing_summary") or {}
+    period = data.get("billing_period") or {}
+    plan = (summary.get("individualUsage") or {}).get("plan") or {}
+    on_demand = (summary.get("individualUsage") or {}).get("onDemand") or {}
+    plan_usage = period.get("planUsage") or {}
+    breakdown = plan.get("breakdown") or {}
+    start_s = _local_day(summary.get("billingCycleStart"))
+    end_s = _local_day(summary.get("billingCycleEnd"))
+    try:
+        end_d = datetime.date.fromisoformat(end_s) if end_s else (
+            today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+    except ValueError:
+        end_d = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+    included_limit = _cents_usd(plan.get("limit") or plan_usage.get("limit"))
+    included_used = _cents_usd(plan.get("used") or plan_usage.get("includedSpend"))
+    included_remaining = _cents_usd(plan.get("remaining"))
+    if plan.get("remaining") is None and included_limit:
+        included_remaining = max(0.0, included_limit - included_used)
+    bonus_usd = _cents_usd(breakdown.get("bonus") or plan_usage.get("bonusSpend"))
+    plan_total_usd = _cents_usd(breakdown.get("total") or plan_usage.get("totalSpend"))
+    od_used = _cents_usd(on_demand.get("used"))
+    od_limit = _cents_usd(on_demand.get("limit") or (
+        (period.get("spendLimitUsage") or {}).get("individualLimit")))
+    od_remaining = _cents_usd(on_demand.get("remaining") or (
+        (period.get("spendLimitUsage") or {}).get("individualRemaining")))
+    budget = CREDIT_BUDGET if _BUDGET_OVERRIDDEN else (included_limit or CREDIT_BUDGET)
+    mtd_sessions = [c for c in (_clip(s, start_s or MIN_DAY, end_s or MAX_DAY)
+                                for s in data["sessions"] if s.get("billed")) if c] if start_s else []
+    cycle_tokens = sum(s["total_tokens"] or 0 for s in mtd_sessions)
+    return {
+        "which": "current",
+        "month": f"{start_s} → {end_s}" if start_s else today.strftime("%Y-%m"),
+        "start": start_s,
+        "end": end_s,
+        "billed": True,
+        "plan": summary.get("membershipType") or "",
+        "requests": sum(s["requests"] or 0 for s in mtd_sessions),
+        "sessions": len(mtd_sessions),
+        "total_tokens": cycle_tokens,
+        "cost_usd": round(included_used + bonus_usd + od_used, 4),
+        "included_usd": included_used,
+        "included_limit": included_limit,
+        "included_remaining": included_remaining,
+        "bonus_usd": bonus_usd,
+        "plan_total_usd": plan_total_usd or round(included_used + bonus_usd, 4),
+        "on_demand_usd": od_used,
+        "on_demand_limit": od_limit,
+        "on_demand_remaining": od_remaining,
+        "auto_pct": plan.get("autoPercentUsed"),
+        "api_pct": plan.get("apiPercentUsed"),
+        "total_pct": plan.get("totalPercentUsed"),
+        "auto_msg": (summary.get("autoModelSelectedDisplayMessage")
+                     or period.get("autoModelSelectedDisplayMessage") or ""),
+        "named_msg": (summary.get("namedModelSelectedDisplayMessage")
+                      or period.get("namedModelSelectedDisplayMessage") or ""),
+        "display_msg": period.get("displayMessage") or "",
+        "budget": budget,
+        "pct": (included_used / included_limit * 100) if included_limit else None,
+        "remaining": included_remaining,
+        "reset_date": _fmt_day(end_d),
+        "days_left": max(0, (end_d - today).days),
+    }
+
+
+def _summarize_subscriptions(sub_lines):
+    """Roll up plan-fee invoices to one row per account + plan."""
+    groups = collections.OrderedDict()
+    for inv in sub_lines:
+        acct = (inv.get("account") or "").strip() or "account"
+        plan = inv.get("plan") or "Subscription"
+        key = (acct.lower(), plan)
+        g = groups.setdefault(key, {
+            "account": acct,
+            "plan": plan,
+            "count": 0,
+            "net_usd": 0.0,
+            "first_day": inv.get("day") or "",
+            "last_day": inv.get("day") or "",
+        })
+        net = inv.get("net_usd") or 0
+        if net > 0.004:
+            g["count"] += 1
+            g["net_usd"] = round(g["net_usd"] + net, 4)
+        day = inv.get("day") or ""
+        if day:
+            if not g["first_day"] or day < g["first_day"]:
+                g["first_day"] = day
+            if not g["last_day"] or day > g["last_day"]:
+                g["last_day"] = day
+    return [g for g in groups.values() if g["count"] > 0]
+
+
+def _by_account_totals(sub_lines, usage_inv, billed_rows):
+    buckets = collections.defaultdict(lambda: {
+        "subscription_usd": 0.0,
+        "on_demand_invoiced_usd": 0.0,
+        "metered_usd": 0.0,
+        "included_usd": 0.0,
+        "on_demand_metered_usd": 0.0,
+    })
+    for inv in sub_lines:
+        acct = (inv.get("account") or "").strip() or "unknown"
+        buckets[acct]["subscription_usd"] += inv.get("net_usd") or 0
+    for inv in usage_inv:
+        acct = (inv.get("account") or "").strip() or "unknown"
+        buckets[acct]["on_demand_invoiced_usd"] += inv.get("net_usd") or 0
+    for row in billed_rows:
+        acct = (row.get("account_label") or "").strip() or "unknown"
+        cost = row.get("cost_usd") or 0
+        od = row.get("on_demand_usd") or 0
+        buckets[acct]["metered_usd"] += cost
+        buckets[acct]["on_demand_metered_usd"] += od
+        buckets[acct]["included_usd"] += max(0.0, cost - od)
+    out = []
+    for acct, b in sorted(buckets.items()):
+        sub = round(b["subscription_usd"], 4)
+        od_inv = round(b["on_demand_invoiced_usd"], 4)
+        out.append({
+            "account": acct,
+            "subscription_usd": sub,
+            "on_demand_invoiced_usd": od_inv,
+            "cash_usd": round(sub + od_inv, 4),
+            "metered_usd": round(b["metered_usd"], 4),
+            "included_usd": round(b["included_usd"], 4),
+            "on_demand_metered_usd": round(b["on_demand_metered_usd"], 4),
+        })
+    return out
+
+
+def build_payload(start, end, q="", force=False):
+    data = scan_cursor(force=force)
+    billed = bool(data.get("billed"))
+    sessions = []
+    for full in data["sessions"]:
+        clipped = _clip(full, start, end)
+        if clipped:
+            sessions.append(clipped)
+    q = (q or "").strip().lower()
+    if q:
+        sessions = [s for s in sessions if _matches(s, q)]
+    billed_rows = [s for s in sessions if s.get("billed")] if billed else sessions
+    other_rows = [s for s in sessions if billed and not s.get("billed")]
+    models, daily = _aggregate(billed_rows)
+    refs = {s["session_id"]: s.get("refs") or data["refs"].get(s["session_id"],
+            {"jira": [], "prs": [], "repos": []}) for s in billed_rows}
+    keep = {s["session_id"] for s in billed_rows}
+    turn_prs = {k: v for k, v in data["turn_prs"].items() if k in keep}
+    turn_cost = {k: v for k, v in data["turn_cost"].items() if k in keep}
+    on_demand = sum(s.get("on_demand_usd") or 0 for s in billed_rows)
+    totals = {
+        "cost_usd": sum(s["cost_usd"] or 0 for s in billed_rows),
+        "est_usd": 0.0 if billed else sum(s.get("est_usd") or 0 for s in billed_rows),
+        "on_demand_usd": on_demand,
+        "included_usd": 0.0,
+        "measured_usd": 0.0,
+        "total_tokens": sum(s["total_tokens"] or 0 for s in billed_rows),
+        "input_tokens": sum(s["input_tokens"] or 0 for s in billed_rows),
+        "output_tokens": sum(s["output_tokens"] or 0 for s in billed_rows),
+        "cache_read_tokens": sum(s["cache_read_tokens"] or 0 for s in billed_rows),
+        "cache_write_tokens": sum(s["cache_write_tokens"] or 0 for s in billed_rows),
+        "measured_tokens": sum(s.get("measured_tokens") or 0 for s in billed_rows),
+        "requests": sum(s["requests"] or 0 for s in billed_rows),
+        "sessions": len(billed_rows),
+        "other_sessions": len(other_rows),
+        "other_est_usd": sum(s["cost_usd"] or 0 for s in other_rows),
+    }
+    totals["included_usd"] = max(0.0, totals["cost_usd"] - on_demand) if billed else (
+        totals["cost_usd"] - totals["est_usd"])
+    totals["measured_usd"] = totals["included_usd"]
+    sub_lines, usage_inv = [], []
+    inv_cycle_starts = sorted({
+        inv.get("usage_cycle_start") or _invoice_usage_cycle_start(inv)
+        for inv in data.get("invoices") or []
+        if inv.get("kind") == "usage" and (
+            inv.get("usage_cycle_start") or _invoice_usage_cycle_start(inv))
+    })
+    bc = _billing_cycles(data) if billed else None
+    if bc:
+        for key in ("current", "last"):
+            s = (bc.get(key) or {}).get("start")
+            if s:
+                inv_cycle_starts.append(s)
+    inv_cycle_starts = sorted(set(inv_cycle_starts))
+    for inv in data.get("invoices") or []:
+        day = inv.get("day") or ""
+        if inv.get("kind") == "subscription":
+            if day and start <= day <= end:
+                sub_lines.append(inv)
+        elif inv.get("kind") == "usage" and _usage_invoice_in_view(
+                inv, start, end, inv_cycle_starts):
+            usage_inv.append(inv)
+    sub_lines.sort(key=lambda i: i.get("day") or "")
+    totals["subscription_usd"] = round(sum(i.get("net_usd") or 0 for i in sub_lines), 4)
+    totals["subscription_lines"] = sub_lines
+    totals["subscription_summary"] = _summarize_subscriptions(sub_lines)
+    totals["invoice_usage_usd"] = round(sum(i.get("net_usd") or 0 for i in usage_inv), 4)
+    totals["cash_usd"] = round(totals["subscription_usd"] + totals["invoice_usage_usd"], 4)
+    totals["metered_usd"] = round(totals["cost_usd"], 4)
+    totals["grand_usd"] = totals["cash_usd"]
+    totals["by_account"] = _by_account_totals(sub_lines, usage_inv, billed_rows)
+    totals["unattributed_usd"] = round(
+        sum(s["cost_usd"] or 0 for s in billed_rows if s.get("unattributed")), 4)
+    totals["orphan_billed_usd"] = round(
+        sum(s["cost_usd"] or 0 for s in billed_rows if s.get("orphan_billed")), 4)
+    legacy = next((a for a in totals["by_account"]
+                   if a["account"].lower() == LEGACY_INVOICE_EMAIL.lower()), None)
+    if legacy:
+        totals["legacy_compare"] = {
+            "email": LEGACY_INVOICE_EMAIL,
+            "reported_usd": LEGACY_INVOICE_TOTAL,
+            "api_cash_usd": legacy["cash_usd"],
+            "metered_usd": legacy["metered_usd"],
+            "subscription_usd": legacy["subscription_usd"],
+            "on_demand_invoiced_usd": legacy["on_demand_invoiced_usd"],
+        }
+    bounds_days = [s["first_day"] for s in data["sessions"] if s.get("first_day")] + \
+                  [s["last_day"] for s in data["sessions"] if s.get("last_day")]
+    today = datetime.date.today()
+    cycles = _billing_cycles(data) if billed else None
+    if billed:
+        mtd = _cycle_mtd(data, today)
+        view_cycle = dict(mtd)
+        if cycles and cycles.get("last"):
+            last = cycles["last"]
+            if start == last["start"] and end == last["end"]:
+                view_cycle = _cycle_historical(
+                    data["sessions"], last["start"], last["end"],
+                    plan=mtd.get("plan") or "",
+                    included_limit=mtd.get("included_limit") or 0.0)
+    else:
+        month = today.strftime("%Y-%m")
+        mtd_sessions = [c for c in (_clip(s, month + "-01", MAX_DAY)
+                                    for s in data["sessions"]) if c]
+        mtd_cost = sum(s["cost_usd"] or 0 for s in mtd_sessions)
+        reset = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+        mtd = {"which": "current", "month": month, "start": month + "-01", "end": today.isoformat(),
+               "billed": False,
+               "requests": sum(s["requests"] or 0 for s in mtd_sessions),
+               "sessions": len(mtd_sessions),
+               "total_tokens": sum(s["total_tokens"] or 0 for s in mtd_sessions),
+               "cost_usd": mtd_cost,
+               "budget": CREDIT_BUDGET,
+               "pct": (mtd_cost / CREDIT_BUDGET * 100) if CREDIT_BUDGET else None,
+               "remaining": (CREDIT_BUDGET - mtd_cost) if CREDIT_BUDGET else None,
+               "reset_date": _fmt_day(reset),
+               "days_left": (reset - today).days}
+        view_cycle = mtd
+    if billed:
+        range_is_current_cycle = bool(
+            cycles and start == (cycles.get("current") or {}).get("start")
+            and end == (cycles.get("current") or {}).get("end"))
+    else:
+        range_is_current_cycle = bool(
+            mtd.get("start") and start == mtd["start"]
+            and end <= (mtd.get("end") or MAX_DAY))
+    pub = [_public_session(s) for s in (billed_rows + other_rows)]
+    return {
+        "totals": totals,
+        "sessions": pub,
+        "models": models,
+        "daily": daily,
+        "mtd": mtd,
+        "view_cycle": view_cycle,
+        "cycles": cycles,
+        "range_is_current_cycle": range_is_current_cycle,
+        "rollup": rollup(billed_rows, refs, turn_prs, turn_cost,
+                          data.get("git_pr_catalog")),
+        "jira_base": JIRA_BASE,
+        "q": q,
+        "range": {"start": start, "end": end},
+        "bounds": {"min": min(bounds_days) if bounds_days else None,
+                   "max": max(bounds_days) if bounds_days else None},
+        "db": DB_PATH,
+        "billed": billed,
+        "billing_error": data.get("billing_error"),
+        "billing_email": data.get("billing_email") or "",
+        "billing_emails": data.get("billing_emails") or [],
+        "previous_email": data.get("previous_email") or "",
+        "plan": (data.get("billing_summary") or {}).get("membershipType") or "",
+        "rates": {k: {"input": a, "output": b, "cache_read": c}
+                  for k, (a, b, c) in MODEL_RATES.items()},
+        "chars_per_token": CHARS_PER_TOKEN,
+        "context_window": CONTEXT_WINDOW_TOKENS,
+    }
+
+
+def _state_load():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _state_save(state):
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+        os.replace(tmp, STATE_PATH)
+    except Exception as exc:
+        DIGEST_STATUS["last_error"] = f"state write failed: {exc}"
+
+
+def _digest_enabled(state=None):
+    """Automatic digests need a recipient *and* the switch left on."""
+    if not EMAIL_TO:
+        return False
+    if state is None:
+        state = _state_load()
+    return bool(state.get("digest_enabled", True))
+
+
+def budget_set(value):
+    global CREDIT_BUDGET, _BUDGET_OVERRIDDEN
+    try:
+        n = float(str(value).replace(",", "").replace("_", "").replace("$", "").strip())
+    except (TypeError, ValueError):
+        return CREDIT_BUDGET
+    n = max(0.0, n)
+    CREDIT_BUDGET = n
+    _BUDGET_OVERRIDDEN = True
+    with DIGEST_LOCK:
+        state = _state_load()
+        state["monthly_budget_usd"] = n
+        _state_save(state)
+    return n
+
+
+def digest_set_enabled(on):
+    """Persist the on/off switch so it survives a restart."""
+    with DIGEST_LOCK:
+        state = _state_load()
+        state["digest_enabled"] = bool(on)
+        if on:
+            # Re-arm today's guard, so switching back on part-way through a day
+            # still delivers that day's digest instead of silently skipping it.
+            state.pop("last_check_day", None)
+        _state_save(state)
+
+
+def _gmail_app_dir():
+    appdata = os.environ.get("APPDATA") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(appdata, "cursor-dashboard")
+
+
+def _gmail_credentials_path():
+    candidates = []
+    if GMAIL_CREDENTIALS:
+        candidates.append(os.path.expandvars(os.path.expanduser(GMAIL_CREDENTIALS)))
+    appdir = _gmail_app_dir()
+    candidates += [
+        os.path.join(appdir, "gmail-oauth-client.json"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "gmail-oauth-client.json"),
+        os.path.join(os.path.dirname(STATE_PATH), "gmail-oauth-client.json"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+def _gmail_token_file():
+    if GMAIL_TOKEN_PATH:
+        return os.path.expandvars(os.path.expanduser(GMAIL_TOKEN_PATH))
+    cred = _gmail_credentials_path()
+    if cred and os.path.isfile(cred):
+        return os.path.join(os.path.dirname(cred), "gmail-oauth-token.json")
+    return os.path.join(_gmail_app_dir(), "gmail-oauth-token.json")
+
+
+def _gmail_setup_hint():
+    dest = os.path.join(_gmail_app_dir(), "gmail-oauth-client.json")
+    return (
+        "Gmail API is not set up. One-time steps:\n"
+        "  1. https://console.cloud.google.com/apis/library/gmail.googleapis.com — enable Gmail API\n"
+        "  2. APIs & Services → Credentials → Create credentials → OAuth client ID → Desktop app\n"
+        "  3. Download the JSON and save it as:\n"
+        f"       {dest}\n"
+        "  4. If the consent screen is in Testing, add your Gmail as a test user\n"
+        "  5. py -3 cursor_dashboard.py --gmail-auth"
+    )
+
+
+def _gmail_load_client():
+    path = _gmail_credentials_path()
+    if not path or not os.path.isfile(path):
+        raise RuntimeError(_gmail_setup_hint())
+    with open(path, encoding="utf-8") as fh:
+        raw = json.load(fh)
+    cfg = raw.get("installed") or raw.get("web") or raw
+    if not cfg.get("client_id"):
+        raise RuntimeError(f"No client_id in {path}. Download a Desktop OAuth client JSON from Google Cloud.")
+    return cfg, path
+
+
+def _gmail_token_load():
+    path = _gmail_token_file()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _gmail_token_save(token):
+    path = _gmail_token_file()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(token, fh, indent=2)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _gmail_http(method, url, data=None, headers=None, form=False):
+    hdrs = dict(headers or {})
+    body = None
+    if data is not None:
+        if form:
+            body = urlencode(data).encode()
+            hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        else:
+            body = json.dumps(data).encode()
+            hdrs.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=body, method=method, headers=hdrs)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        snippet = exc.read()[:400].decode("utf-8", "replace")
+        raise RuntimeError(f"Gmail API {exc.code}: {snippet}") from exc
+    return json.loads(raw) if raw else {}
+
+
+def _gmail_pkce():
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _gmail_wait_for_code(httpd, timeout=180):
+    result = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = parse_qs(urlparse(self.path).query)
+            result.update({k: v[0] for k, v in qs.items() if v})
+            ok = "code" in result and not result.get("error")
+            msg = ("Gmail access granted. You can close this tab and return to the dashboard."
+                   if ok else "Authorization failed: " + (result.get("error") or "unknown"))
+            body = (f"<html><body style='font-family:sans-serif;padding:2rem'>"
+                    f"<h2>Cursor dashboard</h2><p>{msg}</p></body></html>").encode()
+            self.send_response(200 if ok else 400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    httpd.RequestHandlerClass = Handler
+    httpd.timeout = timeout
+    httpd.handle_request()
+    return result
+
+
+def gmail_auth(force_consent=True):
+    """Open a browser for Gmail OAuth and store a refresh token on disk."""
+    cfg, cred_path = _gmail_load_client()
+    httpd = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    port = httpd.server_address[1]
+    redirect_uri = f"http://127.0.0.1:{port}/"
+    verifier, challenge = _gmail_pkce()
+    state = secrets.token_urlsafe(24)
+    params = {
+        "client_id": cfg["client_id"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": GMAIL_SCOPE,
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    if force_consent:
+        params["prompt"] = "consent"
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    print(f"  opening browser for Gmail OAuth (client {cred_path})", flush=True)
+    print(f"  if it does not open: {auth_url}", flush=True)
+    webbrowser.open(auth_url)
+    result = _gmail_wait_for_code(httpd)
+    httpd.server_close()
+    if result.get("error"):
+        raise RuntimeError(f"Gmail OAuth denied: {result.get('error_description') or result['error']}")
+    if result.get("state") != state:
+        raise RuntimeError("Gmail OAuth state mismatch — try --gmail-auth again.")
+    code = result.get("code")
+    if not code:
+        raise RuntimeError("Gmail OAuth timed out or returned no code. Run --gmail-auth again.")
+    token = _gmail_http("POST", cfg.get("token_uri") or "https://oauth2.googleapis.com/token", {
+        "client_id": cfg["client_id"],
+        **({"client_secret": cfg["client_secret"]} if cfg.get("client_secret") else {}),
+        "code": code,
+        "code_verifier": verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": redirect_uri,
+    }, form=True)
+    if not token.get("refresh_token"):
+        prev = _gmail_token_load()
+        if prev.get("refresh_token"):
+            token["refresh_token"] = prev["refresh_token"]
+        else:
+            raise RuntimeError(
+                "Google did not return a refresh token. Re-run with --gmail-auth "
+                "(prompt=consent) and make sure you tick the Gmail send permission.")
+    token["obtained_at"] = int(time.time())
+    token["expiry"] = int(time.time()) + int(token.get("expires_in") or 3600) - 60
+    token["email"] = _gmail_profile_email(token.get("access_token"))
+    _gmail_token_save({k: token[k] for k in token if k != "id_token"})
+    print(f"  Gmail authorized as {token['email']}", flush=True)
+    return token
+
+
+def _gmail_profile_email(access_token):
+    if not access_token:
+        return ""
+    try:
+        profile = _gmail_http(
+            "GET", "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            headers={"Authorization": f"Bearer {access_token}"})
+        return (profile.get("emailAddress") or "").strip()
+    except Exception:
+        return ""
+
+
+def _gmail_refresh(cfg, token):
+    refresh = token.get("refresh_token")
+    if not refresh:
+        raise RuntimeError("Gmail token has no refresh_token. Run: py -3 cursor_dashboard.py --gmail-auth")
+    fresh = _gmail_http("POST", cfg.get("token_uri") or "https://oauth2.googleapis.com/token", {
+        "client_id": cfg["client_id"],
+        **({"client_secret": cfg["client_secret"]} if cfg.get("client_secret") else {}),
+        "refresh_token": refresh,
+        "grant_type": "refresh_token",
+    }, form=True)
+    token.update(fresh)
+    token["refresh_token"] = refresh
+    token["obtained_at"] = int(time.time())
+    token["expiry"] = int(time.time()) + int(fresh.get("expires_in") or 3600) - 60
+    if not token.get("email"):
+        token["email"] = _gmail_profile_email(token.get("access_token"))
+    _gmail_token_save({k: token[k] for k in token if k != "id_token"})
+    return token
+
+
+def _gmail_access_token(interactive=False):
+    cfg, _ = _gmail_load_client()
+    token = _gmail_token_load()
+    if not token.get("refresh_token") and not token.get("access_token"):
+        if not interactive:
+            raise RuntimeError("Gmail is not authorized. Run: py -3 cursor_dashboard.py --gmail-auth")
+        token = gmail_auth()
+    expiry = int(token.get("expiry") or 0)
+    if token.get("access_token") and expiry > time.time() + 30:
+        return token["access_token"], token
+    token = _gmail_refresh(cfg, token)
+    return token["access_token"], token
+
+
+def _gmail_ready():
+    token = _gmail_token_load()
+    email = (token.get("email") or "").strip()
+    return bool(token.get("refresh_token") or token.get("access_token")), email
+
+
+def _gmail_send_message(msg, interactive=False):
+    access, token = _gmail_access_token(interactive=interactive)
+    sender = (token.get("email") or _gmail_profile_email(access) or "").strip()
+    if sender:
+        if msg.get("From"):
+            msg.replace_header("From", sender)
+        else:
+            msg["From"] = sender
+    raw = base64.urlsafe_b64encode(bytes(msg)).decode("ascii")
+    headers = {"Authorization": f"Bearer {access}"}
+    try:
+        return _gmail_http(
+            "POST", "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            {"raw": raw}, headers=headers)
+    except RuntimeError as exc:
+        if "401" not in str(exc):
+            raise
+        cfg, _ = _gmail_load_client()
+        token = _gmail_refresh(cfg, _gmail_token_load())
+        headers = {"Authorization": f"Bearer {token['access_token']}"}
+        return _gmail_http(
+            "POST", "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            {"raw": raw}, headers=headers)
+
+
+def _digest_from():
+    """Sender: Gmail account that authorized, else an explicit --email-from."""
+    if EMAIL_FROM:
+        return EMAIL_FROM
+    _, email = _gmail_ready()
+    if email:
+        return email
+    domain = EMAIL_TO.split("@")[-1] if "@" in EMAIL_TO else "gmail.com"
+    return f"cursor-dashboard@{domain}"
+
+
+def _money(v):
+    return f"${v:,.2f}"
+
+
+def _find_digest_day(before):
+    """The most recent day with activity strictly before ``before``.
+
+    Deliberately not "yesterday": after a weekend or time off the digest should
+    still report the last day actually worked, rather than mailing an empty day
+    or silently skipping it.
+    """
+    lo = (datetime.date.fromisoformat(before)
+          - datetime.timedelta(days=DIGEST_LOOKBACK_DAYS)).isoformat()
+    hi = (datetime.date.fromisoformat(before) - datetime.timedelta(days=1)).isoformat()
+    if hi < lo:
+        return None, None
+    recent = build_payload(lo, hi, "")
+    active = [d for d in recent.get("daily", []) if (d.get("requests") or 0) > 0]
+    if not active:
+        return None, recent
+    return max(d["day"] for d in active), recent
+
+
+def _digest_data(day, recent=None):
+    """Everything the email needs: the day itself plus trailing context."""
+    p = build_payload(day, day, "")
+    if recent is None:
+        lo = (datetime.date.fromisoformat(day)
+              - datetime.timedelta(days=DIGEST_LOOKBACK_DAYS)).isoformat()
+        recent = build_payload(lo, day, "")
+    days = {d["day"]: d for d in recent.get("daily", []) if (d.get("requests") or 0) > 0}
+    prior = [d for d in sorted(days) if d < day]
+    # Compare like with like: an average over active days only, so a week off
+    # does not make an ordinary day look like a spike.
+    window = prior[-DIGEST_AVG_DAYS:]
+    avg = (sum(days[d]["cost_usd"] for d in window) / len(window)) if window else None
+    return {
+        "day": day,
+        "payload": p,
+        "prev_day": prior[-1] if prior else None,
+        "prev_cost": days[prior[-1]]["cost_usd"] if prior else None,
+        "avg_cost": avg,
+        "avg_days": len(window),
+    }
+
+
+def _delta_note(cost, ref, label):
+    if not ref:
+        return ""
+    pct = (cost - ref) / ref * 100 if ref else 0
+    arrow = "▲" if pct >= 0 else "▼"
+    return f"{arrow} {abs(pct):,.0f}% vs {label} ({_money(ref)})"
+
+
+def _digest_subject(d):
+    t = d["payload"]["totals"]
+    pretty = datetime.date.fromisoformat(d["day"]).strftime("%a %b %d")
+    return (f"Cursor digest — {pretty}: {_money(t['cost_usd'])}, "
+            f"{t['requests']:,} requests")
+
+
+def _rows(items, n=5):
+    return [i for i in (items or [])][:n]
+
+
+def _digest_sessions(p):
+    rows = p.get("sessions") or []
+    if p.get("billed"):
+        rows = [s for s in rows if s.get("billed") is not False]
+    return rows
+
+
+def _digest_html(d):
+    p = d["payload"]
+    t = p["totals"]
+    day_pretty = datetime.date.fromisoformat(d["day"]).strftime("%A, %B %d, %Y")
+    billed = bool(p.get("billed"))
+    email = p.get("billing_email") or EMAIL_TO
+    incl = t.get("included_usd") or 0
+    od = t.get("on_demand_usd") or 0
+
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    def table(title, rows, cols):
+        if not rows:
+            return ""
+        head = "".join(f"<th align='{a}'>{esc(c)}</th>" for c, a, _ in cols)
+        body = ""
+        for r in rows:
+            body += "<tr>" + "".join(
+                f"<td align='{a}' style='padding:4px 10px;border-top:1px solid #e6e8eb'>"
+                f"{fn(r)}</td>" for _, a, fn in cols) + "</tr>"
+        return (f"<h3 style='margin:22px 0 6px;font-size:14px;color:#57606a'>{esc(title)}</h3>"
+                f"<table cellspacing='0' cellpadding='0' style='border-collapse:collapse;"
+                f"font-size:13px;width:100%'><tr style='color:#57606a;font-size:11px;"
+                f"text-transform:uppercase;letter-spacing:.4px'>{head}</tr>{body}</table>")
+
+    deltas = " &nbsp;·&nbsp; ".join(x for x in (
+        _delta_note(t["cost_usd"], d["prev_cost"], f"prior active day ({d['prev_day']})"),
+        _delta_note(t["cost_usd"], d["avg_cost"], f"{d['avg_days']}-day avg"),
+    ) if x)
+
+    cards = [("Spend", _money(t["cost_usd"]))]
+    if billed:
+        cards += [("Included", _money(incl)), ("On-demand", _money(od))]
+    cards += [("Requests", f"{t['requests']:,}"),
+              ("Chats", f"{t['sessions']:,}"),
+              ("Tokens", f"{(t.get('total_tokens') or 0):,}")]
+    card_html = "".join(
+        f"<td style='padding:10px 14px;background:#f6f8fa;border-radius:8px'>"
+        f"<div style='font-size:11px;color:#57606a;text-transform:uppercase;"
+        f"letter-spacing:.4px'>{esc(k)}</div>"
+        f"<div style='font-size:19px;font-weight:600;color:#1f2328'>{esc(v)}</div></td>"
+        f"<td style='width:8px'></td>" for k, v in cards)
+
+    ro = p.get("rollup") or {}
+    parts = [
+        table("Cost by model", _rows(p.get("models")), [
+            ("Model", "left", lambda r: esc(r["model"]) + (
+                " <span style='color:#9a6700;font-size:10px'>EST</span>"
+                if r.get("est") else "")),
+            ("Requests", "right", lambda r: f"{r['requests']:,}"),
+            ("Cost", "right", lambda r: _money(r["cost_usd"]))]),
+        table("Top Jira tickets", _rows(ro.get("jira")), [
+            ("Ticket", "left", lambda r: esc(r["key"])),
+            ("Chats", "right", lambda r: f"{r['chats']:,}"),
+            ("Cost", "right", lambda r: _money(r["cost_usd"]))]),
+        table("Top pull requests", _rows(ro.get("prs")), [
+            ("PR", "left", lambda r: esc(r["key"])),
+            ("Chats", "right", lambda r: f"{r['chats']:,}"),
+            ("Cost", "right", lambda r: _money(r["cost_usd"]))]),
+        table("Top repositories", _rows(ro.get("repos")), [
+            ("Repository", "left", lambda r: esc(r["key"])),
+            ("Chats", "right", lambda r: f"{r['chats']:,}"),
+            ("Cost", "right", lambda r: _money(r["cost_usd"]))]),
+        table("Most expensive chats", _rows(_digest_sessions(p)), [
+            ("Chat", "left", lambda r: esc((r["title"] or "")[:70]) + (
+                " <span style='color:#9a6700;font-size:10px'>EST</span>"
+                if r.get("est") else "")),
+            ("Requests", "right", lambda r: f"{(r.get('requests') or 0):,}"),
+            ("Cost", "right", lambda r: _money(r["cost_usd"]))]),
+    ]
+    if billed:
+        split = (f"Billed to {esc(email)} &nbsp;·&nbsp; included {_money(incl)} "
+                 f"&nbsp;·&nbsp; on-demand {_money(od)}")
+        foot = (f"Generated locally by cursor_dashboard.py. Figures are Cursor billed usage "
+                f"for {esc(email)} (included plan + on-demand). The Pro / Pro+ subscription "
+                f"fee is invoiced separately and is not included. Cloud agents on other "
+                f"machines are included in billed events; chats from a previous Cursor login "
+                f"on this machine are not.")
+    else:
+        split = "Local transcript estimate — not a Cursor invoice."
+        foot = ("Generated locally by cursor_dashboard.py from this machine's Cursor chat "
+                "store. These are list-price estimates, not a Cursor invoice.")
+    return f"""<html><body style="margin:0;padding:24px;background:#fff;
+ font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1f2328">
+<div style="max-width:720px;margin:0 auto">
+<div style="font-size:12px;color:#57606a;text-transform:uppercase;letter-spacing:.6px">
+Cursor &mdash; daily digest</div>
+<h2 style="margin:4px 0 2px;font-size:20px">{esc(day_pretty)}</h2>
+<div style="font-size:12px;color:#57606a">{deltas or "&nbsp;"}</div>
+<table cellspacing="0" cellpadding="0" style="margin:16px 0 4px"><tr>{card_html}</tr></table>
+<div style="font-size:12px;color:#57606a;margin:10px 0 0">{split}</div>
+{"".join(parts)}
+<p style="margin:26px 0 0;font-size:11px;color:#8b949e;border-top:1px solid #e6e8eb;
+padding-top:10px">
+{foot}
+</p></div></body></html>"""
+
+
+def _digest_text(d):
+    p = d["payload"]
+    t = p["totals"]
+    billed = bool(p.get("billed"))
+    email = p.get("billing_email") or EMAIL_TO
+    lines = [f"Cursor daily digest - {d['day']}", ""]
+    if billed:
+        lines += [f"Account     : {email}",
+                  f"Spend       : {_money(t['cost_usd'])}",
+                  f"Included    : {_money(t.get('included_usd') or 0)}",
+                  f"On-demand   : {_money(t.get('on_demand_usd') or 0)}"]
+    else:
+        lines.append(f"Est. spend  : {_money(t['cost_usd'])}")
+    lines += [f"Requests    : {t['requests']:,}",
+              f"Chats       : {t['sessions']:,}"]
+    if d["prev_cost"]:
+        lines.append(f"Prior active day ({d['prev_day']}): {_money(d['prev_cost'])}")
+    if d["avg_cost"]:
+        lines.append(f"{d['avg_days']}-day average: {_money(d['avg_cost'])}")
+    lines += ["", "Top models:"]
+    for m in _rows(p.get("models")):
+        lines.append(f"  {m['model']:<28} {m['requests']:>6,} req  {_money(m['cost_usd'])}")
+    ro = p.get("rollup") or {}
+    for label, key in (("Jira", "jira"), ("Pull requests", "prs"), ("Repositories", "repos")):
+        rows = _rows(ro.get(key))
+        if rows:
+            lines += ["", f"{label}:"]
+            for r in rows:
+                lines.append(f"  {r['key']:<40} {_money(r['cost_usd'])}")
+    lines += ["", "Most expensive chats:"]
+    for s in _rows(_digest_sessions(p)):
+        lines.append(f"  {(s['title'] or '')[:52]:<52} {_money(s['cost_usd'])}")
+    if billed:
+        lines += ["", f"Cursor billed usage for {email} (included plan + on-demand). "
+                  "Subscription invoices are separate."]
+    else:
+        lines += ["", "Local transcript estimates, not a Cursor invoice."]
+    return "\n".join(lines)
+
+
+def send_digest(day, recent=None, interactive=False):
+    """Build and deliver the digest for one day via the Gmail API."""
+    d = _digest_data(day, recent)
+    msg = EmailMessage()
+    msg["Subject"] = _digest_subject(d)
+    msg["From"] = _digest_from()
+    msg["To"] = EMAIL_TO
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=_digest_from().split("@")[-1])
+    msg.set_content(_digest_text(d))
+    msg.add_alternative(_digest_html(d), subtype="html")
+    _gmail_send_message(msg, interactive=interactive)
+    return d
+
+
+def _digest_worker(day, recent, state, interactive=True):
+    try:
+        send_digest(day, recent, interactive=interactive)
+        state["last_digest_day"] = day
+        state["last_sent_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        DIGEST_STATUS["last_error"] = ""
+        print(f"[digest] sent {day} to {EMAIL_TO}")
+    except Exception as exc:
+        DIGEST_STATUS["last_error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[digest] FAILED for {day}: {exc}")
+        traceback.print_exc()
+    finally:
+        DIGEST_STATUS["sending"] = False
+        _state_save(state)
+
+
+def maybe_send_digest(force=False):
+    """Send the digest once, on the first refresh of a new local day.
+
+    The guard is written to disk *before* the mail is attempted and the whole
+    check is serialized, so several browser tabs refreshing at once cannot
+    produce duplicate mail.
+    """
+    if not EMAIL_TO:
+        return
+    today = datetime.date.today().isoformat()
+    with DIGEST_LOCK:
+        state = _state_load()
+        if not _digest_enabled(state):
+            return
+        if not force and state.get("last_check_day") == today:
+            return
+        state["last_check_day"] = today
+        day, recent = _find_digest_day(today)
+        if not day or (not force and day == state.get("last_digest_day")):
+            _state_save(state)
+            return
+        DIGEST_STATUS["sending"] = True
+        _state_save(state)
+        threading.Thread(target=_digest_worker, args=(day, recent, state),
+                         kwargs={"interactive": True}, daemon=True).start()
+
+
+def digest_status():
+    state = _state_load()
+    ready, gmail_email = _gmail_ready()
+    via = f"Gmail API as {gmail_email}" if gmail_email else "Gmail API"
+    hint = ""
+    if not os.path.isfile(_gmail_credentials_path() or ""):
+        hint = _gmail_setup_hint()
+    elif not ready:
+        hint = "Gmail is not authorized. Run: py -3 cursor_dashboard.py --gmail-auth"
+    return {"configured": bool(EMAIL_TO), "enabled": _digest_enabled(state),
+            "to": EMAIL_TO, "from": gmail_email or _digest_from(),
+            "via": via, "gmail_email": gmail_email, "ready": ready,
+            "last_digest_day": state.get("last_digest_day"),
+            "last_sent_at": state.get("last_sent_at"),
+            "sending": DIGEST_STATUS["sending"],
+            "error": DIGEST_STATUS["last_error"] or hint}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def _send(self, body, ctype):
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        qs = parse_qs(url.query)
+        try:
+            if url.path == "/api/data":
+                start = qs.get("start", ["0000-01-01"])[0]
+                end = qs.get("end", ["9999-12-31"])[0]
+                q = qs.get("q", [""])[0]
+                force = qs.get("refresh", ["0"])[0] == "1"
+                payload = build_payload(start, end, q, force=force)
+                # The first refresh of a new day is what triggers the digest; it
+                # rides along with the data request so a scheduled browser open
+                # is enough to send mail.
+                maybe_send_digest()
+                payload["digest"] = digest_status()
+                self._send(json.dumps(payload, default=str), "application/json")
+            elif url.path == "/api/digest":
+                action = qs.get("action", [""])[0]
+                if qs.get("force", ["0"])[0] == "1":
+                    action = "send"
+                if action in ("on", "off"):
+                    digest_set_enabled(action == "on")
+                elif action == "send":
+                    maybe_send_digest(force=True)
+                self._send(json.dumps(digest_status()), "application/json")
+            elif url.path in ("/api/budget", "/api/credits"):
+                if "value" in qs:
+                    budget_set(qs.get("value", [""])[0])
+                self._send(json.dumps({"budget": CREDIT_BUDGET}),
+                           "application/json")
+            elif url.path == "/api/turns":
+                sid = qs.get("session_id", [""])[0]
+                turns = scan_cursor().get("turns", {}).get(sid, [])
+                self._send(json.dumps(turns, default=str), "application/json")
+            elif url.path in ("/", "/index.html"):
+                self._send(PAGE, "text/html; charset=utf-8")
+            else:
+                self.send_error(404)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            return
+        except Exception as exc:
+            traceback.print_exc()
+            try:
+                self._send(json.dumps({"error": str(exc)}), "application/json")
+            except Exception:
+                return
+
+
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Cursor Chat Cost Dashboard</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--acc:#2f81f7;--good:#3fb950}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,Segoe UI,Roboto,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);
+ padding:12px 20px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+h1{font-size:16px;margin:0;font-weight:600;flex:1}
+input,select,button{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit}
+button{cursor:pointer}button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+main{padding:20px;max-width:1500px;margin:0 auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-bottom:20px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0;overflow:hidden}
+.card.subcard{grid-column:span 1;min-width:190px}
+.card .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.card .v{font-size:24px;font-weight:700;margin-top:6px}
+.card .v .metered-note{display:block;margin-top:6px;font-size:11px;font-weight:500;color:var(--dim);line-height:1.4}
+.card .fees{margin-top:10px;display:flex;flex-direction:column;gap:6px;font-weight:500;letter-spacing:0}
+.card .fees.compact .fee-l{font-size:12px}
+.card .fee{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+.card .fee-l{display:flex;flex-direction:column;gap:1px;font-size:13px;font-weight:600;color:var(--fg)}
+.card .fee-l span{font-size:11px;font-weight:400;color:var(--dim)}
+.card .fee-r{color:#d2a8ff;font-variant-numeric:tabular-nums;white-space:nowrap;font-size:14px}
+.card .fee-note{font-size:11px;font-weight:400;color:var(--dim);margin-top:-4px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:20px}
+h2{font-size:13px;margin:0 0 12px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:7px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left;white-space:normal}
+th{color:var(--dim);font-weight:600;font-size:12px;cursor:pointer;user-select:none;position:sticky;top:0;background:var(--panel)}
+tbody tr:hover{background:#1c2128}
+.cost{color:var(--good);font-weight:600}
+.sub{color:var(--dim);font-size:12px}
+.sub.billing-note{font-style:normal;line-height:1.35;max-width:52em;white-space:normal}
+#busy{position:fixed;top:0;left:0;right:0;height:3px;background:transparent;z-index:100;
+  overflow:hidden;pointer-events:none;opacity:0;transition:opacity .15s}
+body.busy #busy{opacity:1}
+#busy::after{content:"";position:absolute;top:0;left:0;height:100%;width:40%;
+  background:linear-gradient(90deg,transparent,var(--acc),transparent);
+  animation:slide 1.1s linear infinite}
+@keyframes slide{from{transform:translateX(-100%)}to{transform:translateX(350%)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+#refresh .spin{display:none;width:11px;height:11px;margin-right:6px;vertical-align:-1px;
+  border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;
+  animation:spin .7s linear infinite}
+body.busy #refresh .spin{display:inline-block}
+body.busy #refresh{opacity:.8}
+body.busy main > *:not(#loadnote){opacity:.45;transition:opacity .15s}
+#loadnote{display:none;align-items:center;gap:8px;padding:14px 16px;margin:0 0 14px;
+  border:1px solid var(--line);border-radius:8px;color:var(--dim);font-size:13px}
+body.busy #loadnote{display:flex}
+#loadnote .spin{width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--acc);
+  border-radius:50%;animation:spin .7s linear infinite}
+.bar{height:6px;background:var(--acc);border-radius:3px;min-width:2px}
+.bar.dim{background:#4a5568}
+tr.unattr td{color:var(--dim);font-style:italic}
+tr.unattr td.cost{color:var(--dim)}
+.spark{display:flex;gap:2px;align-items:flex-end;height:90px}
+.spark>div{flex:1;min-height:1px;display:flex;flex-direction:column-reverse;border-radius:2px 2px 0 0;overflow:hidden}
+.spark>div>i{display:block;width:100%}
+.spark>div>i.m{background:var(--acc)}
+.spark>div>i.e{background:#d29922}
+.spark>div:hover>i.m{background:#58a6ff}
+.spark>div:hover>i.e{background:#e3b341}
+.sparkkey{display:flex;gap:14px;align-items:center}
+.sparkkey span{display:inline-flex;align-items:center;gap:5px}
+.sparkkey b{display:inline-block;width:9px;height:9px;border-radius:2px}
+.expand{cursor:pointer;color:var(--acc)}
+.turns td{font-size:12px;color:var(--dim);background:#0d1117}
+a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+.badges{margin-top:5px;display:flex;flex-wrap:wrap;gap:4px}
+.b{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600;
+   border:1px solid var(--line);background:#0d1117;white-space:nowrap}
+.b.jira{border-color:#8957e5;color:#c297ff}
+.b.pr{border-color:#3fb950;color:#7ee787}
+.b.prnew{border-color:#d29922;color:#e3b341}
+.b.repo{border-color:#388bfd;color:#79c0ff}
+.b.gitinf{border-color:#8957e5;color:#d2a8ff}
+.git-corr{margin:0 0 10px;padding:8px 10px;background:#1c1425;border:1px solid #8957e5;border-radius:6px;font-size:12px;line-height:1.5}
+.git-near{margin-top:4px}
+.git-hit{display:block;margin-top:2px;color:var(--dim)}
+.b.more{color:var(--dim)}
+.b.est{border-color:#d29922;color:#e3b341;background:#1c1710}
+.card .split{display:flex;flex-wrap:wrap;gap:3px 12px;margin-top:5px;font-size:11px;
+  font-weight:600;letter-spacing:0;color:var(--dim)}
+.card .split span{white-space:nowrap}
+.card .split .e{color:#e3b341}
+.card .split .s{color:#d2a8ff}
+.card .split i{font-style:normal;font-weight:400;opacity:.75}
+td.cost .split,td.cost .cost-lbl{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:2px 6px;
+  margin-top:2px;font-size:11px;font-weight:400;color:var(--dim);line-height:1.35;text-align:right;
+  white-space:normal}
+td.cost .split span{white-space:nowrap}
+td.cost .split .sep{color:var(--dim);opacity:.55;padding:0 2px;white-space:pre}
+td.cost .split .s,td.cost .cost-lbl.s{color:#d2a8ff}
+td.cost .split .e,td.cost .cost-lbl.e{color:#e3b341}
+td.cost .split i{font-style:normal;opacity:.75}
+button.fold{background:none;border:0;color:var(--dim);cursor:pointer;font:inherit;
+  padding:0 7px 0 0;line-height:1}
+button.fold:hover{color:var(--fg)}
+section.collapsed > *:not(h2){display:none !important}
+.tabs{display:flex;gap:6px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.note{border:1px solid #d29922;background:#1c1710;color:#e3b341;border-radius:8px;
+   padding:10px 12px;font-size:12px;line-height:1.5;margin-bottom:14px}
+.tabs button.on{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.tabs input{margin-left:auto}
+.clearable{position:relative;display:inline-block}
+.tabs > .clearable{margin-left:auto}
+.tabs > .clearable > input{margin-left:0}
+.clearable > input{padding-right:24px}
+.clearx{position:absolute;right:2px;top:50%;transform:translateY(-50%);display:none;
+  border:0;background:none;color:var(--dim);cursor:pointer;font-size:15px;line-height:1;
+  padding:0 5px;border-radius:6px}
+.clearable.has > .clearx{display:block}
+.clearx:hover{color:var(--fg)}
+.budgetin{font:inherit;color:inherit;background:transparent;border:0;border-bottom:1px dashed var(--dim);
+  border-radius:0;padding:0 2px;width:6.5em;text-align:left}
+.budgetin:hover{border-bottom-color:var(--fg)}
+.budgetin:focus{outline:none;border-bottom:1px solid var(--acc)}
+.mtdgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:12px}
+.mtdgrid .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.mtdgrid .v{font-size:22px;font-weight:700;margin-top:4px}
+.allow-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:12px}
+.allow-card{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.allow-card.primary{border-color:#388bfd55}
+.allow-card .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.allow-card .v{font-size:20px;font-weight:700;margin-top:6px;line-height:1.2}
+.allow-card .v .sub{font-size:13px;font-weight:500;color:var(--dim)}
+.allow-rem{margin-top:4px;font-size:13px;font-weight:600;color:var(--good)}
+.allow-rem.over{color:#f85149}
+.allow-card .meter{margin-top:10px;height:8px}
+.allow-card .sub{margin-top:6px;font-size:11px;line-height:1.4}
+.meter{height:12px;background:#0d1117;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.meter>div{height:100%;background:var(--good);transition:width .3s}
+.meter>div.warn{background:#d29922}.meter>div.over{background:#f85149}
+#err{color:#f85149}
+/* Daily digest flag: only ever visible when a recipient is configured. */
+#digest{font-size:11px;padding:2px 8px;border-radius:10px;border:1px solid #30363d;
+  color:#8b949e;cursor:pointer;user-select:none;white-space:nowrap}
+#digest.on{border-color:#2ea043;color:#3fb950}
+#digest.busy{border-color:#d29922;color:#d29922}
+#digest.bad{border-color:#f85149;color:#f85149}
+#digest.off{border-style:dashed;color:#6e7681}
+#digestsend{font-size:11px;padding:2px 6px;border-radius:10px;border:1px solid #30363d;
+  background:none;color:#8b949e;cursor:pointer;white-space:nowrap}
+#digestsend:hover{color:#c9d1d9;border-color:#8b949e}
+.autobox{display:inline-flex;flex-direction:column;align-items:flex-start;line-height:1.15}
+#lastref{font-size:10px;color:var(--dim);white-space:nowrap;padding-left:18px}
+</style></head><body>
+<div id="busy"></div>
+<header>
+  <h1>Cursor &mdash; Chat Cost Dashboard</h1>
+  <label class="sub">From <input type="date" id="start"></label>
+  <label class="sub">To <input type="date" id="end"></label>
+  <select id="preset">
+    <option value="all">All time</option>
+    <option value="today">Today</option>
+    <option value="yesterday">Yesterday</option>
+    <option value="week">This week</option>
+    <option value="7">Last 7 days</option>
+    <option value="mtd">This cycle</option>
+    <option value="lastcycle">Last cycle</option>
+    <option value="30">Last 30 days</option><option value="90">Last 90 days</option>
+  </select>
+  <span class="clearable"><input id="q" placeholder="Filter chats…" size="18"><button
+    class="clearx" data-for="q" tabindex="-1" title="Clear filter"
+    aria-label="Clear filter">&times;</button></span>
+  <span class="sub" id="qnote"></span>
+  <span id="digest" title="Daily digest email"></span>
+  <button id="digestsend" title="Send the digest now">Send now</button>
+  <span class="autobox">
+    <label class="sub"><input type="checkbox" id="auto" checked> auto 15m</label>
+    <span id="lastref" title="When the data on this page was last loaded"></span>
+  </span>
+  <button class="primary" id="refresh"><span class="spin"></span>Refresh</button>
+</header>
+<main>
+  <div id="loadnote"><span class="spin"></span><span id="loadmsg">Loading…</span></div>
+  <div id="err"></div>
+  <div class="note" id="mixnote"></div>
+  <div class="cards" id="cards"></div>
+  <section id="mtd" style="display:none">
+    <h2 id="mtdHeading">Plan allowance this cycle</h2>
+    <div class="sub" id="cycleMeta"></div>
+    <div class="allow-grid">
+      <div class="allow-card primary">
+        <div class="k">Included usage allowance</div>
+        <div class="v"><span id="cycleIncUsed"></span> <span class="sub">of <span id="cycleIncLimit"></span></span></div>
+        <div class="allow-rem" id="cycleIncRem"></div>
+        <div class="meter"><div id="mtdBar"></div></div>
+        <div class="sub" id="cycleIncDetail"></div>
+      </div>
+      <div class="allow-card" id="cycleBonusCard" style="display:none">
+        <div class="k">Bonus usage</div>
+        <div class="v" id="cycleBonus"></div>
+        <div class="sub">Extra included spend from model providers beyond what you purchased.</div>
+      </div>
+      <div class="allow-card">
+        <div class="k">On-demand pool</div>
+        <div class="v"><span id="cycleOdUsed"></span> <span class="sub">of <span id="cycleOdLimit"></span></span></div>
+        <div class="allow-rem" id="cycleOdRem"></div>
+        <div class="sub">Cash overage invoiced when this pool is used.</div>
+      </div>
+      <div class="allow-card">
+        <div class="k">Tokens this cycle</div>
+        <div class="v" id="mtdTok"></div>
+        <div class="sub" id="cycleTokFoot"></div>
+      </div>
+    </div>
+    <div class="sub" id="mtdFoot"></div>
+    <div class="sub" id="mtdNote"></div>
+  </section>
+  <section><h2>Daily spend</h2><div class="spark" id="spark"></div><div class="sub" id="sparklabel"></div></section>
+  <section><h2>Cost by work item</h2>
+    <div class="tabs">
+      <button data-t="sessions" class="on">Sessions</button>
+      <button data-t="repos">Repositories</button>
+      <button data-t="prs">Pull requests</button>
+      <span class="clearable"><input id="rq" placeholder="Search work items…" size="22"><button
+        class="clearx" data-for="rq" tabindex="-1" title="Clear search"
+        aria-label="Clear search">&times;</button></span>
+    </div>
+    <table id="rollup"></table>
+    <div class="sub" id="rollupfoot"></div>
+  </section>
+  <section><h2>Cost by model</h2><table id="models"></table></section>
+  <section><h2>Cost by chat / session <span class="sub">(click a row for per-turn detail)</span></h2>
+    <table id="sessions"></table></section>
+  <div class="sub" id="foot"></div>
+</main>
+<script>
+const usd=n=>'$'+(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const usd4=n=>'$'+(n||0).toLocaleString(undefined,{minimumFractionDigits:4,maximumFractionDigits:4});
+const num=n=>(n||0).toLocaleString();
+const kt=n=>{n=n||0;return n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':n};
+function split(total,parts,fmt){
+  const f=fmt||usd;
+  const shown=(parts||[]).filter(p=>(p.v||0)>0.004);
+  if(!shown.length) return f(total);
+  return `${f(total)}<div class="split">`+shown.map(p=>
+    `<span class="${p.cls||''}"${p.title?` title="${p.title}"`:''}>${f(p.v)} <i>${p.label}</i></span>`
+  ).join('<span class="sep"> / </span>')+`</div>`;
+}
+function costCell(row,billed,prec){
+  const fmt=prec?usd4:usd;
+  const total=row.cost_usd||0;
+  if(!billed){
+    const est=row.est_usd||0;
+    if(est>0.004){
+      const meas=Math.max(total-est,0);
+      return split(total,[
+        ...(meas>0.004?[{v:meas,label:'measured',cls:'s'}]:[]),
+        {v:est,label:'est.',cls:'e'},
+      ],fmt);
+    }
+    return fmt(total);
+  }
+  const od=row.on_demand_usd||0;
+  const inc=Math.max(total-od,0);
+  if(od<=0.004)
+    return `${fmt(total)}<div class="cost-lbl s"><i>allowance</i></div>`;
+  if(inc<=0.004)
+    return `${fmt(total)}<div class="cost-lbl e"><i>on-demand</i></div>`;
+  return split(total,[
+    {v:inc,label:'allowance',cls:'s',title:'Included plan or bonus — not cash on-demand'},
+    {v:od,label:'on-demand',cls:'e',title:'Usage-based billing — cash overage pool'},
+  ],fmt);
+}
+const costThTitle=billed=>
+  billed
+    ? 'Metered cost: allowance (included plan/bonus) vs on-demand (cash overage)'
+    : 'Estimated cost from local transcript';
+let DATA=null, sortKey='cost_usd', sortDir=-1, tab='sessions', LAST_LOAD=null;
+
+const jiraUrl=k=>(DATA&&DATA.jira_base)?`${DATA.jira_base}/browse/${k}`:null;
+const prUrl=k=>{const [r,n]=k.split('#');return `https://github.com/${r}/pull/${n}`;};
+const repoUrl=r=>`https://github.com/${r}`;
+const MAXB=4;
+function badges(refs){
+  if(!refs) return '';
+  const out=[];
+  refs.jira.slice(0,MAXB).forEach(k=>{const u=jiraUrl(k);
+    out.push(u?`<a class="b jira" href="${u}" target="_blank" title="Jira ${k}">${k}</a>`
+              :`<span class="b jira" title="Set --jira-base to link">${k}</span>`);});
+  if(refs.jira.length>MAXB) out.push(`<span class="b more">+${refs.jira.length-MAXB} Jira</span>`);
+  refs.prs.slice(0,MAXB).forEach(p=>out.push(
+    `<a class="b ${p.inferred?'gitinf':(p.created?'prnew':'pr')}" href="${prUrl(p.key)}" target="_blank" title="${p.inferred?'PR inferred from merge commit near billed usage':(p.created?'PR created in this chat':'PR referenced')}: ${p.key}">${p.inferred?'≈ ':''}${p.created?'✚ ':''}#${p.number}</a>`));
+  if(refs.prs.length>MAXB) out.push(`<span class="b more">+${refs.prs.length-MAXB} PR</span>`);
+  refs.repos.filter(r=>r.role==='primary'||r.role==='inferred').slice(0,3).forEach(r=>out.push(
+    `<a class="b ${r.role==='inferred'?'gitinf':'repo'}" href="${repoUrl(r.name)}" target="_blank" title="${r.role==='inferred'?'Inferred from nearby git commits (±8h)':'Primary tracked repo'}">${r.role==='inferred'?'≈ ':''}${r.name.split('/').pop()}</a>`));
+  return out.length?`<div class="badges">${out.join('')}</div>`:'';
+}
+function renderRollup(){
+  let items=(DATA.rollup&&DATA.rollup[tab])||[];
+  const rq=(document.getElementById('rq').value||'').toLowerCase().trim();
+  if(rq) items=items.filter(i=>(i.key+' '+(i.titles||[]).join(' ')).toLowerCase().includes(rq));
+  const billed=!!DATA.billed;
+  const label={jira:'Jira ticket',prs:'Pull request',repos:'Repository',sessions:'Chat / session'}[tab];
+  const link=x=>tab==='jira'?jiraUrl(x.key):tab==='prs'?prUrl(x.key):tab==='repos'?repoUrl(x.key):null;
+  const unit=tab==='sessions'?'Turns':tab==='prs'?'Segments':'Chats';
+  const mx=Math.max(...items.map(i=>i.cost_usd),0.0001);
+  const un=(DATA.rollup&&DATA.rollup.unattributed&&DATA.rollup.unattributed[tab])||null;
+  const showUn=un&&!rq&&un.cost_usd>0.005&&tab!=='sessions';
+  const noun={jira:'Jira ticket',prs:'pull request',repos:'repository'}[tab]||'reference';
+  const unRow=showUn?`<tr class="unattr">
+      <td>No ${esc(noun)}<div class="sub">No chat metadata — expand “Other billed usage” for git-inferred repo hints if commits landed within ±8h of billed calls</div></td>
+      <td>${un.chats?num(un.chats):'-'}</td><td>${kt(un.total_tokens)}</td>
+      <td class="cost">${costCell(un,billed)}</td>
+      <td style="width:160px"><div class="bar dim" style="width:${Math.min(100,un.cost_usd/mx*100)}%"></div></td></tr>`:'';
+  document.getElementById('rollup').innerHTML=items.length?
+    `<thead><tr><th>${label}</th><th>${unit}</th><th>Tokens</th>`
+    +`<th title="${costThTitle(billed)}">Cost</th><th>Share</th></tr></thead><tbody>`+
+    items.map(i=>{const u=link(i);
+      const cell = (i.keys&&i.keys.length)
+        ? i.keys.map(k=>`<a class="b pr" href="${prUrl(k)}" target="_blank">${esc(k.split('/').pop())}</a>`).join(' ')
+          + (i.keys.length>1?` <span class="sub">${i.keys.length} PRs from one segment</span>`:'')
+        : (u?`<a href="${u}" target="_blank">${esc(i.key)}</a>`:esc(i.key));
+      return `<tr>
+      <td>${cell}
+        ${i.est?'<span class="b est" title="Includes estimated token data">est</span>':''}
+        ${i.created?'<span class="b prnew">✚ created</span>':''}
+        ${i.inferred?'<span class="b gitinf" title="PR inferred from merge commit near billed usage">git ±8h</span>':''}
+        ${i.turns?'<span class="b more">'+i.turns+' turn'+(i.turns===1?'':'s')+'</span>':''}
+        ${i.role==='inferred'?'<span class="b gitinf" title="Attributed from git commit timestamps near billed usage">git ±8h</span>':''}
+        ${i.role==='primary'?'<span class="b repo">primary</span>':''}
+        <div class="sub">${esc(i.titles.join(' · '))}</div></td>
+      <td>${num(i.chats)}</td><td>${kt(i.total_tokens)}</td>
+      <td class="cost">${costCell(i,billed)}</td>
+      <td style="width:160px"><div class="bar" style="width:${i.cost_usd/mx*100}%"></div></td></tr>`;}).join('')+
+    unRow+'</tbody>' : `<tbody><tr><td class="sub">No ${label.toLowerCase()} ${rq?'matches "'+esc(rq)+'"':'references found in range'}.</td></tr></tbody>`;
+  const tot=items.reduce((a,b)=>a+b.cost_usd,0);
+  const tk=items.reduce((a,b)=>a+(b.total_tokens||0),0);
+  const plural={jira:'Jira tickets',prs:'Pull requests',repos:'Repositories',sessions:'Chats / sessions'}[tab];
+  const rec=showUn
+    ? ` · ${usd(tot)} of ${usd(un.total_usd)} in view attributed · ${usd(un.cost_usd)} has no ${noun} to attribute it to`
+    : (un&&!rq&&tab!=='sessions'?' · matches the totals above':'');
+  const costKey=billed
+    ? ' · multi-root workspace chats split by git commit/PR activity (±8h), not evenly'
+    : '';
+  document.getElementById('rollupfoot').textContent=
+    `${items.length} ${(items.length===1?label:plural).toLowerCase()} · ${kt(tk)} tokens · ${usd(tot)}`+rec+costKey;
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===tab));
+}
+
+let BUSY=0;
+function busy(on,msg){
+  BUSY=Math.max(0,BUSY+(on?1:-1));
+  document.body.classList.toggle('busy',BUSY>0);
+  if(on&&msg)document.getElementById('loadmsg').textContent=msg;
+}
+async function load(force){
+  const preset=document.getElementById('preset').value;
+  if(isCyclePreset(preset)){
+    if(DATA&&DATA.cycles) applyPreset(preset);
+  } else {
+    syncPreset();
+  }
+  const s=document.getElementById('start').value||'0000-01-01';
+  const e=document.getElementById('end').value||'9999-12-31';
+  const q=document.getElementById('q').value.trim();
+  busy(true,'Loading Cursor billed usage — first load fetches events from cursor.com and scans local chat titles…');
+  try{
+    const r=await fetch(`/api/data?start=${s}&end=${e}&q=${encodeURIComponent(q)}${force?'&refresh=1':''}`);
+    DATA=await r.json();
+    if(DATA.error){document.getElementById('err').textContent='Error: '+DATA.error;return;}
+    document.getElementById('err').textContent='';
+    if(isCyclePreset(preset)&&DATA.cycles){
+      const [a,b]=presetRange(preset);
+      if(a&&b&&(a!==s||b!==e)){
+        document.getElementById('start').value=a;
+        document.getElementById('end').value=b;
+        PRESET_LOCK={v:preset,start:a,end:b};
+        if(!load._cycleFix){
+          load._cycleFix=true;
+          try{await load(force);}finally{load._cycleFix=false;}
+          return;
+        }
+      } else if(a&&b){
+        PRESET_LOCK={v:preset,start:a,end:b};
+      }
+    }
+    LAST_LOAD=new Date();
+    renderLastRef();
+    render();
+  }catch(err){
+    document.getElementById('err').textContent='Error: '+err;
+  }finally{ busy(false); }
+}
+function renderLastRef(){
+  const el=document.getElementById('lastref');
+  if(!LAST_LOAD){ el.textContent=''; return; }
+  const mins=Math.floor((Date.now()-LAST_LOAD)/60000);
+  const age=mins<1?'just now':(mins+'m ago');
+  el.textContent=LAST_LOAD.toLocaleTimeString([], {hour:'numeric',minute:'2-digit',
+    second:'2-digit'})+' · '+age;
+  el.title='Data last loaded '+LAST_LOAD.toLocaleString();
+}
+setInterval(renderLastRef, 30000);
+function renderDigest(){
+  const el=document.getElementById('digest'), btn=document.getElementById('digestsend'),
+        d=DATA.digest||{};
+  if(!d.configured){ el.style.display='none'; btn.style.display='none'; return; }
+  el.style.display=''; btn.style.display=d.enabled?'':'none';
+  if(!d.enabled){
+    el.className='off'; el.textContent='✉ Digest: off';
+    el.title='Daily digest is switched off — no mail will be sent.\nClick to turn it'
+      +' back on.';
+    return;
+  }
+  el.className = d.error?'bad' : d.sending?'busy' : d.last_digest_day?'on':'';
+  const when=d.last_digest_day?('sent '+d.last_digest_day):'none sent yet';
+  el.textContent = '✉ Digest: '+(d.sending?'sending…':when);
+  el.title = (d.error?('Last error: '+d.error+'\n'):'')
+    + `Daily digest to ${d.to} via ${d.via||'Gmail API'}`
+    +(d.from&&d.from!==d.to?`\nFrom ${d.from}`:'')
+    +(d.last_sent_at?`\nLast sent ${d.last_sent_at}`:'')
+    +'\nSent on the first refresh of each day, covering the most recent day with'
+    +' activity.\nClick to switch it off.';
+}
+async function digestCall(action){
+  try{ DATA.digest=await (await fetch('/api/digest?action='+action)).json(); }catch(e){}
+  renderDigest();
+}
+document.getElementById('digest').onclick=()=>
+  digestCall((DATA.digest||{}).enabled?'off':'on');
+document.getElementById('digestsend').onclick=async()=>{
+  const el=document.getElementById('digest');
+  el.className='busy'; el.textContent='✉ Digest: sending…';
+  await digestCall('send');
+  // Delivery happens on a background thread, so re-read the outcome shortly after.
+  setTimeout(async()=>{ try{ DATA.digest=await (await fetch('/api/digest')).json();
+    renderDigest(); }catch(e){} },4000);
+};
+function render(){
+  const t=DATA.totals;
+  renderDigest();
+  const budget=DATA.range_is_current_cycle?(DATA.mtd||{}).budget:null;
+  const mix=document.getElementById('mixnote');
+  if(DATA.billing_error && !DATA.billed){
+    mix.innerHTML=`Could not load Cursor billed usage (${esc(DATA.billing_error)}). `
+      +`Showing a local transcript estimate instead — this undercounts invoices.`;
+  } else if(DATA.billed){
+    const emails=(DATA.billing_emails&&DATA.billing_emails.length)
+      ? DATA.billing_emails : [DATA.billing_email].filter(Boolean);
+    const emailList=emails.map(e=>`<b>${esc(e)}</b>`).join(' and ');
+    let explain='';
+    if(emails.length>1){
+      explain=`<br><br><b>Two accounts merged:</b> totals combine `
+        +(t.by_account||[]).map(a=>`<b>${esc(a.account)}</b> ${usd(a.cash_usd)} cash / ${usd(a.metered_usd)} metered`).join(' · ')
+        +`. Filter by account in the chat list (account badge).`;
+    }
+    const unUsd=t.unattributed_usd||0;
+    const orphanUsd=t.orphan_billed_usd||0;
+    if(unUsd>0.005){
+      explain+=`<br><br><b>Other billed usage (${usd(unUsd)}):</b> Cursor invoiced model calls `
+        +`without a conversation/chat ID, so they cannot be tied to a title in your local chat store. `
+        +`The dashboard tries to infer likely repos from git commits and merge PRs in your workspace `
+        +`repos within ±8 hours of each billed call (purple <span class="b gitinf">≈</span> badges). `
+        +`Expand that row for per-turn commit matches.`;
+    }
+    if(orphanUsd>0.005){
+      explain+=`<br><br><b>Orphan billed chats (${usd(orphanUsd)}):</b> these have a conversation ID on the `
+        +`invoice but no matching chat history on this machine (cloud agent, other device, or cleared data).`;
+    }
+    mix.innerHTML=`<b>Cash invoiced</b> in the cards below is what Stripe actually charged `
+      +`(subscriptions + on-demand invoices). `
+      +`<b>Usage metered</b> is Cursor's token-dollar accounting — included usage is plan allowance, `
+      +`not money paid again. `
+      +`Data from ${emailList||'signed-in account(s)'} since 29 Nov 2025.`
+      +explain;
+  } else {
+    mix.innerHTML=`List-price estimate from this machine's Cursor chat store — not a Cursor invoice. `
+      +`Cloud agents and chats on other machines are invisible here.`;
+  }
+  const billed=!!DATA.billed;
+  const subGroups=t.subscription_summary||[];
+  const subHint=subGroups.map(g=>{
+    const who=(g.account||'').split('@')[0]||'account';
+    return `${g.plan||'Plan'} × ${g.count} (${who}) ${usd(g.net_usd)}`;
+  }).join(' · ');
+  const subBreak=subGroups.length
+    ? `<div class="fees compact">`+subGroups.map(g=>{
+        const who=(g.account||'').split('@')[0]||'account';
+        const range=(g.first_day&&g.last_day&&g.first_day!==g.last_day)
+          ? g.first_day.slice(0,7)+'–'+g.last_day.slice(0,7)
+          : (g.first_day||'');
+        return `<div class="fee"><div class="fee-l">${esc(g.plan||'Plan')} × ${g.count}`
+          +`<span>${esc(who)}${range?' · '+range:''}</span></div>`
+          +`<div class="fee-r">${usd(g.net_usd)}</div></div>`;
+      }).join('')+`</div>`
+    : `<div class="split"><span>no plan invoices in this range</span></div>`;
+  const cash=t.cash_usd!=null?t.cash_usd:((t.subscription_usd||0)+(t.invoice_usage_usd||0));
+  const odCash=t.invoice_usage_usd!=null?t.invoice_usage_usd:0;
+  const odMetered=t.on_demand_usd||0;
+  const meteredNote=billed&&t.metered_usd
+    ? `<span class="metered-note">${usd(t.metered_usd)} usage metered · `
+      +`${usd(odMetered)} on-demand metered · `
+      +`${usd(t.included_usd||0)} allowance (not extra cash)</span>`
+    : '';
+  document.getElementById('cards').innerHTML=[
+    ['Cash invoiced', billed
+      ? split(cash, [
+          {v:t.subscription_usd,label:'subscription',cls:'s'},
+          {v:odCash,label:'on-demand invoiced',cls:'e'}])+meteredNote
+      : split(t.cost_usd, [
+          {v:t.measured_usd,label:'measured'},
+          {v:t.est_usd,label:'estimated',cls:'e'}]),
+      billed?'Stripe cash in this view: subscription fees plus on-demand invoices attributed to billing cycles in range (not invoice charge date). Gold daily bars are on-demand metered from usage events.':null],
+    ...(billed?[['Subscription',
+      usd(t.subscription_usd||0)+subBreak,
+      subHint||'No plan-fee invoices in this date range']]:[]),
+    ...(budget?[[`% of ${usd(budget)} budget`,(t.cost_usd/budget*100).toFixed(1)+'%',
+      billed
+        ? 'Spend this billing cycle vs your included-usage allowance ($70 on Pro Plus). Included usage is not extra cash beyond the subscription; on-demand is.'
+        : 'Spend this month vs the configured monthly budget.']]:[]),
+    ['Chats / sessions',num(t.sessions)],
+    ...(t.other_sessions?[['Other-account chats',
+      usd(t.other_est_usd)+`<div class="split"><span class="e">${num(t.other_sessions)} local est.</span></div>`,
+      (DATA.previous_email||'A previous Cursor login')+' — not in the signed-in account invoices. Local transcript estimate only.']]:[]) ,
+    ['Model requests',num(t.requests)],['Total tokens',kt(t.total_tokens)],
+    ['Input',kt(t.input_tokens)],['Output',kt(t.output_tokens)],
+    ['Cache read',kt(t.cache_read_tokens)],
+    ['Cache write',kt(t.cache_write_tokens)],
+    ['Avg $/chat',usd(t.sessions?t.cost_usd/t.sessions:0)],
+    ['Avg $/request',usd4(t.requests?t.cost_usd/t.requests:0)]
+  ].map(([k,v,h,cls])=>`<div class="card${cls?' '+cls:''}"${h?` title="${h}"`:''}><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+
+  const m=DATA.view_cycle||DATA.mtd||{};
+  const mtdEl=document.getElementById('mtd');
+  if(m.start||m.month){
+    mtdEl.style.display='';
+    const plan=(m.plan||DATA.plan||'').replace(/_/g,' ');
+    const isLast=m.which==='last'||m.historical;
+    if(m.billed){
+      document.getElementById('mtdHeading').textContent=
+        isLast?'Previous billing cycle':'Plan allowance this cycle';
+      document.getElementById('cycleMeta').textContent=
+        isLast
+          ? (plan?plan+' · ':'')+`cycle ${m.start||''} → ${m.end||''} · closed`
+          : (plan?plan+' · ':'')+`cycle ${m.start||''} → ${m.end||''} · resets ${m.reset_date||''} (${m.days_left} day${m.days_left===1?'':'s'})`;
+      const incLimit=m.included_limit||m.budget||0;
+      const incUsed=m.included_usd||0;
+      const incRem=m.included_remaining!=null?m.included_remaining:Math.max(0,incLimit-incUsed);
+      const incPct=incLimit?Math.min(100,incUsed/incLimit*100):0;
+      const exhausted=!isLast&&incLimit>0.004&&incRem<=0.004;
+      document.getElementById('cycleIncUsed').textContent=usd(incUsed);
+      document.getElementById('cycleIncLimit').textContent=incLimit?usd(incLimit):'—';
+      const incRemEl=document.getElementById('cycleIncRem');
+      incRemEl.textContent=isLast
+        ? (incLimit
+          ? (incUsed>incLimit+0.004?`OVER plan allowance by ${usd(incUsed-incLimit)}`:`${usd(incUsed)} metered of ${usd(incLimit)} allowance`)
+          : `${usd(incUsed)} metered (plan allowance)`)
+        : (exhausted
+          ? 'Included allowance exhausted'
+          : (incRem>0.004
+            ? `${usd(incRem)} remaining (${incPct.toFixed(0)}% used)`
+            : (incUsed>incLimit+0.004?`OVER by ${usd(incUsed-incLimit)}`:'Included allowance exhausted')));
+      incRemEl.className='allow-rem'+(exhausted||incRem<=0.004&&incUsed>incLimit+0.004?' over':'');
+      const bar=document.getElementById('mtdBar');
+      bar.style.width=(incLimit?Math.min(100,incPct):0)+'%';
+      bar.className=incPct>=100?'over':incPct>=80?'warn':'';
+      document.getElementById('cycleIncDetail').textContent=
+        isLast
+          ? 'Metered from billed events in this closed cycle — live allowance API is current-cycle only.'
+          : exhausted
+            ? [
+                `Purchased plan allowance fully used (${usd(incUsed)} of ${usd(incLimit)}).`,
+                (m.bonus_usd||0)>0.004
+                  ? `${usd(m.bonus_usd)} bonus usage metered — provider allocation beyond your plan allowance, not extra subscription cash.`
+                  : '',
+                (m.on_demand_usd||0)>0.004
+                  ? `${usd(m.on_demand_usd)} on-demand metered beyond included + bonus.`
+                  : '',
+              ].filter(Boolean).join(' ')
+            : [
+                `${incPct.toFixed(0)}% of ${usd(incLimit)} included allowance used.`,
+                (m.bonus_usd||0)>0.004?`${usd(m.bonus_usd)} bonus usage so far.`:'',
+              ].filter(Boolean).join(' ');
+      const bonusCard=document.getElementById('cycleBonusCard');
+      if(!isLast&&(m.bonus_usd||0)>0.004){
+        bonusCard.style.display='';
+        document.getElementById('cycleBonus').textContent=usd(m.bonus_usd);
+      } else bonusCard.style.display='none';
+      const odLimit=m.on_demand_limit||0;
+      const odUsed=m.on_demand_usd||0;
+      const odRem=m.on_demand_remaining!=null?m.on_demand_remaining:Math.max(0,odLimit-odUsed);
+      document.getElementById('cycleOdUsed').textContent=usd(odUsed);
+      document.getElementById('cycleOdLimit').textContent=odLimit?usd(odLimit):'—';
+      const odRemEl=document.getElementById('cycleOdRem');
+      odRemEl.textContent=isLast
+        ? (odUsed>0.004?`${usd(odUsed)} on-demand metered`:'')
+        : (odLimit?`${usd(odRem)} remaining`:'');
+      odRemEl.className='allow-rem';
+      document.getElementById('mtdTok').textContent=kt(m.total_tokens);
+      document.getElementById('cycleTokFoot').textContent=
+        `${num(m.requests)} model requests across ${num(m.sessions)} chats on this machine`;
+      document.getElementById('mtdFoot').textContent=
+        isLast
+          ? `Closed-cycle totals from Cursor billed usage events in ${m.start||''} → ${m.end||''}. `
+            +`Cards and charts above match this same date range.`
+          : `Included allowance is your plan's ${usd(incLimit)} monthly usage budget (same dollars as cursor.com/dashboard). `
+            +`Bonus usage is extra provider allocation — metered but not subscription cash. `
+            +(exhausted&&((m.bonus_usd||0)>0.004||(m.on_demand_usd||0)>0.004)
+              ? `This cycle continues on${(m.bonus_usd||0)>0.004?` bonus (${usd(m.bonus_usd)})`:''}${(m.bonus_usd||0)>0.004&&(m.on_demand_usd||0)>0.004?' and':''}${(m.on_demand_usd||0)>0.004?` on-demand (${usd(m.on_demand_usd)})`:''}. `
+              : '')
+            +(m.plan_total_usd&&!exhausted?`Plan + bonus metered this cycle: ${usd(m.plan_total_usd)}. `:'');
+      document.getElementById('mtdNote').textContent=
+        isLast
+          ? 'On-demand here is metered overage from billed events, not necessarily cash invoiced that cycle.'
+          : 'On-demand pool is the cash overage cap before Cursor pauses usage-based billing. '
+            + 'Token counts are from billed events joined to local chats in this cycle.';
+    } else {
+      document.getElementById('mtdHeading').textContent='Usage this month';
+      document.getElementById('cycleMeta').textContent=m.month||'';
+      document.getElementById('cycleIncUsed').textContent=usd(m.cost_usd);
+      document.getElementById('cycleIncLimit').textContent=m.budget?usd(m.budget):'—';
+      document.getElementById('cycleIncRem').textContent=m.remaining!=null
+        ? (m.remaining<0?`OVER by ${usd(-m.remaining)}`:`${usd(m.remaining)} remaining`):'';
+      document.getElementById('cycleIncDetail').textContent='Local estimate only';
+      document.getElementById('cycleBonusCard').style.display='none';
+      document.getElementById('cycleOdUsed').textContent='—';
+      document.getElementById('cycleOdLimit').textContent='—';
+      document.getElementById('cycleOdRem').textContent='';
+      document.getElementById('mtdTok').textContent=kt(m.total_tokens);
+      document.getElementById('cycleTokFoot').textContent='';
+      document.getElementById('mtdFoot').textContent='';
+      document.getElementById('mtdNote').textContent=
+        'Calendar month, local chats only — not Cursor billed usage.';
+      const bar=document.getElementById('mtdBar');
+      bar.style.width=(m.budget?Math.min(100,(m.cost_usd/m.budget*100)):0)+'%';
+    }
+  } else {
+    mtdEl.style.display='none';
+  }
+
+  const mx=Math.max(...DATA.daily.map(d=>d.cost_usd),0.0001);
+  document.getElementById('spark').innerHTML=DATA.daily.map(d=>{
+    const od=billed?(d.on_demand_usd||0):(d.est_usd||0);
+    const base=Math.max(d.cost_usd-od,0);
+    const h=Math.max(1,d.cost_usd/mx*100);
+    const ep=d.cost_usd>0?od/d.cost_usd*100:0;
+    return `<div style="height:${h}%" title="${d.day}: ${usd(d.cost_usd)} · ${num(d.requests)} req`
+      +(od>0?` · ${usd(base)} ${billed?'included':'measured'} + ${usd(od)} ${billed?'on-demand':'est.'}`:'')+`">`
+      +`<i class="m" style="height:${100-ep}%"></i><i class="e" style="height:${ep}%"></i></div>`;
+  }).join('');
+  const anySplit=DATA.daily.some(d=>billed?(d.on_demand_usd||0)>0:(d.est_usd||0)>0);
+  document.getElementById('sparklabel').innerHTML=DATA.daily.length
+    ? `<span class="sparkkey"><span>${DATA.daily[0].day} → ${DATA.daily[DATA.daily.length-1].day} `
+      +`· peak ${usd(mx)}/day</span>`
+      +`<span><b style="background:var(--acc)"></b>${billed?'allowance metered':'measured tokens'}</span>`
+      +(anySplit?`<span><b style="background:#d29922"></b>${billed?'on-demand metered (USAGE_BASED events)':'estimated from transcript'}</span>`:'')
+      +'</span>' : 'no data';
+
+  const mmax=Math.max(...DATA.models.map(m=>m.cost_usd),0.0001);
+  document.getElementById('models').innerHTML=
+    '<thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th>'
+    +`<th title="${costThTitle(billed)}">Cost</th><th>Share</th></tr></thead><tbody>`+
+    DATA.models.map(m=>`<tr><td>${m.model}${m.est?' <span class="b est" title="Includes estimated token data">est</span>':''}${m.known_rate?'':' <span class="b more" title="No published rate for this model id; Auto rates assumed">assumed rate</span>'}</td><td>${num(m.requests)}</td><td>${kt(m.input_tokens)}</td>
+      <td>${kt(m.cache_write_tokens)}</td><td>${kt(m.cache_read_tokens)}</td><td>${kt(m.output_tokens)}</td>
+      <td class="cost">${costCell(m,billed)}</td><td style="width:160px"><div class="bar" style="width:${m.cost_usd/mmax*100}%"></div></td></tr>`).join('')+
+    '</tbody>';
+
+  const q=DATA.q||'';
+  document.getElementById('qnote').textContent=
+    q?`filtered by "${q}" — ${DATA.sessions.length} chat${DATA.sessions.length===1?'':'s'}`:'';
+  let rows=DATA.sessions.slice();
+  rows.sort((a,b)=>((a[sortKey]>b[sortKey])-(a[sortKey]<b[sortKey]))*sortDir);
+  const cols=[['title','Chat'],['top_model','Model'],['turns','Turns'],['requests','Reqs'],
+    ['input_tokens','Input'],['cache_read_tokens','Cache R'],
+    ['output_tokens','Output'],['total_tokens','Tokens'],['cost_usd','Cost'],['last_day','Last used']];
+  document.getElementById('sessions').innerHTML=
+    '<thead><tr>'+cols.map(([k,l])=>{
+      const h=k==='cost_usd'?` title="${costThTitle(billed)}"`:'';
+      return `<th data-k="${k}"${h}>${l}${sortKey===k?(sortDir<0?' ▼':' ▲'):''}</th>`;
+    }).join('')+'</tr></thead><tbody>'+
+    rows.map(s=>{
+      const wt=s.shared_attribution==='git-weighted'&&s.repo_weights
+        ? ' · '+Object.entries(s.repo_weights).map(([n,w])=>n.split('/').pop()+' '+(w*100).toFixed(0)+'%').join(' · ')
+        : '';
+      const sub=s.billing_note
+        ? `<div class="sub billing-note">${esc(s.billing_note)}</div>`
+        : `<div class="sub">${esc(s.repository||'—')}${s.branch?' · '+esc(s.branch):''}${wt}</div>`;
+      const sharedBadge=s.shared_attribution==='git-weighted'&&s.repo_weights
+        ? ` <span class="b gitinf" title="Multi-root split by git commits/PRs during this chat (not equal shares)">git split · ${Object.keys(s.repo_weights).length} repos</span>`
+        : (s.shared_attribution==='unconfirmed'&&(s.repo_split>1||0)
+          ? ` <span class="b more" title="Multi-root workspace open but no git activity during this chat to assign repos">shared unconfirmed</span>`
+          : (s.repo_split>1?` <span class="b more" title="Multiple tracked repos">${s.repo_split} repos</span>`:''));
+      const unBadge=s.unattributed
+        ? ` <span class="b more" title="Billed usage with no conversation ID on the invoice">no chat ID</span>`
+        : (s.orphan_billed
+          ? ` <span class="b more" title="Conversation ID on invoice but no local chat on this machine">orphan</span>`
+          : sharedBadge);
+      const gitBadge=(s.git_correlation&&s.git_correlation.matched)
+        ? ` <span class="b gitinf" title="Repos inferred from nearby git commits">git matched</span>`:'';
+      return `<tr class="row${s.unattributed||s.orphan_billed?' unattr':''}" data-id="${s.session_id}">
+      <td><span class="expand">▸</span> ${esc(s.title)}${s.est?' <span class="b est" title="Includes tokens inferred from transcript length">est</span>':''}${unBadge}${gitBadge}${s.billed&&s.account_label&&(DATA.billing_emails||[]).length>1?` <span class="b more">${esc(s.account_label)}</span>`:''}${s.billed===false&&DATA.billed?` <span class="b more" title="On this machine but not billed to ${esc((DATA.billing_emails||[DATA.billing_email]).filter(Boolean).join(' / ')||'the signed-in account')}${s.account_label?' — likely '+esc(s.account_label):''}">${esc(s.account_label||'other account')}</span>`:''}${s.subagent?' <span class="b more">subagent</span>':''}${sub}${badges(s.refs)}</td>
+      <td>${s.top_model}${s.models>1?' <span class="sub">+'+(s.models-1)+'</span>':''}</td>
+      <td>${num(s.turns)}</td><td>${num(s.requests)}</td><td>${kt(s.input_tokens)}</td>
+      <td>${kt(s.cache_read_tokens)}</td><td>${kt(s.output_tokens)}</td>
+      <td>${kt(s.total_tokens)}</td><td class="cost">${costCell(s,billed)}</td><td class="sub">${s.last_day}</td></tr>`;
+    }).join('')+
+    '</tbody>';
+  renderRollup();
+  document.querySelectorAll('#sessions th').forEach(th=>th.onclick=()=>{
+    const k=th.dataset.k; sortDir = sortKey===k ? -sortDir : -1; sortKey=k; render();});
+  document.querySelectorAll('#sessions tr.row').forEach(tr=>tr.onclick=e=>{
+    if(e.target.tagName==='A') return; toggle(tr);});
+  document.getElementById('foot').textContent=
+    `${rows.length} chats shown · ${DATA.billed?'Cursor billed usage events':'local transcript estimate'}`
+    +(billed?' · Cost: allowance (purple) + on-demand (gold)':'')
+    +` · ${DATA.db}`;
+}
+function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+async function toggle(tr){
+  if(tr.nextElementSibling&&tr.nextElementSibling.classList.contains('turns')){
+    tr.nextElementSibling.remove(); tr.querySelector('.expand').textContent='▸'; return;}
+  tr.querySelector('.expand').textContent='▾';
+  const ph=document.createElement('tr'); ph.className='turns';
+  ph.innerHTML='<td colspan="10"><span class="sub">Loading turns…</span></td>';
+  tr.after(ph);
+  const turns=await (await fetch('/api/turns?session_id='+encodeURIComponent(tr.dataset.id))).json();
+  ph.remove();
+  if(!tr.isConnected||tr.querySelector('.expand').textContent==='▸')return;
+  const sess=(DATA.sessions||[]).find(s=>s.session_id===tr.dataset.id);
+  let gitHdr='';
+  if(sess&&sess.git_correlation&&sess.git_correlation.matched){
+    const gc=sess.git_correlation;
+    gitHdr=`<div class="git-corr"><b>Git correlation</b> (±${gc.window_hours}h of each billed call) — `
+      +`${usd(gc.matched_cost_usd||0)} matched`
+      +(gc.unmatched_cost_usd>0.005?`, ${usd(gc.unmatched_cost_usd)} with no nearby commits`:``)
+      +`<br>`
+      +gc.repos.map(r=>{
+        const prs=(r.prs||[]).map(p=>`<a href="${prUrl(p)}" target="_blank">#${esc(p.split('#').pop())}</a>`).join(' ');
+        const samp=(r.sample||[]).map(c=>`${c.sha} (${c.delta_h>=0?'+':''}${c.delta_h}h) ${esc(c.subject)}`).join('<br>');
+        return `<div style="margin-top:6px"><b>${esc(r.name)}</b> · ${usd(r.cost_usd)} inferred · ${r.turn_matches||r.commits||0} billed turn${(r.turn_matches||r.commits||0)===1?'':'s'} near commits`
+          +(prs?' · PR '+prs:'')+(samp?'<br><span class="sub">'+samp+'</span>':'')+`</div>`;
+      }).join('')+`</div>`;
+  }
+  const td=document.createElement('tr'); td.className='turns';
+  td.innerHTML=`<td colspan="10">${gitHdr}<table>${turns.map(t=>{
+    const gn=(t.git_nearby||[]).map(g=>{
+      const sign=g.delta_sec>=0?'+':'';
+      const pr=g.pr?` · <a href="${prUrl(g.pr)}" target="_blank">PR #${esc(g.pr.split('#').pop())}</a>`:'';
+      return `<span class="git-hit">${esc(g.repo.split('/').pop())} `
+        +`<a href="https://github.com/${esc(g.repo)}/commit/${g.sha}" target="_blank">${g.sha}</a> `
+        +`${sign}${Math.round(g.delta_sec/60)}m${pr} · ${esc(g.subject.slice(0,72))}</span>`;
+    }).join('');
+    return `<tr><td>Turn ${t.turn_index} <span class="sub">${(t.started_at||'').slice(0,16).replace('T',' ')}</span>`
+     +(t.kind?' <span class="b '+(t.on_demand?'est':'more')+'">'+t.kind+'</span>':'')
+     +(t.est?' <span class="b est">est</span>':'')+`${gn?`<div class="git-near">${gn}</div>`:''}</td>
+     <td>${t.model}</td><td>${num(t.requests)} req</td><td>${kt(t.input_tokens)} in</td>
+     <td>${kt(t.cache_write_tokens||0)} cw</td><td>${kt(t.cache_read_tokens||0)} cr</td>
+     <td>${kt(t.output_tokens)} out</td><td>${kt(t.total_tokens)} tok</td>
+     <td class="cost">${costCell({cost_usd:t.cost_usd,
+       on_demand_usd:t.on_demand?(t.cost_usd||0):0,
+       est_usd:t.est?(t.cost_usd||0):0}, DATA.billed, true)}</td></tr>`;
+  }).join('')}</table></td>`;
+  tr.after(td);
+}
+document.getElementById('refresh').onclick=()=>load(true);
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;renderRollup();});
+document.getElementById('rq').oninput=()=>DATA&&renderRollup();
+let qtimer=null;
+document.getElementById('q').oninput=()=>{clearTimeout(qtimer);qtimer=setTimeout(load,250);};
+document.querySelectorAll('.clearx').forEach(btn=>{
+  const inp=document.getElementById(btn.dataset.for);
+  const paint=()=>inp.parentElement.classList.toggle('has', inp.value!=='');
+  inp.addEventListener('input', paint);
+  btn.onclick=()=>{
+    if(inp.value==='') return;
+    inp.value=''; paint();
+    inp.dispatchEvent(new Event('input',{bubbles:true}));
+    inp.focus();
+  };
+  paint();
+});
+document.getElementById('start').onchange=load;
+document.getElementById('end').onchange=load;
+function isCyclePreset(v){return v==='mtd'||v==='lastcycle';}
+function presetRange(v){
+  const ymd=d=>{const p=n=>String(n).padStart(2,'0');
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());};
+  const n=new Date(), today=new Date(n.getFullYear(),n.getMonth(),n.getDate());
+  const back=k=>{const d=new Date(today); d.setDate(d.getDate()-k); return d;};
+  const out=(a,b)=>[a?ymd(a):'', b?ymd(b):''];
+  if(v==='all') return out(null,null);
+  if(v==='today') return out(today,today);
+  if(v==='yesterday') return out(back(1),back(1));
+  if(v==='week') return out(back((today.getDay()+6)%7),today);
+  if(v==='mtd'){
+    if(DATA&&DATA.cycles&&DATA.cycles.current&&DATA.cycles.current.start)
+      return [DATA.cycles.current.start, DATA.cycles.current.end||ymd(today)];
+    if(DATA&&DATA.mtd&&DATA.mtd.billed&&DATA.mtd.start)
+      return [DATA.mtd.start, DATA.mtd.end||ymd(today)];
+    return out(new Date(today.getFullYear(),today.getMonth(),1),today);
+  }
+  if(v==='lastcycle'){
+    if(DATA&&DATA.cycles&&DATA.cycles.last)
+      return [DATA.cycles.last.start, DATA.cycles.last.end];
+    if(DATA&&DATA.mtd&&DATA.mtd.last_start)
+      return [DATA.mtd.last_start, DATA.mtd.last_end];
+    return out(new Date(today.getFullYear(),today.getMonth()-1,1),
+               new Date(today.getFullYear(),today.getMonth(),0));
+  }
+  return out(back(+v-1),today);
+}
+let PRESET_LOCK=null;
+function applyPreset(v){
+  const [a,b]=presetRange(v);
+  document.getElementById('start').value=a;
+  document.getElementById('end').value=b;
+  PRESET_LOCK={v:v,start:a,end:b};
+}
+function syncPreset(){
+  if(!PRESET_LOCK||PRESET_LOCK.v==='all') return false;
+  const S=document.getElementById('start'), E=document.getElementById('end');
+  if(S.value!==PRESET_LOCK.start||E.value!==PRESET_LOCK.end) return false;
+  const [a,b]=presetRange(PRESET_LOCK.v);
+  if(a===PRESET_LOCK.start&&b===PRESET_LOCK.end) return false;
+  S.value=a; E.value=b; PRESET_LOCK={v:PRESET_LOCK.v,start:a,end:b};
+  return true;
+}
+document.getElementById('preset').onchange=e=>{
+  const v=e.target.value;
+  if(isCyclePreset(v)){
+    if(DATA&&DATA.cycles) applyPreset(v);
+    else PRESET_LOCK={v, start:'', end:''};
+  } else applyPreset(v);
+  load();
+};
+let timer=null;
+function setAuto(on){ clearInterval(timer); timer = on ? setInterval(load,900000) : null; }
+document.getElementById('auto').onchange=e=>setAuto(e.target.checked);
+setAuto(document.getElementById('auto').checked);
+document.querySelectorAll('main section').forEach(s=>{
+  const h=s.querySelector('h2'); if(!h) return;
+  const key='fold:'+h.textContent.trim().slice(0,40);
+  const b=document.createElement('button');
+  b.className='fold'; b.title='Collapse or expand this section';
+  const paint=c=>{b.textContent=c?'▸':'▾'; b.setAttribute('aria-expanded',!c);};
+  const start=localStorage.getItem(key)==='1';
+  if(start) s.classList.add('collapsed');
+  paint(start);
+  b.onclick=()=>{const c=s.classList.toggle('collapsed');
+    paint(c); localStorage.setItem(key,c?'1':'0');};
+  h.prepend(b);
+});
+load();</script></body></html>
+"""
+
+
+def main():
+    global DB_PATH, JIRA_BASE, CREDIT_BUDGET, STATE_PATH, API_ENABLED
+    global EMAIL_TO, EMAIL_FROM, GMAIL_CREDENTIALS, GMAIL_TOKEN_PATH
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--port", type=int, default=8787)
+    ap.add_argument("--db", default=DEFAULT_DB,
+                    help="Cursor state.vscdb (default: <Cursor User>/globalStorage/state.vscdb)")
+    ap.add_argument("--jira-base", default=JIRA_BASE_DEFAULT,
+                    help="Jira base URL, e.g. https://acme.atlassian.net. "
+                         "Auto-detected from your chat history when omitted.")
+    ap.add_argument("--jira-keys", default="",
+                    help="Extra Jira project keys to recognize, comma separated (e.g. ABC,DEF)")
+    ap.add_argument("--budget", default=None,
+                    help="Monthly included-usage budget in USD for the Usage this month banner "
+                         f"(e.g. 20 or 20.00). Default {DEFAULT_BUDGET:g}. "
+                         "Editable in the banner and remembered between runs. "
+                         "Env: CURSOR_DASH_BUDGET")
+    ap.add_argument("--email-to", default=None,
+                    help="Digest recipient. Default: the signed-in Cursor license email "
+                         "(cursorAuth/cachedEmail). Override with this flag or "
+                         "CURSOR_DASH_EMAIL_TO.")
+    ap.add_argument("--email-from", default=EMAIL_FROM,
+                    help="Digest sender address override. Default: the Gmail account "
+                         "that authorized --gmail-auth. Env: CURSOR_DASH_EMAIL_FROM")
+    ap.add_argument("--gmail-credentials", default=GMAIL_CREDENTIALS,
+                    help="Google Cloud OAuth Desktop client JSON. Default: "
+                         "%%APPDATA%%/cursor-dashboard/gmail-oauth-client.json. "
+                         "Env: CURSOR_DASH_GMAIL_CREDENTIALS")
+    ap.add_argument("--gmail-token", default=GMAIL_TOKEN_PATH,
+                    help="Where to store the Gmail OAuth refresh token. Default: "
+                         "beside the client JSON. Env: CURSOR_DASH_GMAIL_TOKEN")
+    ap.add_argument("--gmail-auth", action="store_true",
+                    help="Open a browser to authorize Gmail send access, save the "
+                         "token, then exit.")
+    ap.add_argument("--send-digest", action="store_true",
+                    help="Send the digest immediately on startup, then exit. For testing "
+                         "or for driving the digest from a scheduled task.")
+    ap.add_argument("--no-digest", action="store_true",
+                    help="Disable the daily digest email.")
+    ap.add_argument("--no-api", action="store_true",
+                    help="Skip Cursor billed-usage API and use local transcript estimates.")
+    ap.add_argument("--no-open", action="store_true")
+    args = ap.parse_args()
+    API_ENABLED = not args.no_api
+    DB_PATH = args.db
+    STATE_PATH = os.path.join(os.path.dirname(DB_PATH), "cost-dashboard-state.json")
+    EMAIL_FROM = args.email_from.strip()
+    GMAIL_CREDENTIALS = (args.gmail_credentials or "").strip()
+    GMAIL_TOKEN_PATH = (args.gmail_token or "").strip()
+    if args.no_digest:
+        EMAIL_TO = ""
+    elif args.email_to is not None:
+        EMAIL_TO = args.email_to.strip()
+    elif not EMAIL_TO:
+        EMAIL_TO = _cursor_license_email()
+    JIRA_BASE = args.jira_base.rstrip("/")
+    if args.budget is not None or CREDIT_BUDGET:
+        raw = args.budget if args.budget is not None else CREDIT_BUDGET
+        try:
+            CREDIT_BUDGET = float(str(raw).replace(",", "").replace("_", "").replace("$", ""))
+        except ValueError:
+            raise SystemExit(f"--budget must be a number, got: {raw!r}")
+        budget_set(CREDIT_BUDGET)
+    else:
+        saved = _state_load()
+        if "monthly_budget_usd" in saved:
+            CREDIT_BUDGET = float(saved["monthly_budget_usd"])
+        elif "ai_credits" in saved:
+            CREDIT_BUDGET = float(saved["ai_credits"]) / 100.0
+        else:
+            CREDIT_BUDGET = DEFAULT_BUDGET
+    JIRA_KEY_ALLOW.update(k.strip().upper() for k in args.jira_keys.split(",") if k.strip())
+    if args.gmail_auth:
+        token = gmail_auth()
+        print(f"Gmail token saved for {token.get('email')} at {_gmail_token_file()}")
+        if not args.send_digest:
+            return
+    if not os.path.exists(DB_PATH):
+        raise SystemExit(f"Cursor store not found: {DB_PATH}\n"
+                         f"Pass --db PATH if your Cursor data lives elsewhere.")
+    if args.send_digest:
+        if not EMAIL_TO:
+            raise SystemExit("--send-digest needs a Cursor license email or --email-to")
+        day, recent = _find_digest_day(datetime.date.today().isoformat())
+        if not day:
+            raise SystemExit(f"No Cursor activity in the last {DIGEST_LOOKBACK_DAYS} days")
+        send_digest(day, recent, interactive=False)
+        print(f"digest for {day} sent to {EMAIL_TO}")
+        return
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"Cursor cost dashboard -> {url}  (db: {DB_PATH})", flush=True)
+    if API_ENABLED:
+        print("  costs from Cursor billed usage events (cursor.com)", flush=True)
+    else:
+        print("  --no-api: local transcript estimates only", flush=True)
+    if EMAIL_TO:
+        off = "" if _digest_enabled() else "  [switched off in the dashboard]"
+        ready, gmail_email = _gmail_ready()
+        if ready:
+            via = f"Gmail API as {gmail_email}" if gmail_email else "Gmail API"
+        elif os.path.isfile(_gmail_credentials_path() or ""):
+            via = "Gmail API  [run --gmail-auth]"
+        else:
+            via = "Gmail API  [save OAuth client JSON, then --gmail-auth]"
+        print(f"  daily digest -> {EMAIL_TO} via {via}{off}", flush=True)
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+if __name__ == "__main__":
+    main()

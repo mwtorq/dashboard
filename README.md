@@ -1,3 +1,15 @@
+# Cost dashboards
+
+Two local localhost dashboards live in this repo:
+
+- `github_copilot_dashboard.py` — GitHub Copilot CLI + VS Code Copilot chat (this README)
+- `cursor_dashboard.py` — Cursor billed usage (same metering as cursor.com/dashboard), joined to local chat titles from `state.vscdb`
+
+```powershell
+py -3 cursor_dashboard.py
+py -3 github_copilot_dashboard.py
+```
+
 # copilot-cost-dashboard
 
 A refreshable local web dashboard showing **what each GitHub Copilot CLI chat actually cost**,
@@ -9,7 +21,7 @@ history, and it serves an HTML page on localhost until you stop it.
 
 | | |
 |---|---|
-| Script | `copilot_cost_dashboard.py` (single file) |
+| Script | `github_copilot_dashboard.py` (Copilot) or `cursor_dashboard.py` (Cursor) |
 | Runtime | Python 3.9+, **standard library only** - nothing to install |
 | Data source | `~/.copilot/session-store.db`, opened **read-only**, plus VS Code Copilot chat transcripts (part measured, part estimated - see below) |
 | Serves on | `http://127.0.0.1:8787` (configurable) |
@@ -21,7 +33,7 @@ Run it **from a clone of this repository**, so that a `git pull` is all it takes
 ```powershell
 git clone https://github.com/WRBerkley/mec-it-github-automations.git
 cd mec-it-github-automations
-python automations\copilot-cost-dashboard\copilot_cost_dashboard.py
+python automations\copilot-cost-dashboard\github_copilot_dashboard.py
 ```
 
 If you already have a clone, update it first - the estimator and the VS Code parsing in particular
@@ -29,7 +41,7 @@ change often:
 
 ```powershell
 git pull
-python automations\copilot-cost-dashboard\copilot_cost_dashboard.py
+python automations\copilot-cost-dashboard\github_copilot_dashboard.py
 ```
 
 That opens your browser at `http://127.0.0.1:8787`. `Ctrl+C` stops it.
@@ -44,7 +56,7 @@ non-ASCII characters in chat titles will raise a `UnicodeEncodeError` on print:
 
 ```powershell
 $env:PYTHONIOENCODING = 'utf-8'
-python automations\copilot-cost-dashboard\copilot_cost_dashboard.py
+python automations\copilot-cost-dashboard\github_copilot_dashboard.py
 ```
 
 ## How the cost math works
@@ -261,7 +273,7 @@ or for driving the digest from Task Scheduler / cron instead of from a browser r
 explicit command, so it sends even when the flag is switched off:
 
 ```powershell
-python copilot_cost_dashboard.py --send-digest --email-to you@example.com
+python github_copilot_dashboard.py --send-digest --email-to you@example.com
 ```
 
 SMTP defaults to `smtp.wrberkley.com:25` (unauthenticated internal relay). Override with
@@ -395,7 +407,7 @@ Every one of those can be overridden.
 ## CLI
 
 ```
-python copilot_cost_dashboard.py [--port 8787] [--db PATH] [--jira-base URL]
+python github_copilot_dashboard.py [--port 8787] [--db PATH] [--jira-base URL]
                                  [--jira-keys ABC,DEF] [--ai-credits 60000] [--no-vscode]
                                  [--no-open]
 ```
