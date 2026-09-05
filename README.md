@@ -1,9 +1,11 @@
 # Cost dashboards
 
-Two local localhost dashboards live in this repo:
+Two local localhost dashboards live in this repo. Both are Python 3.9+,
+standard library only — nothing to `pip install`. Each binds `127.0.0.1` and
+defaults to port `8787`, so run one at a time or pass `--port`.
 
-- `github_copilot_dashboard.py` — GitHub Copilot CLI + VS Code Copilot chat (this README)
-- `cursor_dashboard.py` — Cursor billed usage (same metering as cursor.com/dashboard), joined to local chat titles from `state.vscdb`
+- `github_copilot_dashboard.py` — GitHub Copilot CLI + VS Code Copilot chat ([copilot-cost-dashboard](#copilot-cost-dashboard))
+- `cursor_dashboard.py` — Cursor billed usage (same metering as cursor.com/dashboard), joined to local chat titles from `state.vscdb` ([cursor-cost-dashboard](#cursor-cost-dashboard))
 
 ```powershell
 py -3 cursor_dashboard.py
@@ -456,3 +458,233 @@ This matters, because the tool reads your chat history.
 
 Do not commit `session-store.db`, exported cost data, or any dashboard output into this or any
 other repository - it contains the full text of your chats.
+
+# cursor-cost-dashboard
+
+A refreshable local web dashboard showing **what each Cursor chat actually cost**,
+in USD, from Cursor's own billed usage events — the same metering as
+[cursor.com/dashboard](https://cursor.com/dashboard) — joined to local chat titles
+and repos from the IDE's `state.vscdb`.
+
+Unlike the Copilot dashboard above, costs are **not** reconstructed from token
+rates. They are Cursor's recorded `tokenUsage.totalCents` / `chargedCents`
+figures: included plan usage plus on-demand overage. Subscription invoices
+(Pro / Pro+ monthly fee) are listed separately and are not model usage.
+
+| | |
+|---|---|
+| Script | `cursor_dashboard.py` |
+| Runtime | Python 3.9+, **standard library only** — nothing to install |
+| Data source | Cursor billed-usage API (signed-in IDE session) + `%APPDATA%\Cursor\User\globalStorage\state.vscdb` opened **read-only** (macOS / Linux equivalents below) |
+| Serves on | `http://127.0.0.1:8787` (configurable) |
+
+## Quick start
+
+Run it **from a clone of this repository**, so that a `git pull` is all it takes
+to pick up fixes. Cursor must be signed in on this machine (the dashboard reads
+the IDE's stored session token).
+
+```powershell
+git clone https://github.com/mwtorq/dashboard.git
+cd dashboard
+py -3 cursor_dashboard.py
+```
+
+If you already have a clone, update it first:
+
+```powershell
+git pull
+py -3 cursor_dashboard.py
+```
+
+That opens your browser at `http://127.0.0.1:8787`. `Ctrl+C` stops it.
+
+> **Please don't copy the script somewhere else and run it from there.** It is a
+> single file with no dependencies, so copying it is tempting, but detached
+> copies silently go stale. Run it from your clone and pull.
+
+On some Windows PowerShell terminals the console output needs an explicit
+encoding, otherwise non-ASCII characters in chat titles will raise a
+`UnicodeEncodeError` on print:
+
+```powershell
+$env:PYTHONIOENCODING = 'utf-8'
+py -3 cursor_dashboard.py
+```
+
+Default `state.vscdb` locations (first existing `globalStorage` wins):
+
+| OS | Path |
+|---|---|
+| Windows | `%APPDATA%\Cursor\User\globalStorage\state.vscdb` |
+| macOS | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` |
+| Linux | `~/.config/Cursor/User/globalStorage/state.vscdb` |
+
+Pass `--db PATH` if your Cursor data lives elsewhere. If the file is missing
+the process exits with that path.
+
+## How the cost math works
+
+With the billed-usage API (the default), each event carries Cursor's own charge:
+
+- **Included** — plan usage that counts against the monthly allowance
+- **On-demand** — cash overage invoiced when the on-demand pool is used
+
+Those are the same numbers you see on cursor.com. Local `state.vscdb` is used
+for **titles, repos, and chat text** (Jira / PR / repo attribution), not for
+inventing a dollar figure.
+
+`--no-api` skips the Cursor API and falls back to local transcript estimates
+from published per-model rates. That undercounts invoices and is a last resort
+(offline, unsigned-in, or debugging).
+
+Two caveats:
+
+- Subscription invoices (the Pro / Pro+ monthly fee) are **not** folded into
+  chat or model tables. They appear as their own invoice rollup.
+- Chats that exist only on another machine, or billed events that cannot be
+  matched to a local composer, show as billed usage without a local title.
+
+### Days are local days
+
+Cursor timestamps are converted onto the user's local calendar before bucketing,
+so a "day" here is a day where you are, midnight to midnight. Billing-cycle
+presets (*This cycle* / *Last cycle*) follow Cursor's `billingCycleStart` /
+`billingCycleEnd` from the usage-summary API, not the dashboard date-range
+filter.
+
+## Features
+
+- **Date range presets** — *All time*, *Today*, *Yesterday*, *This week*,
+  *Last 7 days*, *This cycle*, *Last cycle*, *Last 30 days*, *Last 90 days*,
+  plus explicit From / To boxes. Presets re-anchor on every refresh.
+- **KPI cards** — total cost, chats, requests, tokens, included vs on-demand
+  split, and subscription invoice totals in range.
+- **Plan allowance this cycle** — included usage vs the plan limit, bonus
+  usage, on-demand pool used/remaining, and tokens this cycle. The included
+  budget defaults to **$70** (Pro Plus) and is overridden by the billing API
+  when available; `--budget` or the banner input persists to
+  `cost-dashboard-state.json` beside the Cursor store.
+- **Daily spend** bar chart, with on-demand called out separately from
+  included usage.
+- **Cost by work item** — *Sessions* / *Repositories* / *Pull requests* tabs,
+  plus a keyword search on the active tab. Repo and PR attribution uses local
+  git activity around billed turns when a multi-root workspace would otherwise
+  split cost evenly.
+- **Cost by model** and a **per-chat table**. Click a row for a per-turn
+  breakdown.
+- **Global chat filter** — the top-bar keyword recomputes the whole page
+  against matching chats (title, repo, Jira, PR).
+- **Manual refresh** plus a 15-minute auto-refresh (on by default), with the
+  time of the last successful load under the *auto 15m* box.
+- **Daily digest email** (Gmail API) — on the first refresh of each day,
+  emails a summary of the most recent day that had activity. See below.
+- **Collapsible sections** — choice persists in `localStorage`.
+
+### Daily digest email (Gmail API)
+
+The default recipient is the **signed-in Cursor license email**
+(`cursorAuth/cachedEmail`). Override with `--email-to` /
+`CURSOR_DASH_EMAIL_TO`. `--no-digest` turns the feature off entirely.
+
+Delivery is the **Gmail API (OAuth)**, not SMTP. One-time setup:
+
+1. [Enable the Gmail API](https://console.cloud.google.com/apis/library/gmail.googleapis.com)
+2. APIs & Services → Credentials → Create credentials → OAuth client ID → **Desktop app**
+3. Download the JSON and save it as `%APPDATA%\cursor-dashboard\gmail-oauth-client.json`
+   (or `~/.config/cursor-dashboard/gmail-oauth-client.json` on macOS / Linux)
+4. If the consent screen is in Testing, add your Gmail as a test user
+5. Authorize once:
+
+```powershell
+py -3 cursor_dashboard.py --gmail-auth
+```
+
+That stores a refresh token beside the client JSON
+(`gmail-oauth-token.json`). The sender is the Gmail account that authorized,
+unless you pass `--email-from`.
+
+- **When** — on the first data refresh of each local day. Leave the dashboard
+  open overnight and the digest sends itself.
+- **What day** — the most recent day that had activity, not simply yesterday.
+- **Sent once** — the last-mailed day is recorded in
+  `cost-dashboard-state.json` beside `state.vscdb`. That file is per-machine
+  state and is never committed.
+- **Never fatal** — mail goes out on a background thread after the page
+  payload is built.
+- A **flag in the top bar** shows state; click it to switch the digest on or
+  off. **Send now** mails immediately.
+
+`--send-digest` sends one digest and exits without starting the server (testing
+or Task Scheduler / cron). It still needs a recipient (license email or
+`--email-to`) and a working Gmail token:
+
+```powershell
+py -3 cursor_dashboard.py --send-digest
+```
+
+## CLI
+
+```
+py -3 cursor_dashboard.py [--port 8787] [--db PATH] [--jira-base URL]
+                          [--jira-keys ABC,DEF] [--budget 70]
+                          [--email-to ADDR] [--email-from ADDR]
+                          [--gmail-credentials PATH] [--gmail-token PATH]
+                          [--gmail-auth] [--send-digest] [--no-digest]
+                          [--no-api] [--no-open]
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--port` | `8787` | Port to listen on, bound to `127.0.0.1` only |
+| `--db` | `<Cursor User>/globalStorage/state.vscdb` | Path to Cursor `state.vscdb` |
+| `--jira-base` | auto-detected | Jira base URL, e.g. `https://yourorg.atlassian.net` |
+| `--jira-keys` | auto-discovered | Extra comma-separated project keys |
+| `--budget` | `70` (or billing API) | Monthly included-usage budget in USD for the cycle banner. Editable in the banner and remembered between runs. Env: `CURSOR_DASH_BUDGET` |
+| `--email-to` | signed-in Cursor license email | Digest recipient. Env: `CURSOR_DASH_EMAIL_TO` |
+| `--email-from` | Gmail account from `--gmail-auth` | Digest sender. Env: `CURSOR_DASH_EMAIL_FROM` |
+| `--gmail-credentials` | `%APPDATA%/cursor-dashboard/gmail-oauth-client.json` | Google Cloud OAuth Desktop client JSON. Env: `CURSOR_DASH_GMAIL_CREDENTIALS` |
+| `--gmail-token` | beside the client JSON | Where to store the Gmail OAuth refresh token. Env: `CURSOR_DASH_GMAIL_TOKEN` |
+| `--gmail-auth` | off | Open a browser to authorize Gmail send access, save the token, then exit |
+| `--send-digest` | off | Send one digest immediately and exit |
+| `--no-digest` | off | Disable the daily digest email |
+| `--no-api` | off | Skip Cursor billed-usage API; local transcript estimates only |
+| `--no-open` | off | Do not launch a browser on startup |
+
+### Environment variables
+
+| Variable | Equivalent flag / purpose |
+|---|---|
+| `CURSOR_DASH_JIRA_BASE` | `--jira-base` |
+| `CURSOR_DASH_JIRA_KEYS` | `--jira-keys` |
+| `CURSOR_DASH_BUDGET` | `--budget` |
+| `CURSOR_DASH_EMAIL_TO` | `--email-to` |
+| `CURSOR_DASH_EMAIL_FROM` | `--email-from` |
+| `CURSOR_DASH_GMAIL_CREDENTIALS` | `--gmail-credentials` |
+| `CURSOR_DASH_GMAIL_TOKEN` | `--gmail-token` |
+
+`COPILOT_DASH_*` equivalents for Jira, budget, and email are still accepted as
+fallbacks.
+
+## Privacy
+
+This matters, because the tool reads your chat history and your Cursor session.
+
+- `state.vscdb` is opened **read-only**. The dashboard never writes to, migrates
+  or locks the IDE database.
+- The server binds to **`127.0.0.1`** only. It is not reachable from the network.
+- **Billed usage is fetched from Cursor's API** using the IDE's stored session
+  token — the same calls cursor.com/dashboard makes. That is the only reason
+  the dollar figures match the official dashboard.
+- The optional digest talks to the **Gmail API** after you authorize it. No
+  other outbound analytics or telemetry.
+- The page itself is self-contained HTML (no external CSS or JavaScript).
+- Each user only ever sees **their own** local chats and the Cursor accounts
+  they have signed into on this machine.
+- Per-machine state (`cost-dashboard-state.json`, Gmail OAuth files,
+  `cursor-sessions.json`) lives under the Cursor store or
+  `%APPDATA%\cursor-dashboard` — never in the repo.
+
+Do not commit `state.vscdb`, Gmail OAuth client/token JSON, `cursor-sessions.json`,
+exported cost data, or any dashboard output — they contain session tokens and
+chat text.
