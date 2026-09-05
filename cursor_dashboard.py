@@ -297,12 +297,16 @@ def _tracked_folders_from_meta(meta_row):
     """Local folder names from Cursor composer trackedGitRepos."""
     if not meta_row:
         return []
+    ws_path = meta_row.get("workspace_path") or ""
+    ws_folders = (_parse_workspace_folders(ws_path)
+                  if _normalize_fs_path(ws_path).endswith(".code-workspace") else [])
     folders = list(meta_row.get("tracked_repos") or [])
+    if ws_folders and len(ws_folders) > 1:
+        return list(dict.fromkeys(folders + ws_folders))
     if folders:
         return folders
-    ws_path = meta_row.get("workspace_path") or ""
-    if _normalize_fs_path(ws_path).endswith(".code-workspace"):
-        return _parse_workspace_folders(ws_path)
+    if ws_folders:
+        return ws_folders
     repo = (meta_row.get("repository") or "").strip()
     if repo and not repo.endswith(".code-workspace"):
         return [repo]
@@ -458,7 +462,7 @@ def _sync_session_repo_labels(session, refs_entry):
         primary = [name for name, w in weights.items() if w > 0]
     else:
         primary = [r["name"] for r in (refs_entry.get("repos") or [])
-                   if r.get("role") in ("primary", "inferred")]
+                   if r.get("role") in ("primary", "inferred", "shared-unconfirmed")]
     if not primary:
         return
     if len(primary) == 1:
@@ -653,6 +657,66 @@ def _turn_pr_git_costs(ts, cost, activities, window, path_by_github):
     return {pk: cost * (w / total_w) for pk, w in weights.items()}
 
 
+def _resolve_bare_pr_repo(num, hints, text, session=None, activities=None,
+                          priced_all=None, path_by_github=None, refs_entry=None):
+    """Pick one repo for a bare 'PR #N' mention instead of fanning out to every hint."""
+    if not hints:
+        return None
+    num_s = str(num)
+    # Explicit owner/repo#N or github URL in session text wins.
+    for owner, repo, n in RE_PR_SHORT.findall(text or ""):
+        if int(n) == num and clean_repo(owner, repo) in hints:
+            return clean_repo(owner, repo)
+    for owner, repo, n in RE_PR.findall(text or ""):
+        if int(n) == num and clean_repo(owner, repo) in hints:
+            return clean_repo(owner, repo)
+    # Git merge for this PR number near a billed turn.
+    if session and activities and priced_all:
+        sid = session.get("session_id")
+        for turn in (priced_all or {}).get(sid) or []:
+            ts = _parse_turn_ts(turn.get("started_at"))
+            if ts is None:
+                continue
+            for repo in hints:
+                pk = f"{repo}#{num}"
+                for act in activities:
+                    if act.get("pr") != pk:
+                        continue
+                    if abs(act["ts"] - ts) <= GIT_CORR_WINDOW:
+                        return repo
+    # Any merge for this PR number among candidate repos (no time window).
+    if activities:
+        merge_repos = []
+        for repo in hints:
+            pk = f"{repo}#{num}"
+            if any(act.get("pr") == pk for act in activities):
+                merge_repos.append(repo)
+        if len(merge_repos) == 1:
+            return merge_repos[0]
+        if len(merge_repos) > 1:
+            weights = (session or {}).get("repo_weights") or {}
+            weighted = [(r, weights[r]) for r in merge_repos if weights.get(r, 0) > 0]
+            if weighted:
+                return max(weighted, key=lambda x: x[1])[0]
+            primaries = {x.get("name") for x in (refs_entry or {}).get("repos") or []
+                         if x.get("role") in ("primary", "shared-unconfirmed")}
+            primary_hits = [r for r in merge_repos if r in primaries]
+            if len(primary_hits) == 1:
+                return primary_hits[0]
+    # PR already linked to a repo in refs for this number.
+    for p in (refs_entry or {}).get("prs") or []:
+        if p.get("number") == num and p.get("repo") in hints:
+            return p["repo"]
+    # Single-repo session or git-weighted top repo.
+    weights = (session or {}).get("repo_weights") or {}
+    weighted = [(r, weights[r]) for r in hints if weights.get(r, 0) > 0]
+    if weighted:
+        return max(weighted, key=lambda x: x[1])[0]
+    if len(hints) == 1:
+        return hints[0]
+    return None
+
+
 def _pr_text_turn_costs(sid, items, turn_prs, turn_cost):
     """Turn-segment costs when a PR is mentioned in that turn's transcript."""
     anchors = sorted((turn_prs or {}).get(sid) or [])
@@ -701,7 +765,9 @@ def _pr_cost_entries(session, refs_entry, turn_prs=None, turn_cost=None):
         if p.get("inferred"):
             abs_cost = gc_prs.get(k) or git_costs.get(k) or 0
         else:
-            abs_cost = text_costs.get(k) or gc_prs.get(k) or git_costs.get(k) or 0
+            abs_cost = text_costs.get(k) or 0
+            if abs_cost <= 0:
+                abs_cost = gc_prs.get(k) or git_costs.get(k) or 0
         if abs_cost <= 0:
             continue
         out.append((p, abs_cost))
@@ -710,7 +776,7 @@ def _pr_cost_entries(session, refs_entry, turn_prs=None, turn_cost=None):
 
 
 def _apply_git_activity_gate(sessions, refs, priced_all, activities, path_by_github):
-    """Drop repo attribution when the repo had no commits/PRs during the session."""
+    """Drop inferred attribution when git did not confirm activity during the session."""
     if not activities:
         return
     for s in sessions:
@@ -721,27 +787,28 @@ def _apply_git_activity_gate(sessions, refs, priced_all, activities, path_by_git
         kept = []
         for x in r.get("repos") or []:
             role = x.get("role")
-            if role not in ("primary", "inferred"):
-                kept.append(x)
-                continue
-            name = x.get("name") or ""
-            if _repo_has_session_activity(
-                    name, s, priced_all, activities, path_by_github):
-                kept.append(x)
+            if role == "inferred":
+                name = x.get("name") or ""
+                if _repo_has_session_activity(
+                        name, s, priced_all, activities, path_by_github):
+                    kept.append(x)
+                else:
+                    kept.append({**x, "role": "shared-skipped"})
             else:
-                kept.append({**x, "role": "shared-skipped"})
+                kept.append(x)
         r["repos"] = kept
         weights = s.get("repo_weights") or {}
         if weights:
             active = {x.get("name") for x in kept
-                      if x.get("role") in ("primary", "inferred")}
+                      if x.get("role") in ("primary", "inferred", "shared-unconfirmed")}
             weights = {k: v for k, v in weights.items() if k in active}
             if weights:
                 total = sum(weights.values()) or 1.0
                 s["repo_weights"] = {k: v / total for k, v in weights.items()}
             else:
                 s["repo_weights"] = {}
-        billable = [x for x in kept if x.get("role") in ("primary", "inferred")]
+        billable = [x for x in kept
+                    if x.get("role") in ("primary", "inferred", "shared-unconfirmed")]
         if not billable:
             s.pop("shared_attribution", None)
             s["repository"] = ""
@@ -753,15 +820,16 @@ def _apply_git_activity_gate(sessions, refs, priced_all, activities, path_by_git
         kept_prs = []
         for p in r.get("prs") or []:
             pk = p.get("key") or ""
-            repo = p.get("repo") or (pk.split("#")[0] if pk else "")
             if p.get("inferred"):
                 if _pr_has_session_activity(
                         pk, s, priced_all, activities, path_by_github):
                     kept_prs.append(p)
+                else:
+                    kept_prs.append({**p, "role": "skipped"})
                 continue
-            if (_pr_has_session_activity(pk, s, priced_all, activities, path_by_github)
-                    or _repo_has_session_activity(
-                        repo, s, priced_all, activities, path_by_github)):
+            if _pr_has_session_activity(pk, s, priced_all, activities, path_by_github):
+                kept_prs.append(p)
+            elif not p.get("bare"):
                 kept_prs.append(p)
             else:
                 kept_prs.append({**p, "role": "skipped"})
@@ -787,11 +855,12 @@ def _apply_git_pr_discovery(sessions, refs, priced_all, activities, path_by_gith
                     ts, cost, activities, GIT_CORR_WINDOW, path_by_github).items():
                 costs[pk] += share
         gc = s.get("git_correlation") or {}
-        for gp in gc.get("prs") or []:
-            pk = gp.get("key")
-            c = gp.get("cost_usd") or 0
-            if pk and c > 0:
-                costs[pk] += c
+        if gc.get("matched"):
+            for gp in gc.get("prs") or []:
+                pk = gp.get("key")
+                c = gp.get("cost_usd") or 0
+                if pk and c > 0 and pk not in costs:
+                    costs[pk] = c
         if not costs:
             continue
         r = refs.setdefault(sid, {"jira": [], "prs": [], "repos": []})
@@ -805,7 +874,7 @@ def _apply_git_pr_discovery(sessions, refs, priced_all, activities, path_by_gith
                     "number": int(pk.split("#")[1]),
                     "created": False, "inferred": True,
                 }
-            elif not existing[pk].get("created"):
+            elif existing[pk].get("inferred") and not existing[pk].get("created"):
                 existing[pk]["inferred"] = True
         r["prs"] = sorted(existing.values(), key=lambda p: (p["repo"], p["number"]))
         refs[sid] = r
@@ -863,8 +932,7 @@ def _repo_cost_shares(session, refs_entry):
             return [(it, w / total) for it, w in alloc]
         return []
     billable = [it for it in items
-                if it.get("role") in ("primary", "inferred")
-                and it.get("role") not in ("shared-skipped", "shared-unconfirmed")]
+                if it.get("role") in ("primary", "inferred", "shared-unconfirmed")]
     if not billable:
         return []
     if len(billable) == 1:
@@ -886,30 +954,83 @@ def _apply_repo_age_filters(sessions, refs, path_by_github):
         refs[sid] = r
 
 
-def _attach_tracked_repos(sessions, meta, refs):
+def _default_code_workspace_path():
+    parent = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    for ws_name in COMMON_WORKSPACE_NAMES:
+        ws = os.path.join(parent, ws_name)
+        if os.path.isfile(ws):
+            return ws
+    return ""
+
+
+def _session_known_repo_map(session_refs, meta_row):
+    known = {}
+    for it in (session_refs or {}).get("repos") or []:
+        name = it.get("name") or ""
+        if "/" in name:
+            known[name.split("/")[-1].lower()] = name
+    for tr in (meta_row or {}).get("tracked_repos") or []:
+        if "/" in tr:
+            known[tr.split("/")[-1].lower()] = tr
+        elif tr:
+            known[tr.lower()] = tr
+    return known
+
+
+def _attach_tracked_repos(sessions, meta, refs, path_by_github=None):
     """Attribute sessions to trackedGitRepos; multi-root splits refined by git activity later."""
-    known = _known_repo_map(refs)
     owner = _github_owner_hint(refs)
+    default_ws = _default_code_workspace_path()
 
     for s in sessions:
         sid = s["session_id"]
         m = meta.get(sid) or {}
+        session_refs = refs.get(sid) or {}
+        known = _session_known_repo_map(session_refs, m)
         row = {
             **m,
             "tracked_repos": s.get("tracked_repos") or m.get("tracked_repos"),
+            "tracked_repo_paths": s.get("tracked_repo_paths") or m.get("tracked_repo_paths"),
             "workspace_path": s.get("workspace_path") or m.get("workspace_path") or "",
             "repository": s.get("repository") or m.get("repository") or "",
         }
         folders = _tracked_folders_from_meta(row)
         ws_path = row.get("workspace_path") or ""
+        ws_norm = _normalize_fs_path(ws_path)
+        if default_ws:
+            ws_candidates = [_repo_from_path(p) for p in _parse_workspace_repo_paths(default_ws)]
+            if not folders and not ws_path:
+                ws_path = default_ws
+                row["workspace_path"] = ws_path
+                folders = ws_candidates
+                session_refs = refs.get(sid) or {}
+                mentioned = {x.get("name") or "" for x in session_refs.get("repos") or []}
+                mentioned |= {n.split("/")[-1] for n in mentioned if n}
+                if mentioned:
+                    folders = [f for f in folders
+                               if f in mentioned
+                               or _canonical_repo_name(f, known, owner) in mentioned
+                               or f.split("/")[-1] in mentioned]
+            elif (s.get("billed") and len(folders) <= 1
+                  and not ws_norm.endswith(".code-workspace")
+                  and len(ws_candidates) > 1):
+                ws_path = ws_path or default_ws
+                row["workspace_path"] = ws_path
+                folders = list(dict.fromkeys(folders + ws_candidates))
         paths_by_folder = _paths_for_workspace_folders(row, ws_path)
         session_end_ts = _session_end_ts(s)
         folders = _filter_folders_by_repo_age(folders, paths_by_folder, session_end_ts)
         multi = len(folders) > 1 or _normalize_fs_path(ws_path).endswith(".code-workspace") or (
             (s.get("repository") or "").endswith(".code-workspace"))
         names = []
+        path_lookup = path_by_github or {}
+        path_rev = {_normalize_fs_path(p): gh for gh, p in path_lookup.items()}
         for folder in folders:
-            cn = _canonical_repo_name(folder, known, owner)
+            path = paths_by_folder.get(folder) or paths_by_folder.get(_repo_from_path(folder))
+            gh_name = ""
+            if path:
+                gh_name = path_rev.get(_normalize_fs_path(path)) or _git_remote_github(path) or ""
+            cn = gh_name or _canonical_repo_name(folder, known, owner)
             if cn and cn not in names:
                 names.append(cn)
         if not names:
@@ -935,6 +1056,7 @@ def _attach_tracked_repos(sessions, meta, refs):
             s["repository"] = " · ".join(short[:5]) + (f" +{len(short) - 5}" if len(short) > 5 else "")
             s["workspace"] = _repo_from_path(_normalize_fs_path(ws_path)) if _normalize_fs_path(ws_path).endswith(".code-workspace") else s["repository"]
         s["tracked_repos"] = folders
+        s["workspace_path"] = ws_path
         s["repo_split"] = len(names) if len(names) > 1 else 0
 
 
@@ -2471,14 +2593,15 @@ def _clip(session, start, end):
             "text", "subagent", "draft", "refs", "billed", "source", "account_label",
             "unattributed", "orphan_billed", "billing_note", "tracked_repos",
             "workspace_path", "repo_split", "git_correlation", "repo_weights",
-            "shared_attribution"}
+            "shared_attribution", "pr_turn_costs"}
     base = {k: session[k] for k in keep if k in session}
     base["days"] = days
     base["by_model_day"] = bmd
     return _fill_totals(base)
 
 
-def _turn_maps_from_priced(priced_by_sid, refs=None, sessions_by_id=None):
+def _turn_maps_from_priced(priced_by_sid, refs=None, sessions_by_id=None,
+                           activities=None, path_by_github=None):
     """priced_by_sid: {sid: [turns with text, cost_usd, total_tokens, turn_index]}"""
     turn_prs = {}
     turn_cost = {}
@@ -2509,9 +2632,15 @@ def _turn_maps_from_priced(priced_by_sid, refs=None, sessions_by_id=None):
                 found[k] = found.get(k, False) or created_here
             for num_s in RE_PR_BARE.findall(text):
                 num = int(num_s)
-                for repo in hints:
-                    k = f"{repo}#{num}"
-                    found[k] = found.get(k, False) or created_here
+                repo = _resolve_bare_pr_repo(
+                    num, hints, text, sess,
+                    activities=activities, priced_all=priced_by_sid,
+                    path_by_github=path_by_github,
+                    refs_entry=refs.get(sid) if refs else None)
+                if not repo:
+                    continue
+                k = f"{repo}#{num}"
+                found[k] = found.get(k, False) or created_here
             if found:
                 prs[ti] = found
         turn_prs[sid] = prs
@@ -2734,6 +2863,8 @@ def scan_cursor(force=False):
                 if local:
                     if local.get("tracked_repos"):
                         sess["tracked_repos"] = local["tracked_repos"]
+                    if local.get("tracked_repo_paths"):
+                        sess["tracked_repo_paths"] = local["tracked_repo_paths"]
                     if local.get("workspace_path"):
                         sess["workspace_path"] = local["workspace_path"]
                     if local.get("repository") and not local.get("repo_split"):
@@ -2745,6 +2876,8 @@ def scan_cursor(force=False):
                         sess["workspace_path"] = mm["workspace_path"]
                     if mm.get("tracked_repos"):
                         sess["tracked_repos"] = mm["tracked_repos"]
+                    if mm.get("tracked_repo_paths"):
+                        sess["tracked_repo_paths"] = mm["tracked_repo_paths"]
             other.sort(key=lambda s: s["cost_usd"], reverse=True)
             sessions = sessions + other
             print(f"  billed {len(billed_sessions)} conversations"
@@ -2754,19 +2887,20 @@ def scan_cursor(force=False):
         allow = JIRA_KEY_ALLOW | _dynamic_jira_keys(texts_by_cid.values())
         sess_repo = {s["session_id"]: s["repository"] for s in sessions if s.get("repository")}
         refs = _build_refs(list(texts_by_cid.items()), sess_repo, allow)
-        _attach_tracked_repos(sessions, meta, refs)
-        path_by_github = _github_path_map(meta=meta)
+        git_repos = _discover_git_repos(meta)
+        path_by_github = _github_path_map(git_repos=git_repos)
+        _attach_tracked_repos(sessions, meta, refs, path_by_github)
         _apply_repo_age_filters(sessions, refs, path_by_github)
-        _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github)
         for sess in sessions:
             sess["refs"] = refs.get(sess["session_id"], {"jira": [], "prs": [], "repos": []})
 
         sessions.sort(key=lambda s: (0 if s.get("billed") else 1, -(s.get("cost_usd") or 0)))
-        git_repos = _discover_git_repos(meta)
         git_since, git_until = _activity_date_bounds(
             sessions, (billing or {}).get("events") if billing else None)
         git_acts = _fetch_git_activities(git_repos, git_since, git_until) if git_repos else []
         _apply_repo_age_filters(sessions, refs, path_by_github)
+        _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github,
+                            priced_all=priced_all, activities=git_acts)
         if billing and git_acts:
             _correlate_git_to_sessions(
                 sessions, priced_all, refs, turns_api, git_acts,
@@ -2783,7 +2917,8 @@ def scan_cursor(force=False):
         for sess in sessions:
             sess["refs"] = refs.get(sess["session_id"], sess.get("refs"))
         turn_prs, turn_cost = _turn_maps_from_priced(
-            priced_all, refs, {s["session_id"]: s for s in sessions})
+            priced_all, refs, {s["session_id"]: s for s in sessions},
+            git_acts, path_by_github)
         git_pr_catalog = _git_pr_catalog(git_acts) if git_acts else {}
         data = {
             "sessions": sessions,
@@ -2792,6 +2927,7 @@ def scan_cursor(force=False):
             "turn_cost": turn_cost,
             "refs": refs,
             "git_pr_catalog": git_pr_catalog,
+            "path_by_github": path_by_github,
             "db": DB_PATH,
             "billed": bool(billing),
             "billing_error": billing_error,
@@ -2846,8 +2982,11 @@ def _repo_hints(session, refs_entry, path_by_github=None):
     """GitHub repo names for resolving bare PR #123 mentions in chat text."""
     hints = set()
     end_ts = _session_end_ts(session) if session else None
+    owner = ""
     for x in (refs_entry or {}).get("repos") or []:
         name = x.get("name") or ""
+        if "/" in name:
+            owner = owner or name.split("/")[0]
         if "/" not in name or x.get("role") in ("shared-skipped",):
             continue
         if path_by_github and end_ts:
@@ -2861,15 +3000,23 @@ def _repo_hints(session, refs_entry, path_by_github=None):
         repo = p.get("repo") or (p.get("key") or "").split("#")[0]
         if repo and "/" in repo:
             hints.add(repo)
-    if hints:
-        return sorted(hints)
+    repo_field = (session or {}).get("repository") or ""
+    if not owner and "/" in repo_field:
+        owner = repo_field.split("/")[0]
     for tr in (session or {}).get("tracked_repos") or []:
-        if tr and "/" in tr:
-            if path_by_github and end_ts:
-                path = path_by_github.get(tr, "")
-                if path and not _repo_existed_at(path, end_ts):
-                    continue
-            hints.add(tr)
+        if not tr:
+            continue
+        if "/" in tr:
+            name = tr
+        else:
+            name = f"{owner}/{tr}" if owner else tr
+        if "/" not in name:
+            continue
+        if path_by_github and end_ts:
+            path = path_by_github.get(name, "")
+            if path and not _repo_existed_at(path, end_ts):
+                continue
+        hints.add(name)
     return sorted(hints)
 
 
@@ -2892,7 +3039,8 @@ def _git_pr_catalog(activities):
     return catalog
 
 
-def _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github=None):
+def _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github=None,
+                         priced_all=None, activities=None):
     """Resolve bare 'PR #17' mentions using session repo context."""
     for s in sessions:
         sid = s["session_id"]
@@ -2905,16 +3053,30 @@ def _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github=None):
         r = refs.setdefault(sid, {"jira": [], "prs": [], "repos": []})
         existing = {p["key"]: dict(p) for p in r.get("prs") or []}
         created_here = bool(RE_CREATED.search(text))
-        for num_s in RE_PR_BARE.findall(text):
-            num = int(num_s)
-            for repo in hints:
-                k = f"{repo}#{num}"
-                if k not in existing:
-                    existing[k] = {
-                        "key": k, "repo": repo, "number": num, "created": created_here,
-                    }
-                else:
-                    existing[k]["created"] = existing[k].get("created") or created_here
+        bare_nums = {int(n) for n in RE_PR_BARE.findall(text)}
+        for num in bare_nums:
+            repo = _resolve_bare_pr_repo(
+                num, hints, text, s, activities, priced_all, path_by_github, r)
+            if not repo:
+                continue
+            k = f"{repo}#{num}"
+            if k not in existing:
+                existing[k] = {
+                    "key": k, "repo": repo, "number": num, "created": created_here,
+                    "bare": True,
+                }
+            else:
+                existing[k]["created"] = existing[k].get("created") or created_here
+                existing[k]["bare"] = True
+        for num in bare_nums:
+            repo = _resolve_bare_pr_repo(
+                num, hints, text, s, activities, priced_all, path_by_github, r)
+            if not repo:
+                continue
+            keep_key = f"{repo}#{num}"
+            for k in list(existing.keys()):
+                if k.endswith(f"#{num}") and k != keep_key and existing[k].get("bare"):
+                    del existing[k]
         r["prs"] = sorted(existing.values(), key=lambda p: (p["repo"], p["number"]))
 
 
@@ -3051,8 +3213,32 @@ def _unattributed(sessions, refs, tabs):
     return out
 
 
-def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None):
+def _repo_alias_map(refs, path_by_github=None):
+    """Map short folder names to canonical owner/repo keys."""
+    aliases = {}
+    for gh in (path_by_github or {}):
+        aliases[gh.split("/")[-1].lower()] = gh
+        aliases[gh.lower()] = gh
+    for r in (refs or {}).values():
+        for it in (r or {}).get("repos") or []:
+            name = it.get("name") or ""
+            if "/" in name:
+                aliases[name.split("/")[-1].lower()] = name
+                aliases[name.lower()] = name
+    return aliases
+
+
+def _norm_repo_key(name, aliases):
+    if not name:
+        return name
+    if "/" in name:
+        return aliases.get(name.lower(), name)
+    return aliases.get(name.lower(), name)
+
+
+def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None, path_by_github=None):
     jira, repos = {}, {}
+    repo_aliases = _repo_alias_map(refs, path_by_github)
     for s in sessions:
         r = refs.get(s["session_id"])
         if not r:
@@ -3078,7 +3264,7 @@ def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None):
         gc = s.get("git_correlation") or {}
         if gc.get("matched") and gc.get("repos") and not s.get("repo_weights"):
             for repo_row in gc["repos"]:
-                k = repo_row["name"]
+                k = _norm_repo_key(repo_row["name"], repo_aliases)
                 share_c = repo_row.get("cost_usd") or 0
                 if share_c <= 0:
                     continue
@@ -3098,7 +3284,7 @@ def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None):
             repo_shares = _repo_cost_shares(s, r)
             if repo_shares:
                 for it, frac in repo_shares:
-                    k = it["name"]
+                    k = _norm_repo_key(it["name"], repo_aliases)
                     e = repos.setdefault(k, {"key": k, "cost_usd": 0.0, "on_demand_usd": 0.0,
                                              "total_tokens": 0,
                                              "chats": 0, "titles": [], "created": False,
@@ -3153,9 +3339,6 @@ def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None):
                     e["created"] = True
                 if isinstance(it, dict) and it.get("inferred"):
                     e["inferred"] = True
-        for pk, cat in (git_pr_catalog or {}).items():
-            if pk not in prs_map:
-                prs_map[pk] = dict(cat)
         prs = sorted(prs_map.values(), key=lambda x: (-x["cost_usd"], x["key"]))
     else:
         prs = pr_segments(titles, turn_prs, turn_cost)
@@ -3530,7 +3713,7 @@ def build_payload(start, end, q="", force=False):
         "cycles": cycles,
         "range_is_current_cycle": range_is_current_cycle,
         "rollup": rollup(billed_rows, refs, turn_prs, turn_cost,
-                          data.get("git_pr_catalog")),
+                          data.get("git_pr_catalog"), data.get("path_by_github")),
         "jira_base": JIRA_BASE,
         "q": q,
         "range": {"start": start, "end": end},
