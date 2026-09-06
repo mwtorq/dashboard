@@ -93,11 +93,16 @@ def _default_db():
 DEFAULT_DB = _default_db()
 
 # --- Jira linking -----------------------------------------------------------
-JIRA_BASE_DEFAULT = os.environ.get("CURSOR_DASH_JIRA_BASE") or os.environ.get("COPILOT_DASH_JIRA_BASE", "")
-JIRA_KEY_ALLOW = {k.strip().upper()
-                  for k in (os.environ.get("CURSOR_DASH_JIRA_KEYS")
-                            or os.environ.get("COPILOT_DASH_JIRA_KEYS", "")).split(",")
-                  if k.strip()}
+JIRA_HOST_DEFAULT = "timberwilde.atlassian.net"
+JIRA_BASE_DEFAULT = (os.environ.get("CURSOR_DASH_JIRA_BASE")
+                     or os.environ.get("COPILOT_DASH_JIRA_BASE")
+                     or f"https://{JIRA_HOST_DEFAULT}")
+JIRA_CRED_RESOURCE = f"Atlassian:{JIRA_HOST_DEFAULT}"
+_JIRA_KEYS_DEFAULT = os.environ.get("CURSOR_DASH_JIRA_KEYS") or os.environ.get("COPILOT_DASH_JIRA_KEYS", "")
+if not _JIRA_KEYS_DEFAULT.strip():
+    _JIRA_KEYS_DEFAULT = "TIM"
+JIRA_KEY_ALLOW = {k.strip().upper() for k in _JIRA_KEYS_DEFAULT.split(",") if k.strip()}
+JIRA_ISSUE_TTL = 300
 JIRA_KEY_DENY = {"UTF", "CVE", "ISO", "RFC", "SHA", "AES", "RSA", "GPT", "API", "UTC",
                  "TLS", "SSL", "HTTP", "SQL", "JSON", "YAML", "BASE", "X", "IPV", "MD",
                  "ISO8601", "SOC", "PCI", "AD", "V", "PY", "NET", "SP", "EC", "AMD",
@@ -149,6 +154,8 @@ _BILLING_CACHE = {"at": 0, "data": None, "turns": {}}
 
 DB_PATH = DEFAULT_DB
 JIRA_BASE = JIRA_BASE_DEFAULT
+_JIRA_ISSUE_CACHE = {"at": 0.0, "data": {}, "keys": frozenset()}
+_JIRA_LAST_ERROR = ""
 
 
 def connect(path=None):
@@ -3094,6 +3101,170 @@ def _dynamic_jira_keys(texts):
     return keys
 
 
+def _jira_credentials():
+    """Atlassian email + API token from env vars or Windows Credential Manager."""
+    email = (os.environ.get("CURSOR_DASH_JIRA_EMAIL")
+             or os.environ.get("ATLASSIAN_EMAIL") or "").strip()
+    token = (os.environ.get("CURSOR_DASH_JIRA_TOKEN")
+             or os.environ.get("ATLASSIAN_API_TOKEN") or "").strip()
+    if email and token:
+        return email, token
+    if os.name != "nt":
+        return "", ""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "get_atlassian_credential.ps1")
+    if not os.path.isfile(script):
+        return "", ""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+            capture_output=True, text=True, timeout=15, check=False)
+        if out.returncode != 0:
+            return "", ""
+        raw = out.stdout.strip()
+        data = json.loads(raw)
+        if isinstance(data, str):
+            data = json.loads(data)
+        return ((data.get("Email") or "").strip(),
+                (data.get("Token") or "").strip())
+    except Exception:
+        return "", ""
+
+
+def _jira_field_name(field):
+    if field is None:
+        return ""
+    if isinstance(field, str):
+        return field
+    if isinstance(field, dict):
+        return (field.get("name") or field.get("displayName")
+                or field.get("value") or "")
+    return str(field)
+
+
+def _jira_parse_issue(issue):
+    fields = issue.get("fields") or {}
+    status = fields.get("status") or {}
+    itype = fields.get("issuetype") or {}
+    assignee = fields.get("assignee") or {}
+    priority = fields.get("priority") or {}
+    parent = fields.get("parent") or {}
+    return {
+        "summary": fields.get("summary") or "",
+        "status": status.get("name") or "",
+        "status_category": ((status.get("statusCategory") or {}).get("key") or ""),
+        "type": itype.get("name") or "",
+        "assignee": assignee.get("displayName") or "Unassigned",
+        "priority": priority.get("name") or "",
+        "updated": (fields.get("updated") or "")[:10],
+        "created": (fields.get("created") or "")[:10],
+        "parent": parent.get("key") or "",
+        "labels": fields.get("labels") or [],
+    }
+
+
+def _jira_api(email, token, path, params=None, body=None, method=None, timeout=30):
+    base = (JIRA_BASE or JIRA_BASE_DEFAULT).rstrip("/")
+    url = base + path
+    if params and body is None:
+        url += "?" + urlencode(params)
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode("ascii")
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method=method or ("POST" if body is not None else "GET"),
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _jira_verify_auth(email, token):
+    """Return None on success, or a short error string."""
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                      (token or "").lower()):
+        return ("Stored value looks like a token ID (UUID), not the API secret. "
+                "Re-run store_atlassian_token.ps1 with the ATATT… secret from "
+                "id.atlassian.com (shown only once at creation).")
+    try:
+        _jira_api(email, token, "/rest/api/3/myself")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return ("Jira authentication failed — check email and API token, then "
+                    "re-run store_atlassian_token.ps1")
+        return f"Jira API HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        return f"Jira API: {type(exc).__name__}: {exc}"
+    return None
+
+
+def _jira_fetch_issues(keys):
+    """Bulk-fetch Jira issue fields for ticket keys. Cached briefly."""
+    global _JIRA_LAST_ERROR
+    keys = sorted({k for k in keys if k})
+    if not keys:
+        return {}
+    email, token = _jira_credentials()
+    if not email or not token:
+        _JIRA_LAST_ERROR = ("Jira credentials not configured — run "
+                            "store_atlassian_token.ps1 or set "
+                            "CURSOR_DASH_JIRA_EMAIL / CURSOR_DASH_JIRA_TOKEN")
+        return {}
+    auth_err = _jira_verify_auth(email, token)
+    if auth_err:
+        _JIRA_LAST_ERROR = auth_err
+        return {}
+    now = time.time()
+    cache = _JIRA_ISSUE_CACHE
+    keyset = frozenset(keys)
+    if (cache["data"] and now - cache["at"] < JIRA_ISSUE_TTL
+            and keyset <= cache["keys"]):
+        return {k: cache["data"][k] for k in keys if k in cache["data"]}
+    out = {}
+    field_list = ["summary", "status", "issuetype", "assignee", "priority",
+                  "updated", "created", "parent", "labels"]
+    for i in range(0, len(keys), 40):
+        chunk = keys[i:i + 40]
+        jql = "key in (" + ",".join(chunk) + ")"
+        try:
+            data = _jira_api(email, token, "/rest/api/3/search/jql", body={
+                "jql": jql,
+                "maxResults": len(chunk),
+                "fields": field_list,
+            })
+        except urllib.error.HTTPError as exc:
+            _JIRA_LAST_ERROR = f"Jira API HTTP {exc.code}: {exc.reason}"
+            return out
+        except Exception as exc:
+            _JIRA_LAST_ERROR = f"Jira API: {type(exc).__name__}: {exc}"
+            return out
+        for issue in data.get("issues") or []:
+            key = issue.get("key")
+            if key:
+                out[key] = _jira_parse_issue(issue)
+    _JIRA_LAST_ERROR = ""
+    cache["at"], cache["data"] = now, out
+    cache["keys"] = keyset
+    return out
+
+
+def _enrich_jira_rollup(rollup):
+    items = (rollup or {}).get("jira") or []
+    if not items:
+        return rollup
+    details = _jira_fetch_issues([i.get("key") for i in items if i.get("key")])
+    for item in items:
+        detail = details.get(item.get("key"))
+        if detail:
+            item.update(detail)
+    return rollup
+
+
 def _build_refs(rows, sess_repo, allow):
     out = {}
     for sid, text in rows:
@@ -3511,6 +3682,49 @@ def _cycle_mtd(data, today):
     }
 
 
+def _range_allowance(billed_rows, start, end, mtd, cycles, range_is_current_cycle,
+                       range_is_last_cycle=False, plan=""):
+    """Allowance vs on-demand metered in the selected date range."""
+    rows = billed_rows or []
+    cost = sum(s.get("cost_usd") or 0 for s in rows)
+    od = sum(s.get("on_demand_usd") or 0 for s in rows)
+    inc = max(0.0, cost - od)
+    out = {
+        "start": start,
+        "end": end,
+        "cost_usd": round(cost, 4),
+        "included_usd": round(inc, 4),
+        "on_demand_usd": round(od, 4),
+        "sessions": len(rows),
+        "requests": sum(s.get("requests") or 0 for s in rows),
+        "total_tokens": sum(s.get("total_tokens") or 0 for s in rows),
+        "plan": plan,
+        "range_is_current_cycle": range_is_current_cycle,
+        "range_is_last_cycle": range_is_last_cycle,
+    }
+    limit = (mtd or {}).get("included_limit") or (mtd or {}).get("budget") or 0.0
+    if range_is_current_cycle and mtd:
+        out["included_limit"] = limit
+        out["included_remaining"] = mtd.get("included_remaining")
+        out["cycle_included_used"] = mtd.get("included_usd")
+        out["on_demand_limit"] = mtd.get("on_demand_limit")
+        out["on_demand_remaining"] = mtd.get("on_demand_remaining")
+        out["bonus_usd"] = mtd.get("bonus_usd")
+        out["cycle_start"] = mtd.get("start")
+        out["cycle_end"] = mtd.get("end")
+        out["reset_date"] = mtd.get("reset_date")
+        out["days_left"] = mtd.get("days_left")
+        if limit:
+            out["pct_of_cycle_limit"] = round(
+                (mtd.get("included_usd") or 0) / limit * 100, 1)
+    elif range_is_last_cycle and limit:
+        out["included_limit"] = limit
+        out["historical"] = True
+        if limit:
+            out["pct_of_cycle_limit"] = round(inc / limit * 100, 1)
+    return out
+
+
 def _summarize_subscriptions(sub_lines):
     """Roll up plan-fee invoices to one row per account + plan."""
     groups = collections.OrderedDict()
@@ -3669,9 +3883,11 @@ def build_payload(start, end, q="", force=False):
     if billed:
         mtd = _cycle_mtd(data, today)
         view_cycle = dict(mtd)
+        range_is_last_cycle = False
         if cycles and cycles.get("last"):
             last = cycles["last"]
             if start == last["start"] and end == last["end"]:
+                range_is_last_cycle = True
                 view_cycle = _cycle_historical(
                     data["sessions"], last["start"], last["end"],
                     plan=mtd.get("plan") or "",
@@ -3694,14 +3910,20 @@ def build_payload(start, end, q="", force=False):
                "reset_date": _fmt_day(reset),
                "days_left": (reset - today).days}
         view_cycle = mtd
+        range_is_last_cycle = False
     if billed:
         range_is_current_cycle = bool(
             cycles and start == (cycles.get("current") or {}).get("start")
             and end == (cycles.get("current") or {}).get("end"))
+        range_allowance = _range_allowance(
+            billed_rows, start, end, mtd, cycles, range_is_current_cycle,
+            range_is_last_cycle=range_is_last_cycle,
+            plan=(mtd or {}).get("plan") or "")
     else:
         range_is_current_cycle = bool(
             mtd.get("start") and start == mtd["start"]
             and end <= (mtd.get("end") or MAX_DAY))
+        range_allowance = None
     pub = [_public_session(s) for s in (billed_rows + other_rows)]
     return {
         "totals": totals,
@@ -3712,9 +3934,13 @@ def build_payload(start, end, q="", force=False):
         "view_cycle": view_cycle,
         "cycles": cycles,
         "range_is_current_cycle": range_is_current_cycle,
-        "rollup": rollup(billed_rows, refs, turn_prs, turn_cost,
-                          data.get("git_pr_catalog"), data.get("path_by_github")),
+        "range_allowance": range_allowance,
+        "rollup": _enrich_jira_rollup(rollup(billed_rows, refs, turn_prs, turn_cost,
+                                            data.get("git_pr_catalog"),
+                                            data.get("path_by_github"))),
         "jira_base": JIRA_BASE,
+        "jira_connected": bool(_jira_credentials()[0]),
+        "jira_error": _JIRA_LAST_ERROR,
         "q": q,
         "range": {"start": start, "end": end},
         "bounds": {"min": min(bounds_days) if bounds_days else None,
@@ -4193,7 +4419,10 @@ def _digest_html(d):
             ("Requests", "right", lambda r: f"{r['requests']:,}"),
             ("Cost", "right", lambda r: _money(r["cost_usd"]))]),
         table("Top Jira tickets", _rows(ro.get("jira")), [
-            ("Ticket", "left", lambda r: esc(r["key"])),
+            ("Ticket", "left", lambda r: esc(r["key"])
+             + (f"<div style='font-size:11px;color:#57606a;margin-top:2px'>{esc(r.get('summary') or '')}</div>"
+                if r.get("summary") else "")),
+            ("Status", "left", lambda r: esc(r.get("status") or "—")),
             ("Chats", "right", lambda r: f"{r['chats']:,}"),
             ("Cost", "right", lambda r: _money(r["cost_usd"]))]),
         table("Top pull requests", _rows(ro.get("prs")), [
@@ -4267,7 +4496,12 @@ def _digest_text(d):
         if rows:
             lines += ["", f"{label}:"]
             for r in rows:
-                lines.append(f"  {r['key']:<40} {_money(r['cost_usd'])}")
+                extra = ""
+                if key == "jira" and r.get("summary"):
+                    extra = f"  {r['summary'][:48]}"
+                    if r.get("status"):
+                        extra += f" [{r['status']}]"
+                lines.append(f"  {r['key']:<40} {_money(r['cost_usd'])}{extra}")
     lines += ["", "Most expensive chats:"]
     for s in _rows(_digest_sessions(p)):
         lines.append(f"  {(s['title'] or '')[:52]:<52} {_money(s['cost_usd'])}")
@@ -4491,6 +4725,10 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .b{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600;
    border:1px solid var(--line);background:#0d1117;white-space:nowrap}
 .b.jira{border-color:#8957e5;color:#c297ff}
+.b.jira-type{border-color:#388bfd;color:#79c0ff}
+.b.jira-st{border-color:#8957e5;color:#c297ff}
+.b.jira-st.done,.b.jira-st.new{border-color:#3fb950;color:#7ee787}
+.b.jira-st.indeterminate{border-color:#d29922;color:#e3b341}
 .b.pr{border-color:#3fb950;color:#7ee787}
 .b.prnew{border-color:#d29922;color:#e3b341}
 .b.repo{border-color:#388bfd;color:#79c0ff}
@@ -4549,6 +4787,9 @@ section.collapsed > *:not(h2){display:none !important}
 .allow-rem.over{color:#f85149}
 .allow-card .meter{margin-top:10px;height:8px}
 .allow-card .sub{margin-top:6px;font-size:11px;line-height:1.4}
+#rangeAllowance{margin-bottom:16px}
+#rangeAllowance h2{font-size:15px;margin:0 0 6px;font-weight:600}
+#rangeAllowance .range-meta{margin-bottom:10px}
 .meter{height:12px;background:#0d1117;border:1px solid var(--line);border-radius:6px;overflow:hidden}
 .meter>div{height:100%;background:var(--good);transition:width .3s}
 .meter>div.warn{background:#d29922}.meter>div.over{background:#f85149}
@@ -4597,6 +4838,30 @@ section.collapsed > *:not(h2){display:none !important}
   <div id="loadnote"><span class="spin"></span><span id="loadmsg">Loading…</span></div>
   <div id="err"></div>
   <div class="note" id="mixnote"></div>
+  <section id="rangeAllowance" style="display:none">
+    <h2 id="rangeAllowHeading">Allowance usage</h2>
+    <div class="sub range-meta" id="rangeAllowMeta"></div>
+    <div class="allow-grid">
+      <div class="allow-card primary">
+        <div class="k">Allowance (included plan)</div>
+        <div class="v" id="rangeIncUsed"></div>
+        <div class="allow-rem" id="rangeIncRem"></div>
+        <div class="meter"><div id="rangeIncBar"></div></div>
+        <div class="sub" id="rangeIncDetail"></div>
+      </div>
+      <div class="allow-card">
+        <div class="k">On-demand metered</div>
+        <div class="v" id="rangeOdUsed"></div>
+        <div class="allow-rem" id="rangeOdRem"></div>
+        <div class="sub">USAGE_BASED events — cash overage beyond included allowance.</div>
+      </div>
+      <div class="allow-card">
+        <div class="k">Total metered in range</div>
+        <div class="v" id="rangeTotalUsed"></div>
+        <div class="sub" id="rangeTokFoot"></div>
+      </div>
+    </div>
+  </section>
   <div class="cards" id="cards"></div>
   <section id="mtd" style="display:none">
     <h2 id="mtdHeading">Plan allowance this cycle</h2>
@@ -4632,9 +4897,10 @@ section.collapsed > *:not(h2){display:none !important}
   <section><h2>Daily spend</h2><div class="spark" id="spark"></div><div class="sub" id="sparklabel"></div></section>
   <section><h2>Cost by work item</h2>
     <div class="tabs">
-      <button data-t="sessions" class="on">Sessions</button>
-      <button data-t="repos">Repositories</button>
+      <button data-t="jira" class="on">Jira tickets</button>
       <button data-t="prs">Pull requests</button>
+      <button data-t="repos">Repositories</button>
+      <button data-t="sessions">Sessions</button>
       <span class="clearable"><input id="rq" placeholder="Search work items…" size="22"><button
         class="clearx" data-for="rq" tabindex="-1" title="Clear search"
         aria-label="Clear search">&times;</button></span>
@@ -4689,7 +4955,7 @@ const costThTitle=billed=>
   billed
     ? 'Metered cost: allowance (included plan/bonus) vs on-demand (cash overage)'
     : 'Estimated cost from local transcript';
-let DATA=null, sortKey='cost_usd', sortDir=-1, tab='sessions', LAST_LOAD=null;
+let DATA=null, sortKey='cost_usd', sortDir=-1, tab='jira', LAST_LOAD=null;
 
 const jiraUrl=k=>(DATA&&DATA.jira_base)?`${DATA.jira_base}/browse/${k}`:null;
 const prUrl=k=>{const [r,n]=k.split('#');return `https://github.com/${r}/pull/${n}`;};
@@ -4709,10 +4975,24 @@ function badges(refs){
     `<a class="b ${r.role==='inferred'?'gitinf':'repo'}" href="${repoUrl(r.name)}" target="_blank" title="${r.role==='inferred'?'Inferred from nearby git commits (±8h)':'Primary tracked repo'}">${r.role==='inferred'?'≈ ':''}${r.name.split('/').pop()}</a>`));
   return out.length?`<div class="badges">${out.join('')}</div>`:'';
 }
+function jiraDetailSub(i){
+  if(tab!=='jira') return esc((i.titles||[]).join(' · '));
+  const parts=[];
+  if(i.summary) parts.push(i.summary);
+  else if(i.titles&&i.titles.length) parts.push(i.titles.join(' · '));
+  const badges=[];
+  if(i.type) badges.push(`<span class="b jira-type">${esc(i.type)}</span>`);
+  if(i.status) badges.push(`<span class="b jira-st ${esc(i.status_category||'')}" title="Jira status">${esc(i.status)}</span>`);
+  if(i.assignee&&i.assignee!=='Unassigned') badges.push(`<span class="b more" title="Assignee">${esc(i.assignee)}</span>`);
+  if(i.priority) badges.push(`<span class="b more" title="Priority">${esc(i.priority)}</span>`);
+  if(i.parent) badges.push(`<a class="b jira" href="${jiraUrl(i.parent)}" target="_blank" title="Parent">${esc(i.parent)}</a>`);
+  const badgeHtml=badges.length?`<div class="badges">${badges.join('')}</div>`:'';
+  return esc(parts.join(' · '))+badgeHtml;
+}
 function renderRollup(){
   let items=(DATA.rollup&&DATA.rollup[tab])||[];
   const rq=(document.getElementById('rq').value||'').toLowerCase().trim();
-  if(rq) items=items.filter(i=>(i.key+' '+(i.titles||[]).join(' ')).toLowerCase().includes(rq));
+  if(rq) items=items.filter(i=>(i.key+' '+(i.summary||'')+' '+(i.status||'')+' '+(i.type||'')+' '+(i.assignee||'')+' '+(i.titles||[]).join(' ')).toLowerCase().includes(rq));
   const billed=!!DATA.billed;
   const label={jira:'Jira ticket',prs:'Pull request',repos:'Repository',sessions:'Chat / session'}[tab];
   const link=x=>tab==='jira'?jiraUrl(x.key):tab==='prs'?prUrl(x.key):tab==='repos'?repoUrl(x.key):null;
@@ -4742,7 +5022,7 @@ function renderRollup(){
         ${i.turns?'<span class="b more">'+i.turns+' turn'+(i.turns===1?'':'s')+'</span>':''}
         ${i.role==='inferred'?'<span class="b gitinf" title="Attributed from git commit timestamps near billed usage">git ±8h</span>':''}
         ${i.role==='primary'?'<span class="b repo">primary</span>':''}
-        <div class="sub">${esc(i.titles.join(' · '))}</div></td>
+        <div class="sub">${jiraDetailSub(i)}</div></td>
       <td>${num(i.chats)}</td><td>${kt(i.total_tokens)}</td>
       <td class="cost">${costCell(i,billed)}</td>
       <td style="width:160px"><div class="bar" style="width:${i.cost_usd/mx*100}%"></div></td></tr>`;}).join('')+
@@ -4756,8 +5036,14 @@ function renderRollup(){
   const costKey=billed
     ? ' · multi-root workspace chats split by git commit/PR activity (±8h), not evenly'
     : '';
+  let jiraNote='';
+  if(tab==='jira'){
+    if(DATA.jira_connected) jiraNote=' · Jira API connected';
+    else if(DATA.jira_error) jiraNote=' · '+DATA.jira_error;
+    else jiraNote=' · run store_atlassian_token.ps1 for Jira summaries';
+  }
   document.getElementById('rollupfoot').textContent=
-    `${items.length} ${(items.length===1?label:plural).toLowerCase()} · ${kt(tk)} tokens · ${usd(tot)}`+rec+costKey;
+    `${items.length} ${(items.length===1?label:plural).toLowerCase()} · ${kt(tk)} tokens · ${usd(tot)}`+rec+costKey+jiraNote;
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===tab));
 }
 
@@ -4850,9 +5136,90 @@ document.getElementById('digestsend').onclick=async()=>{
   setTimeout(async()=>{ try{ DATA.digest=await (await fetch('/api/digest')).json();
     renderDigest(); }catch(e){} },4000);
 };
+function renderRangeAllowance(){
+  const ra=DATA.range_allowance;
+  const el=document.getElementById('rangeAllowance');
+  if(!ra||!DATA.billed){
+    el.style.display='none';
+    return;
+  }
+  el.style.display='';
+  const inc=ra.included_usd||0;
+  const od=ra.on_demand_usd||0;
+  const cost=ra.cost_usd||0;
+  const limit=ra.included_limit||0;
+  const plan=(ra.plan||DATA.plan||'').replace(/_/g,' ');
+  const rangeLbl=`${ra.start||''} → ${ra.end||''}`;
+  document.getElementById('rangeAllowHeading').textContent='Allowance usage in range';
+  let meta=plan?(plan+' · '):'';
+  meta+=rangeLbl;
+  if(ra.range_is_current_cycle&&ra.cycle_start){
+    meta+=` · billing cycle ${ra.cycle_start} → ${ra.cycle_end||''}`;
+    if(ra.reset_date) meta+=` · resets ${ra.reset_date} (${ra.days_left} day${ra.days_left===1?'':'s'})`;
+  } else if(ra.historical){
+    meta+=' · closed billing cycle';
+  }
+  document.getElementById('rangeAllowMeta').textContent=meta;
+  document.getElementById('rangeIncUsed').innerHTML=limit
+    ? `${usd(inc)} <span class="sub">in range · ${usd(ra.cycle_included_used!=null?ra.cycle_included_used:inc)} of ${usd(limit)} this cycle</span>`
+    : `${usd(inc)} <span class="sub">in range</span>`;
+  const incRemEl=document.getElementById('rangeIncRem');
+  if(limit&&ra.range_is_current_cycle&&ra.included_remaining!=null){
+    const cycleUsed=ra.cycle_included_used||0;
+    const exhausted=ra.included_remaining<=0.004;
+    incRemEl.textContent=exhausted
+      ? 'Cycle allowance exhausted'
+      : `${usd(ra.included_remaining)} cycle allowance remaining (${(ra.pct_of_cycle_limit||0).toFixed(0)}% of plan used this cycle)`;
+    incRemEl.className='allow-rem'+(exhausted?' over':'');
+  } else if(limit&&ra.historical){
+    const pct=ra.pct_of_cycle_limit||0;
+    incRemEl.textContent=pct>=100
+      ? `Over plan allowance by ${usd(inc-limit)}`
+      : `${pct.toFixed(0)}% of ${usd(limit)} cycle allowance`;
+    incRemEl.className='allow-rem'+(pct>=100?' over':'');
+  } else {
+    incRemEl.textContent=inc>0.004?'Included plan usage — not extra subscription cash':'';
+    incRemEl.className='allow-rem';
+  }
+  const bar=document.getElementById('rangeIncBar');
+  if(limit&&ra.range_is_current_cycle){
+    const pct=Math.min(100,((ra.cycle_included_used||0)/limit*100));
+    bar.style.width=pct+'%';
+    bar.className=pct>=100?'over':pct>=80?'warn':'';
+  } else if(limit&&ra.historical){
+    const pct=Math.min(100,(inc/limit*100));
+    bar.style.width=pct+'%';
+    bar.className=pct>=100?'over':pct>=80?'warn':'';
+  } else {
+    bar.style.width='0%';
+    bar.className='';
+  }
+  document.getElementById('rangeIncDetail').textContent=
+    ra.range_is_current_cycle&&limit
+      ? `${usd(inc)} allowance metered in this date range. Cycle totals from cursor.com/dashboard.`
+      : 'Allowance is included plan usage — metered but not subscription cash charged again.';
+  document.getElementById('rangeOdUsed').innerHTML=od>0.004
+    ? `${usd(od)}${ra.on_demand_limit?` <span class="sub">of ${usd(ra.on_demand_limit)} pool</span>`:''}`
+    : '$0.00';
+  const odRemEl=document.getElementById('rangeOdRem');
+  if(od>0.004){
+    odRemEl.textContent=ra.on_demand_remaining!=null&&ra.on_demand_limit
+      ? `${usd(ra.on_demand_remaining)} on-demand pool remaining this cycle`
+      : `${usd(od)} on-demand metered in range`;
+  } else odRemEl.textContent='';
+  odRemEl.className='allow-rem';
+  document.getElementById('rangeTotalUsed').innerHTML=
+    split(cost,[
+      {v:inc,label:'allowance',cls:'s',title:'Included plan usage'},
+      {v:od,label:'on-demand',cls:'e',title:'Usage-based overage'},
+    ]);
+  document.getElementById('rangeTokFoot').textContent=
+    `${num(ra.requests)} requests · ${num(ra.sessions)} chats · ${kt(ra.total_tokens)} tokens`;
+}
 function render(){
   const t=DATA.totals;
   renderDigest();
+  renderRangeAllowance();
   const budget=DATA.range_is_current_cycle?(DATA.mtd||{}).budget:null;
   const mix=document.getElementById('mixnote');
   if(DATA.billing_error && !DATA.billed){
@@ -5324,7 +5691,7 @@ def main():
         EMAIL_TO = args.email_to.strip()
     elif not EMAIL_TO:
         EMAIL_TO = _cursor_license_email()
-    JIRA_BASE = args.jira_base.rstrip("/")
+    JIRA_BASE = (args.jira_base or JIRA_BASE_DEFAULT).rstrip("/")
     if args.budget is not None or CREDIT_BUDGET:
         raw = args.budget if args.budget is not None else CREDIT_BUDGET
         try:
@@ -5375,6 +5742,11 @@ def main():
         else:
             via = "Gmail API  [save OAuth client JSON, then --gmail-auth]"
         print(f"  daily digest -> {EMAIL_TO} via {via}{off}", flush=True)
+    jira_email, _ = _jira_credentials()
+    if jira_email:
+        print(f"  Jira API -> {JIRA_BASE} as {jira_email}", flush=True)
+    else:
+        print("  Jira API -> not configured  [run store_atlassian_token.ps1]", flush=True)
     if not args.no_open:
         webbrowser.open(url)
     try:
