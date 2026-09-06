@@ -288,10 +288,18 @@ def _parse_workspace_folders(workspace_path):
             data = json.load(fh)
     except (OSError, json.JSONDecodeError, TypeError):
         return []
+    base = os.path.dirname(path)
     out = []
     for folder in data.get("folders") or []:
         if not isinstance(folder, dict):
             continue
+        rel = (folder.get("path") or "").strip()
+        if rel in (".", ".."):
+            continue
+        if rel:
+            full = os.path.normpath(os.path.join(base, rel))
+            if full == base:
+                continue
         name = (folder.get("name") or "").strip()
         if not name:
             name = _repo_from_path(folder.get("path"))
@@ -304,19 +312,17 @@ def _tracked_folders_from_meta(meta_row):
     """Local folder names from Cursor composer trackedGitRepos."""
     if not meta_row:
         return []
-    ws_path = meta_row.get("workspace_path") or ""
-    ws_folders = (_parse_workspace_folders(ws_path)
-                  if _normalize_fs_path(ws_path).endswith(".code-workspace") else [])
     folders = list(meta_row.get("tracked_repos") or [])
-    if ws_folders and len(ws_folders) > 1:
-        return list(dict.fromkeys(folders + ws_folders))
     if folders:
         return folders
-    if ws_folders:
-        return ws_folders
+    ws_path = meta_row.get("workspace_path") or ""
+    if _normalize_fs_path(ws_path).endswith(".code-workspace"):
+        ws_folders = _parse_workspace_folders(ws_path)
+        if len(ws_folders) == 1:
+            return ws_folders
     repo = (meta_row.get("repository") or "").strip()
     if repo and not repo.endswith(".code-workspace"):
-        return [repo]
+        return [repo.split("/")[-1] if "/" in repo else repo]
     return []
 
 
@@ -428,7 +434,8 @@ def _filter_folders_by_repo_age(folders, paths_by_folder, session_end_ts):
         if not _repo_existed_at(path, session_end_ts):
             continue
         kept.append(folder)
-    return kept
+    # Rewritten/squashed git history can make every repo look "too new" — don't zero attribution.
+    return kept if kept else folders
 
 
 def _github_path_map(git_repos=None, meta=None):
@@ -454,11 +461,14 @@ def _filter_session_refs_by_repo_age(session, refs_entry, path_by_github):
             return True
         return _repo_existed_at(path, end_ts)
 
-    refs_entry["repos"] = [
-        r for r in (refs_entry.get("repos") or []) if _existed(r.get("name"))]
-    refs_entry["prs"] = [
+    kept_repos = [r for r in (refs_entry.get("repos") or []) if _existed(r.get("name"))]
+    if kept_repos or not (refs_entry.get("repos") or []):
+        refs_entry["repos"] = kept_repos
+    kept_prs = [
         p for p in (refs_entry.get("prs") or [])
         if _existed(p.get("repo") or (p.get("key") or "").split("#")[0])]
+    if kept_prs or not (refs_entry.get("prs") or []):
+        refs_entry["prs"] = kept_prs
     return refs_entry
 
 
@@ -549,10 +559,8 @@ def _git_weights_for_repos(session, repo_names, path_by_github, activities,
                     best_per_repo[repo] = (dist, act)
             if not best_per_repo:
                 continue
-            w_map = {repo: 1.0 / (dist + 300.0) for repo, (dist, _) in best_per_repo.items()}
-            total = sum(w_map.values()) or 1.0
-            for repo, w in w_map.items():
-                weights[repo] += mass * (w / total)
+            best_repo = min(best_per_repo.items(), key=lambda x: x[1][0])[0]
+            weights[best_repo] += mass
     else:
         t0, t1 = _session_time_bounds(session, priced_all)
         if t0 is None:
@@ -794,11 +802,12 @@ def _apply_git_activity_gate(sessions, refs, priced_all, activities, path_by_git
         kept = []
         for x in r.get("repos") or []:
             role = x.get("role")
-            if role == "inferred":
+            if role in ("inferred", "shared-unconfirmed"):
                 name = x.get("name") or ""
                 if _repo_has_session_activity(
                         name, s, priced_all, activities, path_by_github):
-                    kept.append(x)
+                    kept.append(x if role == "inferred"
+                                 else {**x, "role": "inferred"})
                 else:
                     kept.append({**x, "role": "shared-skipped"})
             else:
@@ -926,26 +935,15 @@ def _apply_git_weighted_shared_repos(sessions, refs, priced_all, activities, pat
 
 
 def _repo_cost_shares(session, refs_entry):
-    """Return [(repo_item, fraction)] for rollup cost allocation."""
+    """Return [(repo_item, fraction)] — one repo per session at 100%."""
     items = refs_entry.get("repos") or []
-    if not items:
-        return []
-    weights = session.get("repo_weights") or {}
-    if weights:
-        alloc = [(it, weights.get(it.get("name") or "", 0.0))
-                 for it in items if weights.get(it.get("name") or "", 0.0) > 0]
-        if alloc:
-            total = sum(w for _, w in alloc) or 1.0
-            return [(it, w / total) for it, w in alloc]
-        return []
-    billable = [it for it in items
-                if it.get("role") in ("primary", "inferred", "shared-unconfirmed")]
-    if not billable:
-        return []
-    if len(billable) == 1:
-        return [(billable[0], 1.0)]
-    share = 1.0 / len(billable)
-    return [(it, share) for it in billable]
+    primaries = [it for it in items if it.get("role") == "primary"]
+    if len(primaries) == 1:
+        return [(primaries[0], 1.0)]
+    inferred = [it for it in items if it.get("role") == "inferred"]
+    if len(inferred) == 1:
+        return [(inferred[0], 1.0)]
+    return []
 
 
 def _apply_repo_age_filters(sessions, refs, path_by_github):
@@ -959,15 +957,6 @@ def _apply_repo_age_filters(sessions, refs, path_by_github):
         _sync_session_repo_labels(s, r)
         s["refs"] = r
         refs[sid] = r
-
-
-def _default_code_workspace_path():
-    parent = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-    for ws_name in COMMON_WORKSPACE_NAMES:
-        ws = os.path.join(parent, ws_name)
-        if os.path.isfile(ws):
-            return ws
-    return ""
 
 
 def _session_known_repo_map(session_refs, meta_row):
@@ -984,98 +973,328 @@ def _session_known_repo_map(session_refs, meta_row):
     return known
 
 
-def _attach_tracked_repos(sessions, meta, refs, path_by_github=None):
-    """Attribute sessions to trackedGitRepos; multi-root splits refined by git activity later."""
-    owner = _github_owner_hint(refs)
-    default_ws = _default_code_workspace_path()
+# --------------------------------------------------------------------------
+# Repo attribution — one repo per session, clear priority order.
+# --------------------------------------------------------------------------
 
+GIT_CORR_WINDOW = 8 * 3600  # seconds — match billed turns to nearby commits
+WORKSPACE_ROOT_REPO = "evernote_remarkable"
+REPO_TITLE_ALIASES = {
+    "fastcat": ["fastcat", "fast cat", "fast-path", "fast path", "relationship schema"],
+    "jrtca_results": ["jrtca", "trial results", "jrtca_results", "grid-keys", "grid keys",
+                        "normalization"],
+    "horse_shows": ["horse_shows", "horse shows", "horseshows", "scrape class", "show results",
+                    "non-placing", "discovery re-walk", "chrome process", "selenium"],
+    "3dprinting": ["3dprinting", "3d printing", "3d print", "bambu", "rv pantry",
+                   "interlocking shelf"],
+    "dashboard": ["dashboard", "cursor_dashboard", "cost dashboard", "copilot",
+                  "chunk budget", "atlassian api", "jira ticket", "jira backfill",
+                  "repo attribution"],
+    "racing_startingbox": ["racing_startingbox", "starting box", "startingbox"],
+}
+EVERNOTE_TITLE_ALIASES = ()  # dashboard: explicit evernote/remarkable in title only
+
+
+def _repo_short_name(name):
+    return (name or "").split("/")[-1]
+
+
+def _evernote_from_title(title):
+    """Evernote only when the title explicitly names the project — not legacy keyword lists."""
+    blob = (title or "").lower()
+    if "evernote_remarkable" in blob.replace("-", "_").replace(" ", "_"):
+        return True
+    return "evernote" in blob and "remarkable" in blob
+
+
+def _is_passive_evernote_track(tracked, cursor_repo):
+    """Evernote listed alone because it sits in the multi-root workspace file."""
+    if len(tracked) == 1 and tracked[0] == WORKSPACE_ROOT_REPO:
+        return True
+    cr = (cursor_repo or "").split("/")[-1]
+    return cr == WORKSPACE_ROOT_REPO and len(tracked) <= 1
+
+
+def _infer_repo_folder_from_title(title):
+    """Best-effort repo folder from chat title keywords — fallback only."""
+    blob = (title or "").lower().strip()
+    if not blob or blob in ("other billed usage", "(untitled)"):
+        return ""
+    for name, aliases in REPO_TITLE_ALIASES.items():
+        if any(a in blob for a in aliases):
+            return name
+    if _evernote_from_title(title):
+        return WORKSPACE_ROOT_REPO
+    return ""
+
+
+def _pick_git_repo(repo_hits):
+    """Prefer non-evernote when git activity is split across repos."""
+    ranked = repo_hits.most_common()
+    if not ranked:
+        return ""
+    top_repo, top_cost = ranked[0]
+    if (_repo_short_name(top_repo) != WORKSPACE_ROOT_REPO
+            or len(ranked) == 1):
+        return top_repo
+    for repo, cost in ranked[1:]:
+        if _repo_short_name(repo) != WORKSPACE_ROOT_REPO and cost >= top_cost * 0.2:
+            return repo
+    return top_repo
+
+
+def _canonical_repo_from_folder(folder, known, owner, path_by_github=None, paths_by_folder=None):
+    folder = (folder or "").strip()
+    if not folder or folder.endswith(".code-workspace"):
+        return ""
+    if "/" in folder:
+        return folder
+    path = (paths_by_folder or {}).get(folder) or (paths_by_folder or {}).get(_repo_from_path(folder))
+    if path and path_by_github:
+        np = _normalize_fs_path(path)
+        gh = _git_remote_github(path)
+        if gh:
+            return gh
+        for g, p in path_by_github.items():
+            if _normalize_fs_path(p) == np:
+                return g
+    hit = known.get(folder.lower())
+    if hit:
+        return hit
+    if owner:
+        return f"{owner}/{folder}"
+    return folder
+
+
+GENERIC_FILENAMES = frozenset({
+    "readme.md", "readme.txt", "license", "license.md", "changelog.md",
+    "__init__.py", "setup.py", "pyproject.toml", "requirements.txt",
+    "package.json", "package-lock.json", "tsconfig.json", "makefile",
+    "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "main.py", "main.ts", "main.js", "index.py", "index.ts", "index.js",
+    "config.json", "config.yaml", "config.yml", "settings.json",
+    ".gitignore", ".cursorrules",
+})
+RE_FILE_EXT = re.compile(
+    r"(?:\b|/)([\w][\w.-]*\.(?:py|ps1|psm1|tsx?|jsx?|rs|go|java|sql|md|json|ya?ml|"
+    r"html|css|sh|rb|php|cs|cpp|h|vue|svelte|toml|ini|cfg|xml|csv|ipynb))\b",
+    re.I)
+RE_EDITED_FILES = re.compile(r"\bEdited\s+(.+)$", re.I | re.M)
+RE_BACKTICK_FILE = re.compile(r"`([^`\n]+)`")
+_REPO_FILE_INDEX = {}
+
+
+def _session_text_for_files(session, meta):
+    parts = [
+        session.get("title") or "",
+        session.get("subtitle") or "",
+        (meta or {}).get("subtitle") or "",
+        session.get("text") or "",
+    ]
+    return "\n".join(p for p in parts if p)
+
+
+def _extract_file_refs(text):
+    """Basenames mentioned in chat text / Cursor subtitle."""
+    if not text:
+        return []
+    seen = set()
+    out = []
+
+    def add(name):
+        name = (name or "").strip().strip(",")
+        if not name or "/" in name and name.count("/") > 3:
+            base = os.path.basename(name.replace("\\", "/"))
+        else:
+            base = os.path.basename(name.replace("\\", "/")) if "/" in name else name
+        key = base.lower()
+        if not key or key in GENERIC_FILENAMES or key in seen:
+            return
+        if not re.search(r"\.\w{1,10}$", key):
+            return
+        seen.add(key)
+        out.append(base)
+
+    for m in RE_EDITED_FILES.finditer(text):
+        chunk = m.group(1)
+        for part in re.split(r",\s*", chunk):
+            add(part.strip())
+
+    for m in RE_FILE_EXT.finditer(text):
+        add(m.group(1))
+
+    for m in RE_BACKTICK_FILE.finditer(text):
+        token = m.group(1).strip()
+        if "." in token and not token.startswith("http"):
+            add(token)
+
+    return out
+
+
+def _repo_file_basenames(repo_path):
+    """Cached git-tracked basenames for a local repo."""
+    if repo_path in _REPO_FILE_INDEX:
+        return _REPO_FILE_INDEX[repo_path]
+    names = set()
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        _REPO_FILE_INDEX[repo_path] = names
+        return names
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo_path, "ls-files"],
+            capture_output=True, text=True, timeout=90, check=False)
+        for line in (r.stdout or "").splitlines():
+            base = os.path.basename(line.strip())
+            if base:
+                names.add(base.lower())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    _REPO_FILE_INDEX[repo_path] = names
+    return names
+
+
+def _resolve_repo_from_file_refs(session, meta, path_by_github, canon):
+    """Attribute to the repo that owns files referenced in chat text."""
+    if not path_by_github:
+        return "", ""
+    refs = _extract_file_refs(_session_text_for_files(session, meta))
+    if not refs:
+        return "", ""
+    scores = collections.Counter()
+    for basename in refs:
+        key = basename.lower()
+        if key in GENERIC_FILENAMES:
+            continue
+        for gh, repo_path in path_by_github.items():
+            if key in _repo_file_basenames(repo_path):
+                scores[gh] += 1
+    if not scores:
+        return "", ""
+    ranked = scores.most_common()
+    top_gh, top_n = ranked[0]
+    if len(ranked) == 1 or top_n > ranked[1][1]:
+        return top_gh, "file-ref"
+    return "", ""
+
+
+def _resolve_session_repo(session, meta, owner, known, path_by_github=None):
+    """One repo per session. Priority: Cursor metadata → file refs → title → unresolved."""
+    sid = session.get("session_id") or ""
+    if sid == "_unattributed" or session.get("unattributed") or session.get("orphan_billed"):
+        return "", "unresolved"
+
+    m = meta or {}
+    row = {
+        "tracked_repos": session.get("tracked_repos") or m.get("tracked_repos") or [],
+        "tracked_repo_paths": session.get("tracked_repo_paths") or m.get("tracked_repo_paths") or [],
+        "workspace_path": session.get("workspace_path") or m.get("workspace_path") or "",
+        "repository": session.get("repository") or m.get("repository") or "",
+    }
+    ws_path = row["workspace_path"]
+    paths_by_folder = _paths_for_workspace_folders(row, ws_path)
+    tracked = [t for t in (row["tracked_repos"] or []) if t]
+    cursor_repo = (row["repository"] or "").strip()
+    title = session.get("title") or m.get("title") or ""
+    title_repo = _infer_repo_folder_from_title(title)
+
+    def canon(name):
+        return _canonical_repo_from_folder(name, known, owner, path_by_github, paths_by_folder)
+
+    if len(tracked) == 1 and tracked[0] == WORKSPACE_ROOT_REPO:
+        if title_repo and title_repo != WORKSPACE_ROOT_REPO:
+            hit = canon(title_repo)
+            if hit:
+                return hit, "title"
+        if _evernote_from_title(title):
+            hit = canon(tracked[0])
+            if hit:
+                return hit, "cursor-tracked"
+    elif len(tracked) == 1:
+        hit = canon(tracked[0])
+        if hit:
+            return hit, "cursor-tracked"
+
+    if cursor_repo and not cursor_repo.endswith(".code-workspace"):
+        cr_short = cursor_repo.split("/")[-1]
+        if cr_short == WORKSPACE_ROOT_REPO and _is_passive_evernote_track(tracked, cursor_repo):
+            if title_repo and title_repo != WORKSPACE_ROOT_REPO:
+                hit = canon(title_repo)
+                if hit:
+                    return hit, "title"
+            if not _evernote_from_title(title):
+                pass  # fall through — don't assign passive evernote repository
+            else:
+                hit = canon(cursor_repo) if "/" not in cursor_repo else cursor_repo
+                if hit:
+                    return hit, "cursor-repository"
+        else:
+            hit = canon(cursor_repo) if "/" not in cursor_repo else cursor_repo
+            if hit:
+                return hit, "cursor-repository"
+
+    ws_norm = _normalize_fs_path(ws_path)
+    if ws_norm and not ws_norm.endswith(".code-workspace"):
+        hit = canon(_repo_from_path(ws_norm))
+        if hit:
+            return hit, "cursor-workspace"
+
+    file_repo, _file_src = _resolve_repo_from_file_refs(session, m, path_by_github, canon)
+    if file_repo:
+        return file_repo, _file_src
+
+    if title_repo and title_repo != WORKSPACE_ROOT_REPO:
+        hit = canon(title_repo)
+        if hit:
+            return hit, "title"
+    if title_repo == WORKSPACE_ROOT_REPO and _evernote_from_title(title):
+        hit = canon(title_repo)
+        if hit:
+            return hit, "title"
+
+    return "", "unresolved"
+
+
+def _assign_session_repos(sessions, meta, refs, path_by_github=None):
+    """Assign exactly one primary repo per session; record provenance in repo_source."""
+    _REPO_FILE_INDEX.clear()
+    owner = _github_owner_hint(refs)
     for s in sessions:
         sid = s["session_id"]
         m = meta.get(sid) or {}
         session_refs = refs.get(sid) or {}
         known = _session_known_repo_map(session_refs, m)
-        row = {
-            **m,
-            "tracked_repos": s.get("tracked_repos") or m.get("tracked_repos"),
-            "tracked_repo_paths": s.get("tracked_repo_paths") or m.get("tracked_repo_paths"),
-            "workspace_path": s.get("workspace_path") or m.get("workspace_path") or "",
-            "repository": s.get("repository") or m.get("repository") or "",
-        }
-        folders = _tracked_folders_from_meta(row)
-        ws_path = row.get("workspace_path") or ""
-        ws_norm = _normalize_fs_path(ws_path)
-        if default_ws:
-            ws_candidates = [_repo_from_path(p) for p in _parse_workspace_repo_paths(default_ws)]
-            if not folders and not ws_path:
-                ws_path = default_ws
-                row["workspace_path"] = ws_path
-                folders = ws_candidates
-                session_refs = refs.get(sid) or {}
-                mentioned = {x.get("name") or "" for x in session_refs.get("repos") or []}
-                mentioned |= {n.split("/")[-1] for n in mentioned if n}
-                if mentioned:
-                    folders = [f for f in folders
-                               if f in mentioned
-                               or _canonical_repo_name(f, known, owner) in mentioned
-                               or f.split("/")[-1] in mentioned]
-            elif (s.get("billed") and len(folders) <= 1
-                  and not ws_norm.endswith(".code-workspace")
-                  and len(ws_candidates) > 1):
-                ws_path = ws_path or default_ws
-                row["workspace_path"] = ws_path
-                folders = list(dict.fromkeys(folders + ws_candidates))
-        paths_by_folder = _paths_for_workspace_folders(row, ws_path)
-        session_end_ts = _session_end_ts(s)
-        folders = _filter_folders_by_repo_age(folders, paths_by_folder, session_end_ts)
-        multi = len(folders) > 1 or _normalize_fs_path(ws_path).endswith(".code-workspace") or (
-            (s.get("repository") or "").endswith(".code-workspace"))
-        names = []
-        path_lookup = path_by_github or {}
-        path_rev = {_normalize_fs_path(p): gh for gh, p in path_lookup.items()}
-        for folder in folders:
-            path = paths_by_folder.get(folder) or paths_by_folder.get(_repo_from_path(folder))
-            gh_name = ""
-            if path:
-                gh_name = path_rev.get(_normalize_fs_path(path)) or _git_remote_github(path) or ""
-            cn = gh_name or _canonical_repo_name(folder, known, owner)
-            if cn and cn not in names:
-                names.append(cn)
-        if not names:
+        repo, source = _resolve_session_repo(s, m, owner, known, path_by_github)
+        s["repo_source"] = source
+        s["repo_split"] = 0
+        if not repo:
+            s["repository"] = ""
+            s["workspace"] = ""
             continue
-
         r = refs.get(sid) or {"jira": [], "prs": [], "repos": []}
         merged = {x["name"]: x.get("role") or "mentioned" for x in r.get("repos") or []}
-        for name in names:
-            if name not in merged:
-                merged[name] = "primary"
-            elif multi and merged[name] == "mentioned":
-                merged[name] = "primary"
+        merged[repo] = "primary"
         r["repos"] = sorted(
             ({"name": k, "role": v} for k, v in merged.items()),
             key=lambda x: (x["role"] != "primary", x["name"]))
         refs[sid] = r
-
-        if len(names) == 1:
-            s["repository"] = names[0]
-            s["workspace"] = names[0]
-        else:
-            short = [n.split("/")[-1] for n in names]
-            s["repository"] = " · ".join(short[:5]) + (f" +{len(short) - 5}" if len(short) > 5 else "")
-            s["workspace"] = _repo_from_path(_normalize_fs_path(ws_path)) if _normalize_fs_path(ws_path).endswith(".code-workspace") else s["repository"]
-        s["tracked_repos"] = folders
-        s["workspace_path"] = ws_path
-        s["repo_split"] = len(names) if len(names) > 1 else 0
+        s["repository"] = repo
+        s["workspace"] = repo
 
 
 # --------------------------------------------------------------------------
-# Git activity correlation for billing-only sessions (no local chat / no ID).
+# Git activity correlation (fallback when Cursor metadata is missing).
 # --------------------------------------------------------------------------
 
-GIT_CORR_WINDOW = 8 * 3600  # seconds — match billed turns to nearby commits
 _GIT_CACHE = {}
 RE_MERGE_PR = re.compile(r"Merge pull request #(\d+)", re.I)
 RE_GH_REMOTE = re.compile(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", re.I)
 COMMON_WORKSPACE_NAMES = ("mwtorq.code-workspace",)
+
+
+def _sessions_for_git_correlation(sessions):
+    """Sessions still lacking a resolved repo after Cursor/title assignment."""
+    return [s for s in sessions
+            if s.get("repo_source") == "unresolved" and not s.get("repository")]
 
 
 def _parse_workspace_repo_paths(workspace_path):
@@ -1094,11 +1313,12 @@ def _parse_workspace_repo_paths(workspace_path):
         if not isinstance(folder, dict):
             continue
         rel = (folder.get("path") or "").strip()
-        if not rel:
+        if not rel or rel in (".", ".."):
             continue
         full = os.path.normpath(os.path.join(base, rel))
-        if os.path.isdir(full):
-            out.append(full)
+        if full == base or not os.path.isdir(full):
+            continue
+        out.append(full)
     return out
 
 
@@ -1484,7 +1704,7 @@ def _correlate_git_to_sessions(sessions, priced_all, refs, turns_api, activities
                                window=GIT_CORR_WINDOW, path_by_github=None):
     if not activities:
         return
-    targets = [s for s in sessions if s.get("unattributed") or s.get("orphan_billed")]
+    targets = _sessions_for_git_correlation(sessions)
     if not targets:
         return
     for sess in targets:
@@ -1522,25 +1742,22 @@ def _correlate_git_to_sessions(sessions, priced_all, refs, turns_api, activities
                     prev = best_per_repo.get(repo)
                     if not prev or dist < prev[0]:
                         best_per_repo[repo] = (dist, act)
-                weights = {repo: 1.0 / (dist + 300.0)
-                           for repo, (dist, _act) in best_per_repo.items()}
-                total_w = sum(weights.values()) or 1.0
-                for repo, w in weights.items():
-                    dist, act = best_per_repo[repo]
-                    share = cost * (w / total_w)
-                    repo_hits[repo] += share
-                    repo_commits[repo].append({
+                if not best_per_repo:
+                    continue
+                best_repo, (dist, act) = min(best_per_repo.items(), key=lambda x: x[1][0])
+                repo_hits[best_repo] += cost
+                repo_commits[best_repo].append({
+                    "repo": act["repo"], "sha": act["sha"], "subject": act["subject"],
+                    "pr": act.get("pr"), "delta_sec": act["ts"] - ts,
+                })
+                if act.get("pr"):
+                    pr_hits[act["pr"]] += cost
+                    pr_commits[act["pr"]].append({
                         "repo": act["repo"], "sha": act["sha"], "subject": act["subject"],
-                        "pr": act.get("pr"), "delta_sec": act["ts"] - ts,
+                        "pr": act["pr"], "delta_sec": act["ts"] - ts,
                     })
-                    if act.get("pr"):
-                        pr_hits[act["pr"]] += share
-                        pr_commits[act["pr"]].append({
-                            "repo": act["repo"], "sha": act["sha"], "subject": act["subject"],
-                            "pr": act["pr"], "delta_sec": act["ts"] - ts,
-                        })
                 if day:
-                    day_rows[day]["repos"].update(best_per_repo.keys())
+                    day_rows[day]["repos"].add(best_repo)
 
         if turns_api.get(sid):
             api_by_idx = {t["turn_index"]: t for t in turns_api[sid]}
@@ -1558,13 +1775,13 @@ def _correlate_git_to_sessions(sessions, priced_all, refs, turns_api, activities
             continue
 
         r = refs.get(sid) or {"jira": [], "prs": [], "repos": []}
+        top_repo = _pick_git_repo(repo_hits)
+        _top_cost = repo_hits[top_repo]
         merged_repos = {x["name"]: x.get("role") or "mentioned" for x in r.get("repos") or []}
-        for repo in repo_hits:
-            if repo not in merged_repos:
-                merged_repos[repo] = "inferred"
+        merged_repos[top_repo] = "primary"
         r["repos"] = sorted(
             ({"name": k, "role": v} for k, v in merged_repos.items()),
-            key=lambda x: (x["role"] not in ("primary", "inferred"), x["name"]))
+            key=lambda x: (x["role"] != "primary", x["name"]))
         existing_prs = {p["key"]: dict(p) for p in r.get("prs") or []}
         for pk, pcost in pr_hits.items():
             if pcost <= 0:
@@ -1580,6 +1797,10 @@ def _correlate_git_to_sessions(sessions, priced_all, refs, turns_api, activities
         r["prs"] = sorted(existing_prs.values(), key=lambda p: (p["repo"], p["number"]))
         refs[sid] = r
         sess["refs"] = r
+        sess["repository"] = top_repo
+        sess["workspace"] = top_repo
+        sess["repo_source"] = "git"
+        sess["repo_split"] = 0
 
         matched_cost = sum(repo_hits.values())
         sess_cost = sess.get("cost_usd") or 0
@@ -2340,9 +2561,11 @@ def _header_meta(con):
         repo = ""
         branch = ""
         if tracked_folders:
-            repo = tracked_folders[0]
-            if len(tracked_folders) > 1:
-                repo = _repo_from_path(uri.get("fsPath") or uri.get("path") or "") or repo
+            ws_repo = _repo_from_path(uri.get("fsPath") or uri.get("path") or "")
+            if ws_repo and not ws_repo.endswith(".code-workspace"):
+                repo = ws_repo
+            else:
+                repo = tracked_folders[0]
             branches = []
             if repos and isinstance(repos[0], dict):
                 branches = repos[0].get("branches") or []
@@ -2521,8 +2744,13 @@ def _session_from_turns(cid, meta, turns, ws_names):
                 title = " ".join(typed.split())[:90]
                 break
     title = title or "(untitled)"
-    repo = meta.get("repository") or _repo_from_path(meta.get("workspace_path")) \
-        or ws_names.get(meta.get("workspace_id") or "", "")
+    repo = (meta.get("repository") or "").strip()
+    if not repo:
+        ws_repo = _repo_from_path(meta.get("workspace_path") or "")
+        if ws_repo and not ws_repo.endswith(".code-workspace"):
+            repo = ws_repo
+    if not repo:
+        repo = ws_names.get(meta.get("workspace_id") or "", "")
     mode = meta.get("mode") or ""
     extra = []
     if mode:
@@ -2896,8 +3124,7 @@ def scan_cursor(force=False):
         refs = _build_refs(list(texts_by_cid.items()), sess_repo, allow)
         git_repos = _discover_git_repos(meta)
         path_by_github = _github_path_map(git_repos=git_repos)
-        _attach_tracked_repos(sessions, meta, refs, path_by_github)
-        _apply_repo_age_filters(sessions, refs, path_by_github)
+        _assign_session_repos(sessions, meta, refs, path_by_github)
         for sess in sessions:
             sess["refs"] = refs.get(sess["session_id"], {"jira": [], "prs": [], "repos": []})
 
@@ -2905,7 +3132,6 @@ def scan_cursor(force=False):
         git_since, git_until = _activity_date_bounds(
             sessions, (billing or {}).get("events") if billing else None)
         git_acts = _fetch_git_activities(git_repos, git_since, git_until) if git_repos else []
-        _apply_repo_age_filters(sessions, refs, path_by_github)
         _apply_bare_pr_refs(sessions, refs, texts_by_cid, path_by_github,
                             priced_all=priced_all, activities=git_acts)
         if billing and git_acts:
@@ -2915,11 +3141,7 @@ def scan_cursor(force=False):
             print(f"  git correlation: {len(git_repos)} repos, "
                   f"{len(git_acts)} commits ({git_since}..{git_until})",
                   flush=True)
-        _apply_git_weighted_shared_repos(
-            sessions, refs, priced_all, git_acts, path_by_github)
         _apply_git_pr_discovery(
-            sessions, refs, priced_all, git_acts, path_by_github)
-        _apply_git_activity_gate(
             sessions, refs, priced_all, git_acts, path_by_github)
         for sess in sessions:
             sess["refs"] = refs.get(sess["session_id"], sess.get("refs"))
@@ -3432,45 +3654,26 @@ def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None, path_by_git
                 e["est"] = e["est"] or bool(s.get("est"))
                 if len(e["titles"]) < 5:
                     e["titles"].append(s["title"])
-        gc = s.get("git_correlation") or {}
-        if gc.get("matched") and gc.get("repos") and not s.get("repo_weights"):
-            for repo_row in gc["repos"]:
-                k = _norm_repo_key(repo_row["name"], repo_aliases)
-                share_c = repo_row.get("cost_usd") or 0
-                if share_c <= 0:
-                    continue
-                frac = share_c / cost if cost else 0
+        repo_shares = _repo_cost_shares(s, r)
+        if repo_shares:
+            for it, frac in repo_shares:
+                k = _norm_repo_key(it["name"], repo_aliases)
                 e = repos.setdefault(k, {"key": k, "cost_usd": 0.0, "on_demand_usd": 0.0,
                                          "total_tokens": 0,
                                          "chats": 0, "titles": [], "created": False,
-                                         "role": "inferred", "est": False})
-                e["cost_usd"] += share_c
+                                         "role": "mentioned", "est": False,
+                                         "source": s.get("repo_source") or ""})
+                e["cost_usd"] += cost * frac
                 e["on_demand_usd"] += od * frac
                 e["total_tokens"] += int(toks * frac)
-                e["chats"] += 1
+                e["chats"] = round(e["chats"] + frac, 4)
                 e["est"] = e["est"] or bool(s.get("est"))
                 if len(e["titles"]) < 5:
                     e["titles"].append(s["title"])
-        else:
-            repo_shares = _repo_cost_shares(s, r)
-            if repo_shares:
-                for it, frac in repo_shares:
-                    k = _norm_repo_key(it["name"], repo_aliases)
-                    e = repos.setdefault(k, {"key": k, "cost_usd": 0.0, "on_demand_usd": 0.0,
-                                             "total_tokens": 0,
-                                             "chats": 0, "titles": [], "created": False,
-                                             "role": "mentioned", "est": False})
-                    e["cost_usd"] += cost * frac
-                    e["on_demand_usd"] += od * frac
-                    e["total_tokens"] += toks * frac
-                    e["chats"] += 1
-                    e["est"] = e["est"] or bool(s.get("est"))
-                    if len(e["titles"]) < 5:
-                        e["titles"].append(s["title"])
-                    if it.get("role") == "primary":
-                        e["role"] = "primary"
-                    elif it.get("role") == "inferred" and e["role"] != "primary":
-                        e["role"] = "inferred"
+                if it.get("role") == "primary":
+                    e["role"] = "primary"
+                elif it.get("role") == "inferred" and e["role"] != "primary":
+                    e["role"] = "inferred"
     srt = lambda d: sorted(d.values(), key=lambda x: -x["cost_usd"])
     sess = [{"key": s["title"], "cost_usd": s["cost_usd"] or 0,
              "on_demand_usd": s.get("on_demand_usd") or 0,
@@ -4916,7 +5119,7 @@ section.collapsed > *:not(h2){display:none !important}
 <script>
 const usd=n=>'$'+(n||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const usd4=n=>'$'+(n||0).toLocaleString(undefined,{minimumFractionDigits:4,maximumFractionDigits:4});
-const num=n=>(n||0).toLocaleString();
+const num=n=>{const v=n||0;return Number.isInteger(v)?v.toLocaleString():v.toLocaleString(undefined,{maximumFractionDigits:1});};
 const kt=n=>{n=n||0;return n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':n};
 function split(total,parts,fmt){
   const f=fmt||usd;
