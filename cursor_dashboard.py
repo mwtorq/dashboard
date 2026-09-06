@@ -1431,9 +1431,12 @@ def _bubble_ts_from_raw(raw):
 def _sample_cid_bubble_raws(con, cid, cap=BUBBLE_CAP_PER_COMPOSER):
     """Return [(key, raw)] for a composer, chronologically head+tail sampled."""
     prefix = f"bubbleId:{cid}:"
-    n = con.execute(
-        "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE ?",
-        (prefix + "%",)).fetchone()[0]
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE ?",
+            (prefix + "%",)).fetchone()[0]
+    except sqlite3.OperationalError:
+        return []
     if n == 0:
         return []
     if n <= cap:
@@ -1923,12 +1926,18 @@ def _logical_stamp():
             ).fetchone())
         except sqlite3.OperationalError:
             headers = (0, 0)
-        composers = con.execute(
-            "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
-        ).fetchone()[0]
-        row = con.execute(
-            "SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
-        email = str(row["value"]).strip() if row and row["value"] else ""
+        try:
+            composers = con.execute(
+                "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            composers = 0
+        try:
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
+            email = str(row["value"]).strip() if row and row["value"] else ""
+        except sqlite3.OperationalError:
+            email = ""
     return (headers, composers, email)
 
 
@@ -2592,8 +2601,12 @@ def _header_meta(con):
             "draft": bool(blob.get("isDraft")),
             "archived": bool(row["isArchived"] or blob.get("isArchived")),
         }
-    for key, raw in con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"):
+    try:
+        composer_rows = con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
+    except sqlite3.OperationalError:
+        composer_rows = []
+    for key, raw in composer_rows:
         cid = key.split(":", 1)[-1]
         blob = _loads(raw) or {}
         mc = blob.get("modelConfig") or {}
@@ -2920,8 +2933,12 @@ def _load_bubbles(con, meta, skip_cids=None, cap=BUBBLE_CAP_PER_COMPOSER):
     composer_owners = collections.defaultdict(collections.Counter)
     key_counts = collections.Counter()
     loaded = 0
-    for row in con.execute(
-            "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"):
+    try:
+        bubble_keys = con.execute(
+            "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+    except sqlite3.OperationalError:
+        bubble_keys = []
+    for row in bubble_keys:
         key = row[0]
         parts = key.split(":")
         if len(parts) < 3:
@@ -2931,8 +2948,12 @@ def _load_bubbles(con, meta, skip_cids=None, cap=BUBBLE_CAP_PER_COMPOSER):
             continue
         key_counts[cid] += 1
     heavy = {cid for cid, n in key_counts.items() if n > cap}
-    for key, raw in con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"):
+    try:
+        bubble_rows = con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+    except sqlite3.OperationalError:
+        bubble_rows = []
+    for key, raw in bubble_rows:
         parts = key.split(":")
         if len(parts) < 3:
             continue
@@ -4802,6 +4823,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data)
 
@@ -5269,6 +5291,10 @@ async function load(force){
   busy(true,'Loading Cursor billed usage — first load fetches events from cursor.com and scans local chat titles…');
   try{
     const r=await fetch(`/api/data?start=${s}&end=${e}&q=${encodeURIComponent(q)}${force?'&refresh=1':''}`);
+    if(!r.ok){
+      document.getElementById('err').textContent='Error: HTTP '+r.status+' '+r.statusText;
+      return;
+    }
     DATA=await r.json();
     if(DATA.error){document.getElementById('err').textContent='Error: '+DATA.error;return;}
     document.getElementById('err').textContent='';
@@ -5291,7 +5317,8 @@ async function load(force){
     renderLastRef();
     render();
   }catch(err){
-    document.getElementById('err').textContent='Error: '+err;
+    document.getElementById('err').textContent='Error: '+err
+      +' — is the dashboard still running on this origin?';
   }finally{ busy(false); }
 }
 function renderLastRef(){
