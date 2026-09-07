@@ -11,8 +11,8 @@ Usage:  python cursor_dashboard.py [--port 8787] [--db PATH]
         [--import-ide] [--merge-db PATH] [--cloud-agents]
 
 Cloud agent chats (bc-*) are merged from the Cloud Agents API when
-CURSOR_API_KEY is set (Cursor Dashboard → API Keys), so local IDE sessions and
-ALL cloud agent sessions appear in one cost dashboard.
+CLOUD_AGENTS_API_KEY or CURSOR_API_KEY is set (Cursor Dashboard → API Keys),
+so local IDE sessions and ALL cloud agent sessions appear in one cost dashboard.
 
 A daily digest emails the signed-in Cursor license address on the first refresh
 of each day via the Gmail API (override with --email-to / --no-digest).
@@ -2733,7 +2733,8 @@ def fetch_billing(con, force=False):
 # any agents not yet present on the invoice.
 CLOUD_AGENTS_ENABLED = True
 CLOUD_AGENTS_API_KEY = (
-    os.environ.get("CURSOR_API_KEY")
+    os.environ.get("CLOUD_AGENTS_API_KEY")
+    or os.environ.get("CURSOR_API_KEY")
     or os.environ.get("CURSOR_CLOUD_API_KEY")
     or os.environ.get("CURSOR_DASH_API_KEY")
     or ""
@@ -2755,7 +2756,8 @@ def _cloud_api(method, path, timeout=60):
     key = _cloud_api_key()
     if not key:
         raise RuntimeError(
-            "Set CURSOR_API_KEY (Cursor Dashboard → API Keys) to load cloud agents")
+            "Set CLOUD_AGENTS_API_KEY or CURSOR_API_KEY "
+            "(Cursor Dashboard → API Keys) to load cloud agents")
     url = "https://api.cursor.com" + path
     auth = base64.b64encode((key + ":").encode("utf-8")).decode("ascii")
     req = urllib.request.Request(
@@ -3117,7 +3119,7 @@ def _billing_match_notes(cid, local, evs):
         if agentish:
             note = (
                 f"Billed cloud agent {short} — title not in the local IDE store yet. "
-                f"Enable Cloud Agents API (CURSOR_API_KEY) to name it."
+                f"Enable Cloud Agents API (CLOUD_AGENTS_API_KEY / CURSOR_API_KEY) to name it."
             )
         else:
             note = (
@@ -6184,7 +6186,8 @@ function render(){
         +` and merged into this list (titles for bc-* chats + agents not yet on the invoice).`;
     } else if(DATA.cloud_agents_error){
       explain+=`<br><br><b>Cloud agents:</b> not loaded (${esc(DATA.cloud_agents_error)}). `
-        +`Set <code>CURSOR_API_KEY</code> from Cursor Dashboard → API Keys.`;
+        +`Set <code>CLOUD_AGENTS_API_KEY</code> or <code>CURSOR_API_KEY</code> `
+        +`from Cursor Dashboard → API Keys.`;
     }
     mix.innerHTML=`<b>Cash invoiced</b> in the cards below is what Stripe actually charged `
       +`(subscriptions + on-demand invoices). `
@@ -6617,7 +6620,8 @@ def main():
                     help="Find local Cursor IDE state.vscdb install(s) and merge them into "
                          "the dashboard working store before serving.")
     ap.add_argument("--cloud-agents", action="store_true", default=None,
-                    help="Load ALL cloud agents via api.cursor.com (CURSOR_API_KEY) and "
+                    help="Load ALL cloud agents via api.cursor.com "
+                         "(CLOUD_AGENTS_API_KEY or CURSOR_API_KEY) and "
                          "merge them into the session list. Default: on when a key is set.")
     ap.add_argument("--no-cloud-agents", action="store_true",
                     help="Do not fetch or merge Cloud Agents API sessions.")
