@@ -8,6 +8,11 @@ included plan usage plus on-demand overage. Subscription invoices (Pro / Pro+
 monthly fee) are listed separately and are not model usage.
 
 Usage:  python cursor_dashboard.py [--port 8787] [--db PATH]
+        [--import-ide] [--merge-db PATH] [--cloud-agents]
+
+Cloud agent chats (bc-*) are merged from the Cloud Agents API when
+CLOUD_AGENTS_API_KEY or CURSOR_API_KEY is set (Cursor Dashboard → API Keys),
+so local IDE sessions and ALL cloud agent sessions appear in one cost dashboard.
 
 A daily digest emails the signed-in Cursor license address on the first refresh
 of each day via the Gmail API (override with --email-to / --no-digest).
@@ -22,6 +27,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -34,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 CHARS_PER_TOKEN = 4
 CONTEXT_WINDOW_TOKENS = 200_000
@@ -70,24 +76,296 @@ MODEL_RATES = {
 RATE_DEFAULT = MODEL_RATES["auto"]
 
 
-def _cursor_user_dir():
+def _cursor_user_dir_candidates():
+    """Known Cursor User dirs (desktop IDE + remote/server installs)."""
     home = os.path.expanduser("~")
     appdata = os.environ.get("APPDATA")
-    candidates = []
+    out = []
     if appdata:
-        candidates.append(os.path.join(appdata, "Cursor", "User"))
-    candidates += [
+        out.append(os.path.join(appdata, "Cursor", "User"))
+    out += [
         os.path.join(home, "Library", "Application Support", "Cursor", "User"),
         os.path.join(home, ".config", "Cursor", "User"),
+        os.path.join(home, ".cursor-server", "data", "User"),
     ]
-    for path in candidates:
-        if os.path.isdir(os.path.join(path, "globalStorage")):
-            return path
-    return candidates[0]
+    # Preserve order, drop dupes.
+    seen = set()
+    uniq = []
+    for path in out:
+        norm = os.path.normpath(path)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        uniq.append(norm)
+    return uniq
+
+
+def _store_row_counts(db_path):
+    """Return table row counts for a state.vscdb, or None if unreadable."""
+    if not db_path or not os.path.isfile(db_path):
+        return None
+    try:
+        uri = "file:{}?mode=ro".format(db_path.replace("?", "%3f").replace("#", "%23"))
+        with sqlite3.connect(uri, uri=True, timeout=15) as con:
+            counts = {}
+            for table in ("ItemTable", "cursorDiskKV", "composerHeaders"):
+                try:
+                    counts[table] = con.execute(
+                        f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                except sqlite3.OperationalError:
+                    counts[table] = 0
+            return counts
+    except sqlite3.Error:
+        return None
+
+
+def _store_weight(counts):
+    if not counts:
+        return -1
+    return (counts.get("cursorDiskKV") or 0) + (counts.get("composerHeaders") or 0) * 10 + (
+        counts.get("ItemTable") or 0)
+
+
+def _cursor_user_dir():
+    best, best_w = None, -1
+    first_existing = None
+    for path in _cursor_user_dir_candidates():
+        gs = os.path.join(path, "globalStorage")
+        if not os.path.isdir(gs):
+            continue
+        if first_existing is None:
+            first_existing = path
+        db = os.path.join(gs, "state.vscdb")
+        w = _store_weight(_store_row_counts(db))
+        if w > best_w:
+            best, best_w = path, w
+    if best is not None:
+        return best
+    if first_existing is not None:
+        return first_existing
+    return _cursor_user_dir_candidates()[0]
 
 
 def _default_db():
     return os.path.join(_cursor_user_dir(), "globalStorage", "state.vscdb")
+
+
+def _dashboard_data_dir():
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return os.path.join(appdata, "cursor-dashboard")
+    return os.path.join(os.path.expanduser("~"), ".config", "cursor-dashboard")
+
+
+def _merged_store_path():
+    return os.path.join(_dashboard_data_dir(), "merged-state.vscdb")
+
+
+def ide_store_candidates():
+    """Existing state.vscdb paths under known Cursor installs, richest first."""
+    found = []
+    for user_dir in _cursor_user_dir_candidates():
+        db = os.path.join(user_dir, "globalStorage", "state.vscdb")
+        counts = _store_row_counts(db)
+        if counts is None:
+            continue
+        found.append({"path": db, "counts": counts, "weight": _store_weight(counts)})
+    found.sort(key=lambda x: x["weight"], reverse=True)
+    return found
+
+
+def _ensure_store_schema(con):
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ItemTable (
+            key TEXT PRIMARY KEY,
+            value BLOB
+        );
+        CREATE TABLE IF NOT EXISTS cursorDiskKV (
+            key TEXT PRIMARY KEY,
+            value BLOB
+        );
+        CREATE TABLE IF NOT EXISTS composerHeaders (
+            composerId TEXT PRIMARY KEY,
+            workspaceId TEXT,
+            createdAt INTEGER,
+            lastUpdatedAt INTEGER,
+            isArchived INTEGER,
+            isSubagent INTEGER,
+            value BLOB
+        );
+        """
+    )
+
+
+def _open_store_rw(path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    con = sqlite3.connect(path, timeout=60)
+    con.row_factory = sqlite3.Row
+    _ensure_store_schema(con)
+    return con
+
+
+def _copy_store_via_backup(src, dest):
+    """Snapshot a (possibly live) IDE store into dest without locking it for writes."""
+    os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
+    uri = "file:{}?mode=ro".format(src.replace("?", "%3f").replace("#", "%23"))
+    src_con = sqlite3.connect(uri, uri=True, timeout=60)
+    try:
+        if os.path.exists(dest):
+            os.remove(dest)
+        dst_con = sqlite3.connect(dest, timeout=60)
+        try:
+            src_con.backup(dst_con)
+        finally:
+            dst_con.close()
+    finally:
+        src_con.close()
+
+
+def _merge_item_table(dst, src):
+    added = updated = 0
+    try:
+        rows = src.execute("SELECT key, value FROM ItemTable").fetchall()
+    except sqlite3.OperationalError:
+        return added, updated
+    for row in rows:
+        key, value = row[0], row[1]
+        cur = dst.execute("SELECT value FROM ItemTable WHERE key = ?", (key,)).fetchone()
+        if cur is None:
+            dst.execute("INSERT INTO ItemTable(key, value) VALUES (?, ?)", (key, value))
+            added += 1
+        elif (cur[0] in (None, b"", "")) and value not in (None, b"", ""):
+            dst.execute("UPDATE ItemTable SET value = ? WHERE key = ?", (value, key))
+            updated += 1
+    return added, updated
+
+
+def _merge_cursor_disk_kv(dst, src):
+    added = updated = 0
+    try:
+        rows = src.execute("SELECT key, value FROM cursorDiskKV").fetchall()
+    except sqlite3.OperationalError:
+        return added, updated
+    for row in rows:
+        key, value = row[0], row[1]
+        cur = dst.execute("SELECT value FROM cursorDiskKV WHERE key = ?", (key,)).fetchone()
+        if cur is None:
+            dst.execute("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)", (key, value))
+            added += 1
+        elif (cur[0] in (None, b"", "")) and value not in (None, b"", ""):
+            dst.execute("UPDATE cursorDiskKV SET value = ? WHERE key = ?", (value, key))
+            updated += 1
+    return added, updated
+
+
+def _merge_composer_headers(dst, src):
+    added = updated = 0
+    try:
+        rows = src.execute(
+            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, "
+            "isArchived, isSubagent, value FROM composerHeaders"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return added, updated
+    for row in rows:
+        cid = row[0]
+        cur = dst.execute(
+            "SELECT lastUpdatedAt FROM composerHeaders WHERE composerId = ?",
+            (cid,)).fetchone()
+        if cur is None:
+            dst.execute(
+                "INSERT INTO composerHeaders("
+                "composerId, workspaceId, createdAt, lastUpdatedAt, "
+                "isArchived, isSubagent, value) VALUES (?,?,?,?,?,?,?)",
+                tuple(row))
+            added += 1
+        elif (row[3] or 0) >= (cur[0] or 0):
+            dst.execute(
+                "UPDATE composerHeaders SET workspaceId=?, createdAt=?, "
+                "lastUpdatedAt=?, isArchived=?, isSubagent=?, value=? "
+                "WHERE composerId=?",
+                (row[1], row[2], row[3], row[4], row[5], row[6], cid))
+            updated += 1
+    return added, updated
+
+
+def merge_stores(base_paths, dest_path, seed_path=None):
+    """Merge one or more state.vscdb files into dest_path (never writes sources).
+
+    ``seed_path`` is copied first when dest is missing/empty so "this state"
+    remains the baseline and IDE/extra stores layer on top.
+    """
+    paths = []
+    for p in base_paths or []:
+        p = os.path.abspath(os.path.expanduser(p))
+        if p not in paths:
+            paths.append(p)
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        raise FileNotFoundError("Store not found: " + ", ".join(missing))
+    dest_path = os.path.abspath(os.path.expanduser(dest_path))
+    os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+    if seed_path and os.path.isfile(seed_path) and (
+            not os.path.isfile(dest_path) or os.path.getsize(dest_path) < 64):
+        _copy_store_via_backup(seed_path, dest_path)
+    dst = _open_store_rw(dest_path)
+    summary = {"dest": dest_path, "sources": [], "tables": {}}
+    try:
+        for src_path in paths:
+            if os.path.abspath(src_path) == dest_path:
+                continue
+            uri = "file:{}?mode=ro".format(
+                src_path.replace("?", "%3f").replace("#", "%23"))
+            src = sqlite3.connect(uri, uri=True, timeout=60)
+            try:
+                item_a, item_u = _merge_item_table(dst, src)
+                kv_a, kv_u = _merge_cursor_disk_kv(dst, src)
+                hdr_a, hdr_u = _merge_composer_headers(dst, src)
+                summary["sources"].append({
+                    "path": src_path,
+                    "ItemTable": {"added": item_a, "updated": item_u},
+                    "cursorDiskKV": {"added": kv_a, "updated": kv_u},
+                    "composerHeaders": {"added": hdr_a, "updated": hdr_u},
+                })
+            finally:
+                src.close()
+        dst.commit()
+        summary["tables"] = _store_row_counts(dest_path) or {}
+    finally:
+        dst.close()
+    return summary
+
+
+def import_ide_into(current_db, dest_path=None):
+    """Merge the richest local IDE store into dest (default: dashboard merged DB)."""
+    ide = ide_store_candidates()
+    if not ide:
+        searched = [
+            os.path.join(p, "globalStorage", "state.vscdb")
+            for p in _cursor_user_dir_candidates()
+        ]
+        raise FileNotFoundError(
+            "No IDE state.vscdb found. Searched:\n  - " + "\n  - ".join(searched))
+    dest_path = dest_path or _merged_store_path()
+    seed = current_db if current_db and os.path.isfile(current_db) else None
+    # Prefer merging every discovered IDE store so multi-install machines keep chats.
+    sources = [c["path"] for c in ide]
+    return merge_stores(sources, dest_path, seed_path=seed)
+
+
+def use_store(path):
+    """Point the running dashboard at path and drop scan caches."""
+    global DB_PATH, STATE_PATH, _CACHE, _BILLING_CACHE
+    DB_PATH = os.path.abspath(os.path.expanduser(path))
+    STATE_PATH = os.path.join(os.path.dirname(DB_PATH), "cost-dashboard-state.json")
+    _CACHE["stamp"] = None
+    _CACHE["data"] = None
+    _CACHE["at"] = 0
+    _BILLING_CACHE["at"] = 0
+    _BILLING_CACHE["data"] = None
+    _BILLING_CACHE["turns"] = {}
+    return DB_PATH
 
 
 DEFAULT_DB = _default_db()
@@ -1431,9 +1709,12 @@ def _bubble_ts_from_raw(raw):
 def _sample_cid_bubble_raws(con, cid, cap=BUBBLE_CAP_PER_COMPOSER):
     """Return [(key, raw)] for a composer, chronologically head+tail sampled."""
     prefix = f"bubbleId:{cid}:"
-    n = con.execute(
-        "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE ?",
-        (prefix + "%",)).fetchone()[0]
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE ?",
+            (prefix + "%",)).fetchone()[0]
+    except sqlite3.OperationalError:
+        return []
     if n == 0:
         return []
     if n <= cap:
@@ -1923,12 +2204,18 @@ def _logical_stamp():
             ).fetchone())
         except sqlite3.OperationalError:
             headers = (0, 0)
-        composers = con.execute(
-            "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
-        ).fetchone()[0]
-        row = con.execute(
-            "SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
-        email = str(row["value"]).strip() if row and row["value"] else ""
+        try:
+            composers = con.execute(
+                "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'composerData:%'"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            composers = 0
+        try:
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
+            email = str(row["value"]).strip() if row and row["value"] else ""
+        except sqlite3.OperationalError:
+            email = ""
     return (headers, composers, email)
 
 
@@ -2439,6 +2726,344 @@ def fetch_billing(con, force=False):
     return _BILLING_CACHE["data"]
 
 
+# --- Cloud Agents (api.cursor.com/v1/agents) --------------------------------
+# Cloud agent conversation IDs are bc-<uuid>. Billed usage events already carry
+# those IDs but the local IDE store has no titles for them. Listing every agent
+# via the Cloud Agents API fills titles/repos for ALL cloud sessions and adds
+# any agents not yet present on the invoice.
+CLOUD_AGENTS_ENABLED = True
+CLOUD_AGENTS_API_KEY = (
+    os.environ.get("CLOUD_AGENTS_API_KEY")
+    or os.environ.get("CURSOR_API_KEY")
+    or os.environ.get("CURSOR_CLOUD_API_KEY")
+    or os.environ.get("CURSOR_DASH_API_KEY")
+    or ""
+)
+CLOUD_AGENTS_CACHE_PATH = ""
+_CLOUD_AGENTS_CACHE = {"at": 0, "agents": None, "error": ""}
+
+
+def _cloud_agents_cache_path():
+    return CLOUD_AGENTS_CACHE_PATH or os.path.join(
+        _dashboard_data_dir(), "cloud-agents-cache.json")
+
+
+def _cloud_api_key():
+    return (CLOUD_AGENTS_API_KEY or "").strip()
+
+
+def _cloud_api(method, path, timeout=60):
+    key = _cloud_api_key()
+    if not key:
+        raise RuntimeError(
+            "Set CLOUD_AGENTS_API_KEY or CURSOR_API_KEY "
+            "(Cursor Dashboard → API Keys) to load cloud agents")
+    url = "https://api.cursor.com" + path
+    auth = base64.b64encode((key + ":").encode("utf-8")).decode("ascii")
+    req = urllib.request.Request(
+        url, method=method,
+        headers={"Authorization": "Basic " + auth, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw) if raw else {}
+
+
+def _load_cloud_agents_cache_file():
+    path = _cloud_agents_cache_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_cloud_agents_cache_file(agents, source="api"):
+    path = _cloud_agents_cache_path()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": source,
+        "agents": agents,
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _normalize_cloud_agent(raw):
+    """Map API / MCP catalog shapes onto one agent record."""
+    if not isinstance(raw, dict):
+        return None
+    aid = (raw.get("id") or raw.get("bcId") or "").strip()
+    if not aid:
+        return None
+    repos = raw.get("repos") or []
+    repo_url = ""
+    if repos and isinstance(repos[0], dict):
+        repo_url = (repos[0].get("url") or "").strip()
+    repo_url = repo_url or (raw.get("repoUrl") or "").strip()
+    repo_name = ""
+    if repo_url:
+        repo_name = repo_url.rstrip("/").split("/")[-1]
+        if repo_url.rstrip("/").count("/") >= 1:
+            parts = repo_url.rstrip("/").split("/")
+            if len(parts) >= 2:
+                repo_name = parts[-2] + "/" + parts[-1]
+                if repo_name.endswith(".git"):
+                    repo_name = repo_name[:-4]
+    created = raw.get("createdAt") or ""
+    if not created and raw.get("createdAtMs"):
+        try:
+            created = datetime.datetime.fromtimestamp(
+                int(raw["createdAtMs"]) / 1000.0,
+                tz=datetime.timezone.utc).isoformat()
+        except Exception:
+            created = ""
+    updated = raw.get("updatedAt") or ""
+    if not updated and raw.get("updatedAtMs"):
+        try:
+            updated = datetime.datetime.fromtimestamp(
+                int(raw["updatedAtMs"]) / 1000.0,
+                tz=datetime.timezone.utc).isoformat()
+        except Exception:
+            updated = ""
+    url = (raw.get("url") or f"https://cursor.com/agents/{aid}").strip()
+    return {
+        "id": aid,
+        "name": (raw.get("name") or "").strip() or aid,
+        "status": raw.get("status") or "",
+        "url": url,
+        "repo_url": repo_url,
+        "repository": repo_name,
+        "branch": (raw.get("branchName") or "").strip(),
+        "created_at": created,
+        "updated_at": updated,
+        "model": (raw.get("originalModelName") or raw.get("model") or "auto"),
+        "usage": raw.get("usage") or raw.get("totalUsage") or {},
+    }
+
+
+def _list_cloud_agents_api():
+    """Page through GET /v1/agents for every agent owned by the API key user."""
+    agents, cursor = [], None
+    for _ in range(200):  # hard stop ~20k agents
+        path = "/v1/agents?limit=100&includeArchived=true"
+        if cursor:
+            path += "&cursor=" + quote(str(cursor))
+        data = _cloud_api("GET", path)
+        items = data.get("items") or data.get("agents") or []
+        for raw in items:
+            norm = _normalize_cloud_agent(raw)
+            if norm:
+                agents.append(norm)
+        cursor = data.get("nextCursor")
+        if not cursor:
+            break
+    return agents
+
+
+def _fetch_agent_usage(agent_id):
+    try:
+        data = _cloud_api("GET", f"/v1/agents/{quote(agent_id)}/usage")
+    except Exception:
+        return {}
+    return data.get("totalUsage") or {}
+
+
+def fetch_cloud_agents(force=False, with_usage=False):
+    """Return all cloud agents (API + optional local catalog cache)."""
+    global _CLOUD_AGENTS_CACHE
+    if not CLOUD_AGENTS_ENABLED:
+        return []
+    now = time.time()
+    if (not force and _CLOUD_AGENTS_CACHE["agents"] is not None
+            and now - _CLOUD_AGENTS_CACHE["at"] < 300):
+        return _CLOUD_AGENTS_CACHE["agents"]
+    agents, err, source = [], "", ""
+    if _cloud_api_key():
+        try:
+            agents = _list_cloud_agents_api()
+            source = "api"
+            if with_usage and agents:
+                def _one(a):
+                    usage = _fetch_agent_usage(a["id"])
+                    if usage:
+                        a = dict(a, usage=usage)
+                    return a
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    agents = list(pool.map(_one, agents))
+            _save_cloud_agents_cache_file(agents, source="api")
+        except Exception as exc:
+            err = str(exc)
+            print(f"  cloud agents API unavailable ({exc})", flush=True)
+    if not agents:
+        cached = _load_cloud_agents_cache_file()
+        raw_agents = cached.get("agents") or []
+        agents = [a for a in (_normalize_cloud_agent(x) for x in raw_agents) if a]
+        if agents:
+            source = cached.get("source") or "cache"
+            if err:
+                err = err + f"; using cached {len(agents)} agent(s)"
+            print(f"  cloud agents: {len(agents)} from local cache ({source})",
+                  flush=True)
+    elif source == "api":
+        print(f"  cloud agents: {len(agents)} from api.cursor.com", flush=True)
+    _CLOUD_AGENTS_CACHE = {"at": now, "agents": agents, "error": err, "source": source}
+    return agents
+
+
+def _parse_iso_ms(value):
+    if not value:
+        return 0
+    try:
+        if isinstance(value, (int, float)):
+            n = int(value)
+            return n if n > 10_000_000_000 else n * 1000
+        s = str(value).strip().replace("Z", "+00:00")
+        return int(datetime.datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def _session_from_cloud_agent(agent):
+    """Build an estimate-only session from Cloud Agents API usage."""
+    usage = agent.get("usage") or {}
+    inn = int(usage.get("inputTokens") or 0)
+    out = int(usage.get("outputTokens") or 0)
+    cwrite = int(usage.get("cacheWriteTokens") or 0)
+    cread = int(usage.get("cacheReadTokens") or 0)
+    total = int(usage.get("totalTokens") or (inn + out + cwrite + cread))
+    model = _norm_model(agent.get("model") or "auto")
+    cost = _cost(inn, out, cread + cwrite, model)
+    started_ms = _parse_iso_ms(agent.get("created_at"))
+    updated_ms = _parse_iso_ms(agent.get("updated_at")) or started_ms
+    started = ""
+    if started_ms:
+        started = datetime.datetime.fromtimestamp(
+            started_ms / 1000.0, tz=datetime.timezone.utc).isoformat()
+    day = _local_day(started_ms or updated_ms)
+    turn = {
+        "turn_index": 0,
+        "started_at": started,
+        "model": model,
+        "requests": 1 if total else 0,
+        "input_tokens": inn,
+        "output_tokens": out,
+        "cache_read_tokens": cread,
+        "cache_write_tokens": cwrite,
+        "total_tokens": total,
+        "cost_usd": cost,
+        "est": True,
+        "on_demand": False,
+        "kind": "cloud-agent",
+        "text": "",
+    }
+    info = {
+        "title": agent.get("name") or agent["id"],
+        "subtitle": "Cloud agent",
+        "repository": agent.get("repository") or "",
+        "branch": agent.get("branch") or (agent.get("status") or ""),
+        "workspace_path": "",
+        "tracked_repos": [agent["repository"]] if agent.get("repository") else [],
+        "created_ms": started_ms,
+        "updated_ms": updated_ms,
+        "mode": "cloud-agent",
+        "model": model,
+    }
+    sess = _session_from_turns(agent["id"], info, [turn] if total or cost else [], {})
+    if sess is None:
+        # Still surface the agent even with zero recorded usage.
+        days = {day: {
+            "requests": 0, "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0, "total_tokens": 0,
+            "measured_tokens": 0, "cost_usd": 0.0, "est_usd": 0.0, "on_demand_usd": 0.0,
+        }} if day else {}
+        sess = _fill_totals({
+            "session_id": agent["id"],
+            "title": info["title"],
+            "repository": info["repository"],
+            "workspace": info["repository"],
+            "branch": info["branch"],
+            "subtitle": info["subtitle"],
+            "tracked_repos": info["tracked_repos"],
+            "workspace_path": "",
+            "days": days,
+            "by_model_day": {},
+            "text": "",
+            "subagent": False,
+            "draft": False,
+        })
+    sess["billed"] = False
+    sess["est"] = True
+    sess["source"] = "cloud-agent"
+    sess["cloud_agent"] = True
+    sess["cloud_url"] = agent.get("url") or ""
+    sess["billing_note"] = (
+        "Cloud agent — token totals from Cloud Agents API; dollar figure is a "
+        "list-price estimate until Cursor billed usage events attach."
+    )
+    return sess, [turn] if total or cost else []
+
+
+def enrich_sessions_with_cloud_agents(sessions, turns_api, priced_all, agents):
+    """Attach cloud-agent titles to billed orphans and append missing agents."""
+    if not agents:
+        return sessions, turns_api, priced_all, 0
+    by_id = {a["id"]: a for a in agents}
+    matched = 0
+    for sess in sessions:
+        cid = sess.get("session_id") or ""
+        agent = by_id.get(cid)
+        if not agent:
+            continue
+        matched += 1
+        if (not sess.get("title") or sess.get("title") in ("(untitled)",)
+                or sess.get("orphan_billed") or sess.get("unattributed")):
+            sess["title"] = agent.get("name") or sess.get("title") or cid
+        if agent.get("repository") and (
+                not sess.get("repository") or sess.get("orphan_billed")):
+            sess["repository"] = agent["repository"]
+            sess["workspace"] = agent["repository"]
+        if agent.get("branch") and not sess.get("branch"):
+            sess["branch"] = agent["branch"]
+        sess["cloud_agent"] = True
+        sess["cloud_url"] = agent.get("url") or sess.get("cloud_url") or ""
+        sess["source"] = sess.get("source") or "cursor-billed"
+        if sess.get("orphan_billed") or sess.get("unattributed"):
+            sess["billing_note"] = (
+                f"Cloud agent «{agent.get('name') or cid}» — costs from Cursor "
+                f"billed usage; title/repo from Cloud Agents API."
+            )
+            sess["orphan_billed"] = False
+        if not sess.get("subtitle"):
+            sess["subtitle"] = "Cloud agent"
+    present = {s.get("session_id") for s in sessions}
+    added = 0
+    for agent in agents:
+        if agent["id"] in present:
+            continue
+        sess, turns = _session_from_cloud_agent(agent)
+        sessions.append(sess)
+        if turns:
+            turns_api[agent["id"]] = [{k: t[k] for k in (
+                "turn_index", "started_at", "model", "requests", "input_tokens",
+                "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                "total_tokens", "cost_usd", "est", "kind")} for t in turns]
+            priced_all[agent["id"]] = turns
+        added += 1
+    if matched or added:
+        print(f"  cloud agents: matched {matched} billed chat(s), "
+              f"added {added} not yet on invoice", flush=True)
+    sessions.sort(key=lambda s: (0 if s.get("billed") else 1, -(s.get("cost_usd") or 0)))
+    return sessions, turns_api, priced_all, matched + added
+
+
 def _turns_from_events(evs):
     priced = []
     for ev in evs:
@@ -2489,12 +3114,19 @@ def _billing_match_notes(cid, local, evs):
             note += f" Models: {top}."
         return {"unattributed": True, "billing_note": note}
     if not local:
+        agentish = cid.startswith("bc-")
         short = (cid[:20] + "…") if len(cid) > 22 else cid
-        note = (
-            f"Billed to conversation {short} but no matching chat is in this machine's Cursor "
-            f"store — likely a cloud agent, another device, or cleared local history."
-        )
-        return {"orphan_billed": True, "billing_note": note}
+        if agentish:
+            note = (
+                f"Billed cloud agent {short} — title not in the local IDE store yet. "
+                f"Enable Cloud Agents API (CLOUD_AGENTS_API_KEY / CURSOR_API_KEY) to name it."
+            )
+        else:
+            note = (
+                f"Billed to conversation {short} but no matching chat is in this machine's Cursor "
+                f"store — likely a cloud agent, another device, or cleared local history."
+            )
+        return {"orphan_billed": True, "billing_note": note, "cloud_agent": agentish}
     return {}
 
 
@@ -2592,8 +3224,12 @@ def _header_meta(con):
             "draft": bool(blob.get("isDraft")),
             "archived": bool(row["isArchived"] or blob.get("isArchived")),
         }
-    for key, raw in con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'"):
+    try:
+        composer_rows = con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
+    except sqlite3.OperationalError:
+        composer_rows = []
+    for key, raw in composer_rows:
         cid = key.split(":", 1)[-1]
         blob = _loads(raw) or {}
         mc = blob.get("modelConfig") or {}
@@ -2827,7 +3463,8 @@ def _clip(session, start, end):
     keep = {"session_id", "title", "repository", "workspace", "branch", "subtitle",
             "text", "subagent", "draft", "refs", "billed", "source", "account_label",
             "unattributed", "orphan_billed", "billing_note", "tracked_repos",
-            "workspace_path", "repo_split", "git_correlation", "repo_weights",
+            "cloud_agent", "cloud_url", "repo_source", "repo_split", "git_correlation",
+            "workspace_path", "tracked_repo_paths", "repo_weights",
             "shared_attribution", "pr_turn_costs"}
     base = {k: session[k] for k in keep if k in session}
     base["days"] = days
@@ -2920,8 +3557,12 @@ def _load_bubbles(con, meta, skip_cids=None, cap=BUBBLE_CAP_PER_COMPOSER):
     composer_owners = collections.defaultdict(collections.Counter)
     key_counts = collections.Counter()
     loaded = 0
-    for row in con.execute(
-            "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"):
+    try:
+        bubble_keys = con.execute(
+            "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+    except sqlite3.OperationalError:
+        bubble_keys = []
+    for row in bubble_keys:
         key = row[0]
         parts = key.split(":")
         if len(parts) < 3:
@@ -2931,8 +3572,12 @@ def _load_bubbles(con, meta, skip_cids=None, cap=BUBBLE_CAP_PER_COMPOSER):
             continue
         key_counts[cid] += 1
     heavy = {cid for cid, n in key_counts.items() if n > cap}
-    for key, raw in con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'"):
+    try:
+        bubble_rows = con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
+    except sqlite3.OperationalError:
+        bubble_rows = []
+    for key, raw in bubble_rows:
         parts = key.split(":")
         if len(parts) < 3:
             continue
@@ -3119,6 +3764,22 @@ def scan_cursor(force=False):
                   + (f"; {len(other)} local chats not on {account.get('email') or 'this account'}"
                      if other else ""), flush=True)
 
+        cloud_agents = []
+        if CLOUD_AGENTS_ENABLED:
+            try:
+                cloud_agents = fetch_cloud_agents(force=force, with_usage=True)
+            except Exception as exc:
+                print(f"  cloud agents skipped ({exc})", flush=True)
+        if cloud_agents:
+            sessions, turns_api, priced_all, _n = enrich_sessions_with_cloud_agents(
+                sessions, turns_api, priced_all, cloud_agents)
+            for sess in sessions:
+                if sess.get("cloud_agent") and sess.get("title"):
+                    texts_by_cid[sess["session_id"]] = (
+                        (texts_by_cid.get(sess["session_id"]) or "")
+                        + " " + sess.get("title", "") + " " + (sess.get("subtitle") or "")
+                    ).strip()
+
         allow = JIRA_KEY_ALLOW | _dynamic_jira_keys(texts_by_cid.values())
         sess_repo = {s["session_id"]: s["repository"] for s in sessions if s.get("repository")}
         refs = _build_refs(list(texts_by_cid.items()), sess_repo, allow)
@@ -3167,6 +3828,9 @@ def scan_cursor(force=False):
                 [account.get("email")] if account.get("email") else []),
             "previous_email": account.get("previous_email") or "",
             "invoices": _public_invoices((billing or {}).get("invoices")),
+            "cloud_agents": len(cloud_agents) if CLOUD_AGENTS_ENABLED else 0,
+            "cloud_agents_error": (_CLOUD_AGENTS_CACHE.get("error") or ""),
+            "cloud_agents_source": (_CLOUD_AGENTS_CACHE.get("source") or ""),
         }
         _CACHE["stamp"], _CACHE["data"], _CACHE["at"] = stamp, data, time.time()
         t_done = time.perf_counter()
@@ -4155,6 +4819,9 @@ def build_payload(start, end, q="", force=False):
         "billing_emails": data.get("billing_emails") or [],
         "previous_email": data.get("previous_email") or "",
         "plan": (data.get("billing_summary") or {}).get("membershipType") or "",
+        "cloud_agents": data.get("cloud_agents") or 0,
+        "cloud_agents_error": data.get("cloud_agents_error") or "",
+        "cloud_agents_source": data.get("cloud_agents_source") or "",
         "rates": {k: {"input": a, "output": b, "cache_read": c}
                   for k, (a, b, c) in MODEL_RATES.items()},
         "chars_per_token": CHARS_PER_TOKEN,
@@ -4802,6 +5469,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data)
 
@@ -4839,8 +5507,59 @@ class Handler(BaseHTTPRequestHandler):
                 sid = qs.get("session_id", [""])[0]
                 turns = scan_cursor().get("turns", {}).get(sid, [])
                 self._send(json.dumps(turns, default=str), "application/json")
+            elif url.path == "/api/store":
+                ide = ide_store_candidates()
+                self._send(json.dumps({
+                    "db": DB_PATH,
+                    "merged": _merged_store_path(),
+                    "ide": ide,
+                    "counts": _store_row_counts(DB_PATH),
+                }, default=str), "application/json")
             elif url.path in ("/", "/index.html"):
                 self._send(PAGE, "text/html; charset=utf-8")
+            else:
+                self.send_error(404)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            return
+        except Exception as exc:
+            traceback.print_exc()
+            try:
+                self._send(json.dumps({"error": str(exc)}), "application/json")
+            except Exception:
+                return
+
+    def do_POST(self):
+        url = urlparse(self.path)
+        qs = parse_qs(url.query)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length > 0 else b""
+            if url.path == "/api/import-store":
+                mode = (qs.get("mode", ["ide"])[0] or "ide").strip().lower()
+                dest = _merged_store_path()
+                if mode == "ide":
+                    summary = import_ide_into(DB_PATH, dest_path=dest)
+                elif mode == "upload":
+                    if not body:
+                        raise ValueError("POST body must be a state.vscdb file")
+                    os.makedirs(_dashboard_data_dir(), exist_ok=True)
+                    upload_path = os.path.join(_dashboard_data_dir(), "uploaded-state.vscdb")
+                    with open(upload_path, "wb") as fh:
+                        fh.write(body)
+                    summary = merge_stores(
+                        [upload_path], dest, seed_path=DB_PATH if os.path.isfile(DB_PATH) else None)
+                elif mode == "merge":
+                    extra = (qs.get("path", [""])[0] or "").strip()
+                    if not extra:
+                        raise ValueError("mode=merge requires ?path=")
+                    summary = merge_stores(
+                        [extra], dest, seed_path=DB_PATH if os.path.isfile(DB_PATH) else None)
+                else:
+                    raise ValueError("mode must be ide, upload, or merge")
+                use_store(dest)
+                summary["db"] = DB_PATH
+                summary["counts"] = _store_row_counts(DB_PATH)
+                self._send(json.dumps(summary, default=str), "application/json")
             else:
                 self.send_error(404)
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
@@ -5036,6 +5755,11 @@ section.collapsed > *:not(h2){display:none !important}
     <span id="lastref" title="When the data on this page was last loaded"></span>
   </span>
   <button class="primary" id="refresh"><span class="spin"></span>Refresh</button>
+  <button id="importIde" title="Merge Cursor IDE state.vscdb into this dashboard store">Import IDE store</button>
+  <label class="sub" title="Upload a state.vscdb to merge into this dashboard store"
+    style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
+    Upload store<input type="file" id="uploadStore" accept=".vscdb,application/octet-stream" hidden>
+  </label>
 </header>
 <main>
   <div id="loadnote"><span class="spin"></span><span id="loadmsg">Loading…</span></div>
@@ -5269,6 +5993,10 @@ async function load(force){
   busy(true,'Loading Cursor billed usage — first load fetches events from cursor.com and scans local chat titles…');
   try{
     const r=await fetch(`/api/data?start=${s}&end=${e}&q=${encodeURIComponent(q)}${force?'&refresh=1':''}`);
+    if(!r.ok){
+      document.getElementById('err').textContent='Error: HTTP '+r.status+' '+r.statusText;
+      return;
+    }
     DATA=await r.json();
     if(DATA.error){document.getElementById('err').textContent='Error: '+DATA.error;return;}
     document.getElementById('err').textContent='';
@@ -5291,7 +6019,8 @@ async function load(force){
     renderLastRef();
     render();
   }catch(err){
-    document.getElementById('err').textContent='Error: '+err;
+    document.getElementById('err').textContent='Error: '+err
+      +' — is the dashboard still running on this origin?';
   }finally{ busy(false); }
 }
 function renderLastRef(){
@@ -5450,6 +6179,15 @@ function render(){
     if(orphanUsd>0.005){
       explain+=`<br><br><b>Orphan billed chats (${usd(orphanUsd)}):</b> these have a conversation ID on the `
         +`invoice but no matching chat history on this machine (cloud agent, other device, or cleared data).`;
+    }
+    if(DATA.cloud_agents){
+      explain+=`<br><br><b>Cloud agents (${num(DATA.cloud_agents)}):</b> loaded via `
+        +esc(DATA.cloud_agents_source||'Cloud Agents API')
+        +` and merged into this list (titles for bc-* chats + agents not yet on the invoice).`;
+    } else if(DATA.cloud_agents_error){
+      explain+=`<br><br><b>Cloud agents:</b> not loaded (${esc(DATA.cloud_agents_error)}). `
+        +`Set <code>CLOUD_AGENTS_API_KEY</code> or <code>CURSOR_API_KEY</code> `
+        +`from Cursor Dashboard → API Keys.`;
     }
     mix.innerHTML=`<b>Cash invoiced</b> in the cards below is what Stripe actually charged `
       +`(subscriptions + on-demand invoices). `
@@ -5679,10 +6417,13 @@ function render(){
         : (s.orphan_billed
           ? ` <span class="b more" title="Conversation ID on invoice but no local chat on this machine">orphan</span>`
           : sharedBadge);
+      const cloudBadge=s.cloud_agent
+        ? ` <a class="b repo" href="${esc(s.cloud_url||('https://cursor.com/agents/'+s.session_id))}" target="_blank" title="Open cloud agent">cloud</a>`
+        : '';
       const gitBadge=(s.git_correlation&&s.git_correlation.matched)
         ? ` <span class="b gitinf" title="Repos inferred from nearby git commits">git matched</span>`:'';
       return `<tr class="row${s.unattributed||s.orphan_billed?' unattr':''}" data-id="${s.session_id}">
-      <td><span class="expand">▸</span> ${esc(s.title)}${s.est?' <span class="b est" title="Includes tokens inferred from transcript length">est</span>':''}${unBadge}${gitBadge}${s.billed&&s.account_label&&(DATA.billing_emails||[]).length>1?` <span class="b more">${esc(s.account_label)}</span>`:''}${s.billed===false&&DATA.billed?` <span class="b more" title="On this machine but not billed to ${esc((DATA.billing_emails||[DATA.billing_email]).filter(Boolean).join(' / ')||'the signed-in account')}${s.account_label?' — likely '+esc(s.account_label):''}">${esc(s.account_label||'other account')}</span>`:''}${s.subagent?' <span class="b more">subagent</span>':''}${sub}${badges(s.refs)}</td>
+      <td><span class="expand">▸</span> ${esc(s.title)}${cloudBadge}${s.est?' <span class="b est" title="Includes tokens inferred from transcript length">est</span>':''}${unBadge}${gitBadge}${s.billed&&s.account_label&&(DATA.billing_emails||[]).length>1?` <span class="b more">${esc(s.account_label)}</span>`:''}${s.billed===false&&DATA.billed?` <span class="b more" title="On this machine but not billed to ${esc((DATA.billing_emails||[DATA.billing_email]).filter(Boolean).join(' / ')||'the signed-in account')}${s.account_label?' — likely '+esc(s.account_label):''}">${esc(s.account_label||'other account')}</span>`:''}${s.subagent?' <span class="b more">subagent</span>':''}${sub}${badges(s.refs)}</td>
       <td>${s.top_model}${s.models>1?' <span class="sub">+'+(s.models-1)+'</span>':''}</td>
       <td>${num(s.turns)}</td><td>${num(s.requests)}</td><td>${kt(s.input_tokens)}</td>
       <td>${kt(s.cache_read_tokens)}</td><td>${kt(s.output_tokens)}</td>
@@ -5747,6 +6488,30 @@ async function toggle(tr){
   tr.after(td);
 }
 document.getElementById('refresh').onclick=()=>load(true);
+async function importStore(mode, body){
+  busy(true, mode==='upload'
+    ? 'Merging uploaded state.vscdb into the dashboard store…'
+    : 'Merging Cursor IDE state.vscdb into the dashboard store…');
+  try{
+    const r=await fetch('/api/import-store?mode='+encodeURIComponent(mode),{
+      method:'POST', body: body||null,
+      headers: body?{'Content-Type':'application/octet-stream'}:{},
+    });
+    const j=await r.json();
+    if(j.error){document.getElementById('err').textContent='Error: '+j.error;return;}
+    document.getElementById('err').textContent='';
+    await load(true);
+  }catch(err){
+    document.getElementById('err').textContent='Error: '+err;
+  }finally{ busy(false); }
+}
+document.getElementById('importIde').onclick=()=>importStore('ide');
+document.getElementById('uploadStore').onchange=async(ev)=>{
+  const f=ev.target.files&&ev.target.files[0];
+  ev.target.value='';
+  if(!f) return;
+  importStore('upload', await f.arrayBuffer());
+};
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;renderRollup();});
 document.getElementById('rq').oninput=()=>DATA&&renderRollup();
 let qtimer=null;
@@ -5841,11 +6606,28 @@ load();</script></body></html>
 def main():
     global DB_PATH, JIRA_BASE, CREDIT_BUDGET, STATE_PATH, API_ENABLED
     global EMAIL_TO, EMAIL_FROM, GMAIL_CREDENTIALS, GMAIL_TOKEN_PATH
+    global CLOUD_AGENTS_ENABLED, CLOUD_AGENTS_API_KEY, CLOUD_AGENTS_CACHE_PATH
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--db", default=DEFAULT_DB,
                     help="Cursor state.vscdb (default: <Cursor User>/globalStorage/state.vscdb)")
+    ap.add_argument("--merge-db", action="append", default=[],
+                    help="Extra state.vscdb to merge into the dashboard working store "
+                         "(repeatable). Writes ~/.config/cursor-dashboard/merged-state.vscdb "
+                         "(or %%APPDATA%%\\cursor-dashboard). Never modifies the IDE DB.")
+    ap.add_argument("--import-ide", action="store_true",
+                    help="Find local Cursor IDE state.vscdb install(s) and merge them into "
+                         "the dashboard working store before serving.")
+    ap.add_argument("--cloud-agents", action="store_true", default=None,
+                    help="Load ALL cloud agents via api.cursor.com "
+                         "(CLOUD_AGENTS_API_KEY or CURSOR_API_KEY) and "
+                         "merge them into the session list. Default: on when a key is set.")
+    ap.add_argument("--no-cloud-agents", action="store_true",
+                    help="Do not fetch or merge Cloud Agents API sessions.")
+    ap.add_argument("--cloud-agents-cache", default="",
+                    help="Path to cloud-agents-cache.json (default: "
+                         "%%APPDATA%%/cursor-dashboard/cloud-agents-cache.json).")
     ap.add_argument("--jira-base", default=JIRA_BASE_DEFAULT,
                     help="Jira base URL, e.g. https://acme.atlassian.net. "
                          "Auto-detected from your chat history when omitted.")
@@ -5883,7 +6665,38 @@ def main():
     ap.add_argument("--no-open", action="store_true")
     args = ap.parse_args()
     API_ENABLED = not args.no_api
+    if args.cloud_agents_cache:
+        CLOUD_AGENTS_CACHE_PATH = os.path.abspath(os.path.expanduser(args.cloud_agents_cache))
+    if args.no_cloud_agents:
+        CLOUD_AGENTS_ENABLED = False
+    elif args.cloud_agents:
+        CLOUD_AGENTS_ENABLED = True
+    else:
+        # Auto-on when an API key or an existing catalog cache is present.
+        CLOUD_AGENTS_ENABLED = bool(_cloud_api_key() or os.path.isfile(_cloud_agents_cache_path()))
     DB_PATH = args.db
+    if args.import_ide or args.merge_db:
+        dest = _merged_store_path()
+        sources = list(args.merge_db or [])
+        if args.import_ide:
+            ide = ide_store_candidates()
+            if not ide and not sources:
+                searched = [
+                    os.path.join(p, "globalStorage", "state.vscdb")
+                    for p in _cursor_user_dir_candidates()
+                ]
+                raise SystemExit(
+                    "No IDE state.vscdb found to merge. Searched:\n  - "
+                    + "\n  - ".join(searched)
+                    + "\nPass --merge-db PATH or upload via the dashboard.")
+            sources = [c["path"] for c in ide] + sources
+        seed = DB_PATH if os.path.isfile(DB_PATH) else None
+        summary = merge_stores(sources, dest, seed_path=seed)
+        DB_PATH = use_store(dest)
+        print(f"Merged {len(summary['sources'])} store(s) -> {DB_PATH}", flush=True)
+        for src in summary["sources"]:
+            print(f"  + {src['path']}", flush=True)
+        print(f"  tables: {summary.get('tables')}", flush=True)
     STATE_PATH = os.path.join(os.path.dirname(DB_PATH), "cost-dashboard-state.json")
     EMAIL_FROM = args.email_from.strip()
     GMAIL_CREDENTIALS = (args.gmail_credentials or "").strip()
