@@ -73,10 +73,16 @@ def api(method, path, body=None, params=None):
 
 
 def resolve_tiny_link(tiny_id):
-    """Resolve /wiki/x/{tiny_id} to a page ID via redirect."""
+    """Resolve /wiki/x/{tiny_id} to a page ID.
+
+    Confluence tiny links encode the page ID as little-endian bytes in base64.
+    We first try following the redirect URL (works for most page types), then
+    fall back to decoding the base64 bytes directly.
+    """
     url = f"{CONFLUENCE_BASE}/x/{tiny_id}"
     req = urllib.request.Request(url, method="GET", headers=credentials())
     req.add_header("Accept", "text/html")
+    final_url = ""
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             final_url = resp.geturl()
@@ -86,8 +92,16 @@ def resolve_tiny_link(tiny_id):
     m = re.search(r"/pages/(\d+)", final_url or "")
     if m:
         return m.group(1)
-    # Fallback: search by tiny link metadata
-    data = api("GET", f"/rest/api/content", params={"type": "page", "limit": 1})
+    # Fallback: Confluence tiny links are base64-encoded little-endian page IDs
+    try:
+        padding = "=" * ((-len(tiny_id)) % 4)
+        raw = base64.b64decode(tiny_id + padding)
+        page_id = str(int.from_bytes(raw, "little"))
+        # Verify the page exists
+        api("GET", f"/rest/api/content/{page_id}", params={"expand": "version"})
+        return page_id
+    except Exception:
+        pass
     raise RuntimeError(f"Could not resolve tiny link {tiny_id}; last URL: {final_url}")
 
 
