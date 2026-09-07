@@ -9,6 +9,7 @@ Hierarchy (TIM team-managed project):
 
 import argparse
 import base64
+import collections
 import datetime
 import glob
 import json
@@ -26,12 +27,20 @@ import cursor_dashboard as cd
 JIRA_BASE = "https://timberwilde.atlassian.net"
 PROJECT = "TIM"
 START_DATE = "2025-11-29"
-TRANSCRIPT_ROOT = os.path.join(
-    os.environ.get("USERPROFILE", ""),
-    ".cursor", "projects",
-    "c-Users-mw-OneDrive-timberwilde-net-repos-evernote-remarkable",
-    "agent-transcripts",
-)
+TRANSCRIPT_ROOTS = [
+    os.path.join(
+        os.environ.get("USERPROFILE", ""),
+        ".cursor", "projects",
+        "c-Users-mw-OneDrive-timberwilde-net-repos",
+        "agent-transcripts",
+    ),
+    os.path.join(
+        os.environ.get("USERPROFILE", ""),
+        ".cursor", "projects",
+        "c-Users-mw-OneDrive-timberwilde-net-repos-evernote-remarkable",
+        "agent-transcripts",
+    ),
+]
 REPOS = [
     r"c:\Users\mw\OneDrive - timberwilde.net\repos\evernote_remarkable",
     r"c:\Users\mw\OneDrive - timberwilde.net\repos\fastcat",
@@ -236,35 +245,135 @@ def summary_with_prs(prefix, title, prs, max_len=250):
     return base + suffix
 
 
+JIRA_SUMMARY_MAX = 250
+JIRA_DESC_MAX = 30000
+ADF_TEXT_CHUNK = 8000
+
+
+def truncate_summary(text, max_len=JIRA_SUMMARY_MAX):
+    """Single-line Jira summary within field limit."""
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
+def _adf_text_parts(text, max_chunk=ADF_TEXT_CHUNK):
+    """Split long strings into ADF-safe text nodes."""
+    if not text:
+        return [{"type": "text", "text": ""}]
+    parts = []
+    for i in range(0, len(text), max_chunk):
+        parts.append({"type": "text", "text": text[i : i + max_chunk]})
+    return parts
+
+
 def adf_description(text):
-    """Plain text description with clickable PR URLs."""
+    """Plain text description with clickable PR URLs; chunk long lines for ADF."""
     text = (text or "").strip() or "(none)"
+    if len(text) > JIRA_DESC_MAX:
+        text = text[: JIRA_DESC_MAX - 40].rstrip() + "\n\n[Description truncated for Jira size limit]"
     content = []
     for para in text.split("\n"):
         if not para.strip():
+            content.append({"type": "paragraph", "content": [{"type": "text", "text": " "}]})
             continue
         parts = []
         pos = 0
         for m in re.finditer(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+", para):
             if m.start() > pos:
-                parts.append({"type": "text", "text": para[pos:m.start()]})
+                parts.extend(_adf_text_parts(para[pos:m.start()]))
             href = m.group(0)
             parts.append({"type": "text", "text": href,
                           "marks": [{"type": "link", "attrs": {"href": href}}]})
             pos = m.end()
         if pos < len(para):
-            parts.append({"type": "text", "text": para[pos:]})
+            parts.extend(_adf_text_parts(para[pos:]))
         if not parts:
-            parts = [{"type": "text", "text": para}]
+            parts = _adf_text_parts(para)
         content.append({"type": "paragraph", "content": parts})
     if not content:
-        content = [{"type": "paragraph", "content": [{"type": "text", "text": text[:32000]}]}]
+        content = [{"type": "paragraph", "content": _adf_text_parts(text)}]
     return {"type": "doc", "version": 1, "content": content}
+
+
+def format_git_correlation(gc):
+    """Expand git correlation object into readable lines."""
+    if not gc.get("matched"):
+        return []
+    lines = [
+        "Git correlation:",
+        f"  Matched cost: ${gc.get('matched_cost_usd', 0):.2f}",
+        f"  Unmatched cost: ${gc.get('unmatched_cost_usd', 0):.2f}",
+        f"  Window: ±{gc.get('window_hours', 0)}h",
+    ]
+    for row in gc.get("repos") or []:
+        prs = ", ".join(row.get("prs") or []) or "(none)"
+        lines.append(
+            f"  Repo {row.get('name')}: ${row.get('cost_usd', 0):.2f}, "
+            f"{row.get('turn_matches', 0)} turn matches, "
+            f"{row.get('unique_commits', 0)} commits, PRs: {prs}"
+        )
+        for sample in row.get("sample") or []:
+            lines.append(
+                f"    {sample.get('sha')} ({sample.get('delta_h')}h): {sample.get('subject')}"
+            )
+    for row in gc.get("prs") or []:
+        lines.append(
+            f"  PR {row.get('key')}: ${row.get('cost_usd', 0):.2f}, "
+            f"{row.get('turn_matches', 0)} turn matches"
+        )
+        for sample in row.get("sample") or []:
+            lines.append(
+                f"    {sample.get('sha')} ({sample.get('delta_h')}h): {sample.get('subject')}"
+            )
+    for day in gc.get("days") or []:
+        repos = ", ".join(day.get("repos") or [])
+        lines.append(f"  Day {day.get('day')}: ${day.get('cost_usd', 0):.2f} — {repos}")
+    return lines
+
+
+def format_model_breakdown(s):
+    lines = []
+    by_model = s.get("by_model") or {}
+    if not by_model:
+        return lines
+    lines.append("\nCost by model:")
+    for model, c in sorted(by_model.items(), key=lambda x: -(x[1].get("cost_usd") or 0)):
+        lines.append(
+            f"  {model}: ${c.get('cost_usd', 0):.4f}, "
+            f"{c.get('requests', 0)} req, {c.get('total_tokens', 0):,} tokens"
+        )
+    return lines
+
+
+def format_daily_breakdown(s):
+    lines = []
+    days = s.get("days") or {}
+    if not days:
+        return lines
+    lines.append("\nDaily breakdown:")
+    for day in sorted(days):
+        c = days[day]
+        lines.append(
+            f"  {day}: ${c.get('cost_usd', 0):.4f}, "
+            f"{c.get('requests', 0)} req, {c.get('total_tokens', 0):,} tokens"
+        )
+    return lines
+
+
+def session_origin(s):
+    if s.get("cloud_agent") or (s.get("session_id") or "").startswith("bc-"):
+        return "cloud agent"
+    if s.get("subagent"):
+        return "local IDE (subagent)"
+    return "local IDE"
 
 
 def session_description(s):
     lines = [
         f"Cursor session: {s.get('session_id', '')}",
+        f"Origin: {session_origin(s)}",
         f"Account: {s.get('account_label') or s.get('account') or ''}",
         f"Dates: {s.get('first_day')} — {s.get('last_day')}",
         f"Cost USD: ${s.get('cost_usd', 0):.4f}",
@@ -273,9 +382,18 @@ def session_description(s):
         f"Requests: {s.get('requests', 0)}",
         f"Top model: {s.get('top_model') or ''}",
         f"Repository: {s.get('repository') or ''}",
+        f"Repo source: {s.get('repo_source') or ''}",
         f"Branch: {s.get('branch') or ''}",
         f"Workspace: {s.get('workspace') or ''}",
     ]
+    if s.get("cloud_url"):
+        lines.append(f"Cloud agent URL: {s['cloud_url']}")
+    if s.get("source"):
+        lines.append(f"Data source: {s['source']}")
+    if s.get("billing_note"):
+        lines.append(f"Billing note: {s['billing_note']}")
+    if s.get("subtitle"):
+        lines.append(f"Subtitle: {s['subtitle']}")
     refs = s.get("refs") or {}
     if refs.get("jira"):
         lines.append(f"Jira refs: {', '.join(refs['jira'])}")
@@ -284,23 +402,45 @@ def session_description(s):
     if refs.get("repos"):
         lines.append("Repos: " + ", ".join(r.get("name", str(r)) for r in refs["repos"]))
     gc = s.get("git_correlation") or {}
-    if gc.get("matched"):
-        lines.append(
-            f"\nGit correlation: ${gc.get('matched_cost_usd', 0):.2f} matched, "
-            f"${gc.get('unmatched_cost_usd', 0):.2f} unmatched (±{gc.get('window_hours', 0)}h window)"
-        )
+    lines.extend(format_git_correlation(gc))
+    lines.extend(format_model_breakdown(s))
+    lines.extend(format_daily_breakdown(s))
     if s.get("summary"):
         lines.append(f"\nSummary:\n{s['summary']}")
     return "\n".join(lines)
 
 
+def chat_summary_title(t):
+    """Short title for Jira summary field; full text stays in description."""
+    src = t.get("full_query") or t.get("title") or t.get("id") or "Untitled"
+    return truncate_summary(src)
+
+
 def transcript_description(t):
-    prs = prs_from_text(t.get("title") or "")
+    prs = prs_from_text((t.get("full_query") or t.get("title") or ""))
     lines = [
         "Agent transcript (no separate billed session).",
+        f"Origin: {t.get('origin') or 'local IDE'}",
         f"ID: {t['id']}",
         f"Modified: {t['mtime']}",
     ]
+    if t.get("path"):
+        lines.append(f"Transcript: {t['path']}")
+    if t.get("message_count"):
+        lines.append(f"Messages: {t['message_count']}")
+    queries = t.get("user_queries") or []
+    if not queries and t.get("full_query"):
+        queries = [t["full_query"]]
+    if not queries and t.get("title"):
+        queries = [t["title"]]
+    if len(queries) == 1:
+        lines.append(f"\nUser query:\n{queries[0]}")
+    elif queries:
+        lines.append(f"\nUser queries ({len(queries)}):")
+        for i, q in enumerate(queries, 1):
+            lines.append(f"\n--- Query {i} ---\n{q}")
+    if t.get("last_assistant"):
+        lines.append(f"\nLast assistant reply (excerpt):\n{t['last_assistant']}")
     lines.extend(format_pr_lines(prs))
     return "\n".join(lines)
 
@@ -354,9 +494,10 @@ def jira_request(method, path, body=None, headers=None):
 
 def adf_text(text):
     text = (text or "").strip() or "(none)"
+    if len(text) > JIRA_DESC_MAX:
+        text = text[: JIRA_DESC_MAX - 40].rstrip() + "\n\n[Description truncated for Jira size limit]"
     return {"type": "doc", "version": 1,
-            "content": [{"type": "paragraph",
-                           "content": [{"type": "text", "text": text[:32000]}]}]}
+            "content": [{"type": "paragraph", "content": _adf_text_parts(text)}]}
 
 
 def create_issue(fields):
@@ -388,19 +529,25 @@ def search_issues(jql, max_results=120):
 
 def run_update_prs(sessions, git_data, by_repo, extra_transcripts, end):
     """Patch cursor-backfill-v2 issues with PR summaries and descriptions."""
-    issues = search_issues("project=TIM AND labels=cursor-backfill-v2 ORDER BY key ASC", 120)
+    issues = search_issues("project=TIM AND labels=cursor-backfill-v2 ORDER BY key ASC", 250)
     print(f"Found {len(issues)} v2 issues to update", flush=True)
 
     repo_paths = {os.path.basename(p): p for p in REPOS}
     epic_summaries = {f"{n}: Cursor AI work ({START_DATE}": n for n in REPO_NAMES}
 
     session_by_title = {}
+    session_by_id = {}
     for s in sessions:
         title = (s.get("title") or s.get("session_id") or "Untitled").strip()
+        if s.get("cloud_agent") and "cloud agent" not in title.lower():
+            title = f"{title} (cloud agent)"
         for prefix in ("Cursor", "Defect"):
             session_by_title[f"[{prefix}] {title}"] = s
             session_by_title[normalize_title(f"[{prefix}] {title}")] = s
         session_by_title[normalize_title(title)] = s
+        sid = (s.get("session_id") or "").lower()
+        if sid:
+            session_by_id[sid] = s
 
     transcript_by_title = {}
     for t in extra_transcripts:
@@ -433,9 +580,17 @@ def run_update_prs(sessions, git_data, by_repo, extra_transcripts, end):
             time.sleep(0.25)
             continue
 
-        s = session_by_title.get(summary) or session_by_title.get(normalize_title(summary.replace("[Cursor] ", "").replace("[Defect] ", "")))
+        plain = issue_plain_title(summary)
+        s = session_by_title.get(summary) or session_by_title.get(normalize_title(plain))
+        if not s:
+            for m in re.finditer(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|bc-[0-9a-f-]{36})\b", summary, re.I):
+                s = session_by_id.get(m.group(1).lower())
+                if s:
+                    break
         if s:
             title = (s.get("title") or s.get("session_id") or "Untitled")[:240]
+            if s.get("cloud_agent") and "cloud agent" not in title.lower():
+                title = f"{title} (cloud agent)"[:240]
             prs = collect_session_prs(s)
             bug = is_bug(title, s.get("summary") or "")
             prefix = "Defect" if bug else "Cursor"
@@ -446,15 +601,15 @@ def run_update_prs(sessions, git_data, by_repo, extra_transcripts, end):
             time.sleep(0.25)
             continue
 
-        t = transcript_by_title.get(summary)
-        if not t:
+        t = transcript_by_title.get(summary) or transcript_by_title.get(normalize_title(issue_plain_title(summary)))
+        if not t and not summary.startswith("[Cursor]") and not summary.startswith("[Defect]"):
             for tk, tr in transcript_by_title.items():
                 if isinstance(tk, str) and normalize_title(tr["title"]) in normalize_title(summary):
                     t = tr
                     break
         if t:
             prs = prs_from_text(t.get("title") or "")
-            new_summary = summary_with_prs("Chat", t["title"][:200], prs)
+            new_summary = summary_with_prs("Chat", chat_summary_title(t), prs)
             update_issue(key, {"summary": new_summary, "description": adf_description(transcript_description(t))})
             print(f"  {key} chat ({len(prs)} PRs): {t['title'][:45]}", flush=True)
             updated += 1
@@ -478,39 +633,83 @@ def close_issue(key):
         jira_request("POST", f"/rest/api/3/issue/{key}/transitions", {"transition": {"id": done}})
 
 
+def _extract_message_text(row):
+    txt = ""
+    for part in (row.get("message") or {}).get("content") or []:
+        if isinstance(part, dict) and part.get("type") == "text":
+            txt += part.get("text", "")
+    txt = re.sub(r"<timestamp>.*?</timestamp>\s*", "", txt, flags=re.S)
+    m = re.search(r"<user_query>\s*(.*?)(?:</user_query>|$)", txt, re.S)
+    if m:
+        return m.group(1).strip()
+    return txt.strip()
+
+
+def _parse_transcript_file(path):
+    sid = os.path.basename(path).replace(".jsonl", "")
+    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+    full_query = ""
+    user_queries = []
+    last_assistant = ""
+    message_count = 0
+    origin = "local IDE (subagent)" if os.path.sep + "subagents" + os.path.sep in path else "local IDE"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                row = json.loads(line)
+                if row.get("role") not in ("user", "assistant"):
+                    continue
+                message_count += 1
+                if row.get("role") == "user":
+                    q = _extract_message_text(row)
+                    if q:
+                        user_queries.append(q)
+                        if not full_query:
+                            full_query = q
+                elif row.get("role") == "assistant":
+                    a = _extract_message_text(row)
+                    if a:
+                        last_assistant = a
+    except Exception:
+        full_query = sid
+    title = truncate_summary(re.sub(r"\s+", " ", full_query.replace("\n", " "))) if full_query else sid
+    return {
+        "id": sid,
+        "title": title or sid,
+        "full_query": full_query or sid,
+        "user_queries": user_queries,
+        "last_assistant": last_assistant[:4000] if last_assistant else "",
+        "mtime": mtime.isoformat(),
+        "path": path,
+        "message_count": message_count,
+        "origin": origin,
+        "_mtime_dt": mtime,
+    }
+
+
 def extract_transcripts():
-    out = []
-    if not os.path.isdir(TRANSCRIPT_ROOT):
-        return out
+    """Collect agent transcripts from all known workspace roots (deduped by id)."""
+    out = {}
     cutoff = datetime.date(2025, 11, 29)
-    for path in glob.glob(os.path.join(TRANSCRIPT_ROOT, "**", "*.jsonl"), recursive=True):
-        if os.path.sep + "subagents" + os.path.sep in path:
+    for root in TRANSCRIPT_ROOTS:
+        if not os.path.isdir(root):
             continue
-        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path))
-        if mtime.date() < cutoff:
-            continue
-        sid = os.path.basename(path).replace(".jsonl", "")
-        title = ""
-        try:
-            with open(path, encoding="utf-8") as fh:
-                for line in fh:
-                    row = json.loads(line)
-                    if row.get("role") != "user":
-                        continue
-                    txt = ""
-                    for part in (row.get("message") or {}).get("content") or []:
-                        if isinstance(part, dict) and part.get("type") == "text":
-                            txt += part.get("text", "")
-                    m = re.search(r"<user_query>\s*(.*?)(?:</user_query>|$)", txt, re.S)
-                    if m:
-                        title = re.sub(r"\s+", " ", m.group(1).strip())[:200]
-                        break
-                    if txt and not title:
-                        title = re.sub(r"\s+", " ", txt.strip())[:200]
-        except Exception:
-            title = sid
-        out.append({"id": sid, "title": title or sid, "mtime": mtime.isoformat()})
-    return out
+        for path in glob.glob(os.path.join(root, "**", "*.jsonl"), recursive=True):
+            if os.path.sep + "subagents" + os.path.sep in path:
+                continue
+            parsed = _parse_transcript_file(path)
+            if parsed["_mtime_dt"].date() < cutoff:
+                continue
+            prev = out.get(parsed["id"])
+            if not prev or parsed["_mtime_dt"] > prev["_mtime_dt"]:
+                out[parsed["id"]] = parsed
+    cleaned = []
+    for row in out.values():
+        row = dict(row)
+        row.pop("_mtime_dt", None)
+        cleaned.append(row)
+    cleaned.sort(key=lambda r: r.get("mtime") or "")
+    return cleaned
 
 
 def extract_git():
@@ -552,152 +751,49 @@ def is_bug(title, summary=""):
     return any(w in text for w in BUG_WORDS)
 
 
-REPO_ALIASES = {
-    "fastcat": ["fastcat", "fast cat", "fast-path", "fast path", "relationship schema"],
-    "jrtca_results": ["jrtca", "trial results", "jrtca_results", "grid-keys", "grid keys", "normalization"],
-    "horse_shows": ["horse_shows", "horse shows", "horseshows", "scrape class", "show results",
-                    "non-placing", "discovery re-walk", "chrome process", "selenium"],
-    "3dprinting": ["3dprinting", "3d printing", "3d print", "bambu", "rv pantry", "interlocking shelf"],
-    "dashboard": ["dashboard", "cursor_dashboard", "cost dashboard", "copilot", "billed usage",
-                  "chunk budget", "atlassian api", "jira ticket", "jira backfill"],
-}
-# Title keywords for evernote_remarkable project work (never matched from workspace path).
-EVERNOTE_TITLE_ALIASES = [
-    "evernote_remarkable", "evernote remarkable", "evernote-to-remarkable", "evernote to remarkable",
-    "weekly data download", "download agent", "tv dump", "csrf token", "powershell intermediary",
-    "cut over to backlog", "remarkable sync", "evernote sync",
-]
-WORKSPACE_ROOT_REPO = "evernote_remarkable"
-
-
-def _evernote_from_title(title):
-    blob = (title or "").lower()
-    if any(a in blob for a in EVERNOTE_TITLE_ALIASES):
-        return True
-    return "evernote" in blob and "remarkable" in blob
-
-
-def _is_workspace_primary(ref):
-    return (ref.get("role") == "primary"
-            and _repo_from_name(ref.get("name") or "") == WORKSPACE_ROOT_REPO)
-
-
-def _repos_from_refs(item):
-    """Repo refs excluding the multi-root workspace folder marker."""
-    out = []
-    for r in (item.get("refs") or {}).get("repos") or []:
-        if _is_workspace_primary(r):
-            continue
-        rn = _repo_from_name(r.get("name") or "")
-        if rn and rn not in out:
-            out.append(rn)
-    return out
-
-
 def _repo_from_name(name):
     name = (name or "").split("/")[-1]
     return name if name in REPO_NAMES else ""
 
 
-def _repos_from_prs(item):
-    repos = []
-    seen = set()
-    if item.get("session_id") is not None or item.get("cost_usd") is not None:
-        for p in collect_session_prs(item):
-            rn = _repo_from_name(p.get("repo") or (p.get("key") or "").split("#")[0])
-            if rn and rn not in seen:
-                seen.add(rn)
-                repos.append(rn)
-    for p in (item.get("refs") or {}).get("prs") or []:
-        if p.get("role") == "skipped":
-            continue
-        rn = _repo_from_name(p.get("repo") or (p.get("key") or "").split("#")[0])
-        if rn and rn not in seen:
-            seen.add(rn)
-            repos.append(rn)
-    for p in prs_from_text(item.get("title") or ""):
-        rn = _repo_from_name(p.get("repo") or (p.get("key") or "").split("#")[0])
-        if rn and rn not in seen:
-            seen.add(rn)
-            repos.append(rn)
-    return repos
-
-
-def _repos_from_git_correlation(item):
+def _git_repo_folder(item):
+    """Git-correlation repo folder using dashboard pick logic."""
     gc = item.get("git_correlation") or {}
-    rows = sorted(gc.get("repos") or [], key=lambda r: -(r.get("cost_usd") or 0))
-    out = []
-    for row in rows:
-        rn = _repo_from_name(row.get("name") or "")
-        if rn:
-            out.append(rn)
-    return out
+    if not gc.get("matched"):
+        return ""
+    hits = collections.Counter()
+    for row in gc.get("repos") or []:
+        folder = _repo_from_name(row.get("name") or "")
+        if folder:
+            hits[folder] += row.get("cost_usd") or 0
+    if not hits:
+        return ""
+    ranked = hits.most_common()
+    top_repo, top_cost = ranked[0]
+    root = cd.WORKSPACE_ROOT_REPO
+    if top_repo != root or len(ranked) == 1:
+        return top_repo
+    for repo, cost in ranked[1:]:
+        if repo != root and cost >= top_cost * 0.2:
+            return repo
+    return top_repo
 
 
-def _title_repo(title, workspace=""):
-    """Match repo from chat title; workspace path never assigns evernote_remarkable."""
-    blob = (title or "").lower()
-    for name, aliases in REPO_ALIASES.items():
-        if any(a in blob for a in aliases):
-            return name
-    if _evernote_from_title(title):
-        return WORKSPACE_ROOT_REPO
-    wb = (workspace or "").lower()
-    for name, aliases in REPO_ALIASES.items():
-        if any(a in wb for a in aliases):
-            return name
-    for name in REPO_NAMES:
-        if name != WORKSPACE_ROOT_REPO and name in wb:
-            return name
-    return ""
+def session_repo_folder(item, field=""):
+    """One repo per session/chat — uses dashboard assignment when present."""
+    folder = _repo_from_name(item.get("repository") or "")
+    if folder:
+        return folder
+    git_folder = _git_repo_folder(item)
+    if git_folder:
+        return git_folder
+    title = field or item.get("full_query") or item.get("title") or ""
+    return cd._infer_repo_folder_from_title(title) or ""
 
 
 def infer_repo(item, field=""):
-    """Assign repo from chat/PR/git signals — never the workspace root folder alone."""
-    title = field or item.get("title") or ""
-    workspace = item.get("workspace") or ""
-
-    hit = _title_repo(title, workspace)
-    if hit:
-        return hit
-
-    pr_repos = _repos_from_prs(item)
-    git_repos = _repos_from_git_correlation(item)
-    ref_repos = _repos_from_refs(item)
-
-    if len(pr_repos) == 1:
-        return pr_repos[0]
-    if len(git_repos) == 1:
-        return git_repos[0]
-    if len(ref_repos) == 1:
-        return ref_repos[0]
-
-    # Strong evernote git attribution (not just workspace proximity).
-    gc = item.get("git_correlation") or {}
-    rows = sorted(gc.get("repos") or [], key=lambda r: -(r.get("cost_usd") or 0))
-    if rows:
-        top = _repo_from_name(rows[0].get("name") or "")
-        top_cost = rows[0].get("cost_usd") or 0
-        second_cost = (rows[1].get("cost_usd") or 0) if len(rows) > 1 else 0
-        if top == WORKSPACE_ROOT_REPO and top_cost > 0.01 and top_cost >= second_cost:
-            return WORKSPACE_ROOT_REPO
-
-    non_en = [r for r in pr_repos if r != WORKSPACE_ROOT_REPO]
-    if non_en:
-        return non_en[0]
-    if pr_repos:
-        return pr_repos[0]
-
-    non_en = [r for r in git_repos if r != WORKSPACE_ROOT_REPO]
-    if non_en:
-        return non_en[0]
-    if git_repos:
-        return git_repos[0]
-
-    if ref_repos:
-        return ref_repos[0]
-
-    return ""
+    """Alias kept for callers — delegates to session_repo_folder."""
+    return session_repo_folder(item, field)
 
 
 def delete_issue(key):
@@ -746,16 +842,26 @@ def epic_key_map():
 def run_reparent(sessions, git_data, by_repo, extra_transcripts, end, epic_keys):
     """Move stories/bugs/chats to the correct repo epic; refresh epic bodies."""
     repo_paths = {os.path.basename(p): p for p in REPOS}
-    issues = search_issues("project=TIM AND labels=cursor-backfill-v2 ORDER BY key ASC", 120)
+    issues = search_issues("project=TIM AND labels=cursor-backfill-v2 ORDER BY key ASC", 250)
 
     session_by_title = {}
+    session_by_id = {}
     for s in sessions:
         title = (s.get("title") or s.get("session_id") or "Untitled").strip()
+        if s.get("cloud_agent") and "cloud agent" not in title.lower():
+            title = f"{title} (cloud agent)"
         for prefix in ("Cursor", "Defect"):
             session_by_title[f"[{prefix}] {title}"] = s
             session_by_title[normalize_title(title)] = s
+        sid = (s.get("session_id") or "").lower()
+        if sid:
+            session_by_id[sid] = s
 
-    transcript_by_title = {normalize_title(t["title"]): t for t in extra_transcripts}
+    transcript_by_title = {}
+    for t in extra_transcripts:
+        transcript_by_title[normalize_title(t["title"])] = t
+        transcript_by_title[normalize_title(chat_summary_title(t))] = t
+        transcript_by_title[normalize_title(t.get("full_query") or "")] = t
 
     moved = 0
     for issue in issues:
@@ -767,17 +873,27 @@ def run_reparent(sessions, git_data, by_repo, extra_transcripts, end, epic_keys)
 
         repo = ""
         s = None
-        for cand in (summary, summary.split(" PR:")[0]):
-            plain = cand.replace("[Cursor] ", "").replace("[Defect] ", "").replace("[Chat] ", "")
-            s = session_by_title.get(cand) or session_by_title.get(normalize_title(plain))
-            if s:
-                repo = infer_repo(s, s.get("title") or "")
-                break
+        plain = issue_plain_title(summary)
+        s = session_by_title.get(summary) or session_by_title.get(normalize_title(plain))
         if not s:
-            plain = summary.replace("[Chat] ", "").split(" PR:")[0]
+            for m in re.finditer(
+                r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|bc-[0-9a-f-]{36})\b",
+                summary, re.I,
+            ):
+                s = session_by_id.get(m.group(1).lower())
+                if s:
+                    break
+        if s:
+            repo = session_repo_folder(s)
+        if not s:
             t = transcript_by_title.get(normalize_title(plain))
+            if not t:
+                for tk, tr in transcript_by_title.items():
+                    if tk and normalize_title(tr.get("title") or "") in normalize_title(plain):
+                        t = tr
+                        break
             if t:
-                repo = infer_repo(t, t.get("title") or "")
+                repo = session_repo_folder(t)
 
         target = epic_keys.get(repo) or epic_keys.get("_cross") or epic_keys.get("dashboard")
         if not target:
@@ -807,6 +923,121 @@ def run_reparent(sessions, git_data, by_repo, extra_transcripts, end, epic_keys)
     print(f"Reparented/refreshed {moved} issues.", flush=True)
 
 
+def issue_plain_title(summary):
+    s = (summary or "").replace("[Cursor] ", "").replace("[Defect] ", "").replace("[Chat] ", "")
+    if " PR:" in s:
+        s = s.split(" PR:")[0]
+    return s.strip()
+
+
+def index_existing_issues(issues):
+    """Map normalized titles and session/transcript IDs to existing Jira issues."""
+    by_title = {}
+    by_session_id = {}
+    for issue in issues:
+        summary = issue["fields"]["summary"]
+        by_title[normalize_title(issue_plain_title(summary))] = issue
+        # Session/transcript IDs sometimes appear in summaries after renames.
+        for m in re.finditer(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|bc-[0-9a-f-]{36})\b", summary, re.I):
+            by_session_id[m.group(1).lower()] = issue
+    return by_title, by_session_id
+
+
+def session_already_in_jira(s, by_title, by_session_id):
+    sid = (s.get("session_id") or "").lower()
+    if sid and sid in by_session_id:
+        return True
+    title = (s.get("title") or s.get("session_id") or "").strip()
+    if normalize_title(title) in by_title:
+        return True
+    if s.get("cloud_agent"):
+        return normalize_title(f"{title} (cloud agent)") in by_title
+    return False
+
+
+def transcript_already_in_jira(t, by_title, by_session_id):
+    tid = (t.get("id") or "").lower()
+    if tid and tid in by_session_id:
+        return True
+    return normalize_title(t.get("title") or "") in by_title
+
+
+def run_sync(sessions, git_data, by_repo, extra_transcripts, end, epic_keys, close_new=True):
+    """Create missing stories/bugs, refresh all v2 issue bodies, close new issues."""
+    repo_paths = {os.path.basename(p): p for p in REPOS}
+    issues = search_issues("project=TIM AND labels=cursor-backfill-v2 ORDER BY key ASC", 250)
+    children = [i for i in issues if (i["fields"]["issuetype"] or {}).get("name") != "Epic"]
+    by_title, by_session_id = index_existing_issues(children)
+
+    created = []
+    print(f"Existing v2 issues: {len(issues)} ({len(children)} stories/bugs)", flush=True)
+
+    missing_sessions = [s for s in sessions if not session_already_in_jira(s, by_title, by_session_id)]
+    missing_transcripts = [t for t in extra_transcripts if not transcript_already_in_jira(t, by_title, by_session_id)]
+    print(f"Creating {len(missing_sessions)} missing session(s), {len(missing_transcripts)} missing chat(s)...", flush=True)
+
+    for s in missing_sessions:
+        repo = session_repo_folder(s) or "_cross"
+        epic = epic_keys.get(repo) or epic_keys.get("_cross") or epic_keys.get("dashboard")
+        if not epic:
+            raise RuntimeError(f"No epic for repo {repo!r}")
+        title = (s.get("title") or s.get("session_id") or "Untitled")[:240]
+        if s.get("cloud_agent") and "cloud agent" not in title.lower():
+            title = f"{title} (cloud agent)"[:240]
+        bug = is_bug(title, s.get("summary") or "")
+        itype = "Bug" if bug else "Story"
+        prefix = "Defect" if bug else "Cursor"
+        prs = collect_session_prs(s)
+        key = create_issue({
+            "project": {"key": PROJECT},
+            "issuetype": {"name": itype},
+            "summary": summary_with_prs(prefix, title, prs),
+            "description": adf_description(session_description(s)),
+            "labels": ["cursor-backfill-v2", "cursor-session"] + (["defect"] if bug else []),
+            "parent": {"key": epic},
+        })
+        created.append(key)
+        by_title[normalize_title(title)] = {"key": key, "fields": {"summary": summary_with_prs(prefix, title, prs)}}
+        sid = (s.get("session_id") or "").lower()
+        if sid:
+            by_session_id[sid] = by_title[normalize_title(title)]
+        print(f"  + {key} {itype}: {title[:55]}", flush=True)
+        time.sleep(0.25)
+
+    for t in missing_transcripts:
+        repo = session_repo_folder(t) or "dashboard"
+        epic = epic_keys.get(repo) or epic_keys.get("dashboard")
+        prs = prs_from_text(t.get("title") or "")
+        key = create_issue({
+            "project": {"key": PROJECT},
+            "issuetype": {"name": "Story"},
+            "summary": summary_with_prs("Chat", chat_summary_title(t), prs),
+            "description": adf_description(transcript_description(t)),
+            "labels": ["cursor-backfill-v2", "agent-transcript"],
+            "parent": {"key": epic},
+        })
+        created.append(key)
+        by_title[normalize_title(t["title"])] = {"key": key, "fields": {"summary": summary_with_prs("Chat", chat_summary_title(t), prs)}}
+        tid = (t.get("id") or "").lower()
+        if tid:
+            by_session_id[tid] = by_title[normalize_title(t["title"])]
+        print(f"  + {key} Chat: {t['title'][:55]}", flush=True)
+        time.sleep(0.25)
+
+    print("Refreshing epic and issue descriptions...", flush=True)
+    run_update_prs(sessions, git_data, by_repo, extra_transcripts, end)
+
+    if close_new and created:
+        print(f"Closing {len(created)} new issue(s)...", flush=True)
+        for key in created:
+            close_issue(key)
+            print(f"  closed {key}", flush=True)
+            time.sleep(0.2)
+
+    print(f"Sync done — created {len(created)} issue(s).", flush=True)
+    return created
+
+
 def normalize_title(t):
     return re.sub(r"\s+", " ", (t or "").strip()).lower()[:120]
 
@@ -818,6 +1049,7 @@ def main():
     ap.add_argument("--update-prs", action="store_true", help="Update existing v2 issues with PR data")
     ap.add_argument("--delete-range", default="", help="Delete issue numbers in range, e.g. 1-60")
     ap.add_argument("--reparent", action="store_true", help="Fix parent epic on v2 issues (no evernote rollup)")
+    ap.add_argument("--sync", action="store_true", help="Add missing sessions/chats and refresh all v2 issues")
     args = ap.parse_args()
     end = datetime.date.today().isoformat()
 
@@ -833,7 +1065,7 @@ def main():
     by_repo = {n: [] for n in REPO_NAMES}
     by_repo["_cross"] = []
     for s in sessions:
-        repo = infer_repo(s, s.get("title") or "")
+        repo = session_repo_folder(s, s.get("title") or "")
         (by_repo[repo] if repo else by_repo["_cross"]).append(s)
 
     # Transcripts not already covered by a billed session title
@@ -861,6 +1093,13 @@ def main():
 
     if args.update_prs:
         run_update_prs(sessions, git_data, by_repo, extra_transcripts, end)
+        return
+
+    if args.sync:
+        if by_repo["_cross"]:
+            print("Note: cross-repo sessions exist but no cross epic — using dashboard epic as fallback.", flush=True)
+        run_sync(sessions, git_data, by_repo, extra_transcripts, end, epic_keys,
+                 close_new=not args.no_close)
         return
 
     if args.dry_run:
@@ -920,11 +1159,13 @@ def main():
 
     print(f"Creating session stories and bugs...", flush=True)
     for s in sessions:
-        repo = infer_repo(s, s.get("title") or "") or "_cross"
+        repo = session_repo_folder(s) or "_cross"
         epic = epics.get(repo) or epics.get("_cross") or epics.get("dashboard")
         if not epic:
             raise RuntimeError(f"No epic for repo {repo!r}")
         title = (s.get("title") or s.get("session_id") or "Untitled")[:240]
+        if s.get("cloud_agent") and "cloud agent" not in title.lower():
+            title = f"{title} (cloud agent)"[:240]
         bug = is_bug(title, s.get("summary") or "")
         itype = "Bug" if bug else "Story"
         prefix = "Defect" if bug else "Cursor"
@@ -943,7 +1184,7 @@ def main():
 
     print(f"Creating {len(extra_transcripts)} extra chat stories...", flush=True)
     for t in extra_transcripts:
-        repo = infer_repo(t, t.get("title") or "")
+        repo = session_repo_folder(t)
         for name in REPO_NAMES:
             if name in (t.get("title") or "").lower():
                 repo = name
@@ -953,7 +1194,7 @@ def main():
         key = create_issue({
             "project": {"key": PROJECT},
             "issuetype": {"name": "Story"},
-            "summary": summary_with_prs("Chat", t["title"][:200], prs),
+            "summary": summary_with_prs("Chat", chat_summary_title(t), prs),
             "description": adf_description(transcript_description(t)),
             "labels": ["cursor-backfill-v2", "agent-transcript"],
             "parent": {"key": epic},
