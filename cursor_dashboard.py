@@ -2749,7 +2749,15 @@ def _cloud_agents_cache_path():
 
 
 def _cloud_api_key():
-    return (CLOUD_AGENTS_API_KEY or "").strip()
+    """Read the key live from the environment (not only at import time)."""
+    return (
+        os.environ.get("CLOUD_AGENTS_API_KEY")
+        or os.environ.get("CURSOR_API_KEY")
+        or os.environ.get("CURSOR_CLOUD_API_KEY")
+        or os.environ.get("CURSOR_DASH_API_KEY")
+        or CLOUD_AGENTS_API_KEY
+        or ""
+    ).strip()
 
 
 def _cloud_api(method, path, timeout=60):
@@ -2762,10 +2770,21 @@ def _cloud_api(method, path, timeout=60):
     auth = base64.b64encode((key + ":").encode("utf-8")).decode("ascii")
     req = urllib.request.Request(
         url, method=method,
-        headers={"Authorization": "Basic " + auth, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw else {}
+        headers={
+            "Authorization": "Basic " + auth,
+            "Accept": "application/json",
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+        return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        raise RuntimeError(f"Cloud Agents API HTTP {exc.code} for {path}: {body or exc.reason}") from exc
 
 
 def _load_cloud_agents_cache_file():
@@ -2810,13 +2829,13 @@ def _normalize_cloud_agent(raw):
     repo_url = repo_url or (raw.get("repoUrl") or "").strip()
     repo_name = ""
     if repo_url:
-        repo_name = repo_url.rstrip("/").split("/")[-1]
-        if repo_url.rstrip("/").count("/") >= 1:
-            parts = repo_url.rstrip("/").split("/")
-            if len(parts) >= 2:
-                repo_name = parts[-2] + "/" + parts[-1]
-                if repo_name.endswith(".git"):
-                    repo_name = repo_name[:-4]
+        parts = repo_url.rstrip("/").split("/")
+        if len(parts) >= 2:
+            repo_name = parts[-2] + "/" + parts[-1]
+            if repo_name.endswith(".git"):
+                repo_name = repo_name[:-4]
+        else:
+            repo_name = parts[-1]
     created = raw.get("createdAt") or ""
     if not created and raw.get("createdAtMs"):
         try:
@@ -2858,6 +2877,8 @@ def _list_cloud_agents_api():
             path += "&cursor=" + quote(str(cursor))
         data = _cloud_api("GET", path)
         items = data.get("items") or data.get("agents") or []
+        if not isinstance(items, list):
+            raise RuntimeError(f"Unexpected /v1/agents payload keys: {sorted(data)}")
         for raw in items:
             norm = _normalize_cloud_agent(raw)
             if norm:
@@ -2871,23 +2892,28 @@ def _list_cloud_agents_api():
 def _fetch_agent_usage(agent_id):
     try:
         data = _cloud_api("GET", f"/v1/agents/{quote(agent_id)}/usage")
-    except Exception:
+    except Exception as exc:
+        print(f"  cloud agent usage {agent_id}: {exc}", flush=True)
         return {}
     return data.get("totalUsage") or {}
 
 
 def fetch_cloud_agents(force=False, with_usage=False):
     """Return all cloud agents (API + optional local catalog cache)."""
-    global _CLOUD_AGENTS_CACHE
+    global _CLOUD_AGENTS_CACHE, CLOUD_AGENTS_API_KEY
     if not CLOUD_AGENTS_ENABLED:
         return []
     now = time.time()
     if (not force and _CLOUD_AGENTS_CACHE["agents"] is not None
             and now - _CLOUD_AGENTS_CACHE["at"] < 300):
         return _CLOUD_AGENTS_CACHE["agents"]
+    # Refresh module copy so later helpers see the live env value.
+    CLOUD_AGENTS_API_KEY = _cloud_api_key()
     agents, err, source = [], "", ""
-    if _cloud_api_key():
+    key = _cloud_api_key()
+    if key:
         try:
+            print(f"  cloud agents: fetching with key ({len(key)} chars)…", flush=True)
             agents = _list_cloud_agents_api()
             source = "api"
             if with_usage and agents:
@@ -2902,6 +2928,9 @@ def fetch_cloud_agents(force=False, with_usage=False):
         except Exception as exc:
             err = str(exc)
             print(f"  cloud agents API unavailable ({exc})", flush=True)
+    else:
+        err = "no CLOUD_AGENTS_API_KEY / CURSOR_API_KEY in process environment"
+        print(f"  cloud agents: {err}", flush=True)
     if not agents:
         cached = _load_cloud_agents_cache_file()
         raw_agents = cached.get("agents") or []
@@ -3453,7 +3482,14 @@ def _fill_totals(base):
 
 def _clip(session, start, end):
     first, last = session.get("first_day") or "", session.get("last_day") or ""
-    if start <= first and last <= end:
+    # Undated sessions (common for brand-new cloud agents) must not disappear on
+    # All-time views: empty strings fail start<=first string compares.
+    if not first and not last:
+        if start <= MIN_DAY and end >= MAX_DAY:
+            return session
+        if session.get("cloud_agent") and start <= MIN_DAY:
+            return session
+    if first and last and start <= first and last <= end:
         return session
     days = {d: c for d, c in (session.get("days") or {}).items()
             if d and start <= d <= end}
