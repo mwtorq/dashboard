@@ -3093,6 +3093,18 @@ def enrich_sessions_with_cloud_agents(sessions, turns_api, priced_all, agents):
     return sessions, turns_api, priced_all, matched + added
 
 
+def _is_cloud_session(s):
+    """True for Cloud Agent sessions (bc-* IDs or Cloud Agents API)."""
+    if s.get("cloud_agent"):
+        return True
+    sid = s.get("session_id") or ""
+    return sid.startswith("bc-") or s.get("source") == "cloud-agent"
+
+
+def _session_origin(s):
+    return "cloud" if _is_cloud_session(s) else "local-ide"
+
+
 def _turns_from_events(evs):
     priced = []
     for ev in evs:
@@ -4380,7 +4392,10 @@ def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None, path_by_git
              "total_tokens": s["total_tokens"] or 0, "chats": s["turns"] or 0,
              "titles": [x for x in [s["repository"]] if x],
              "created": False, "role": "mentioned", "est": bool(s.get("est")),
-             "session_id": s["session_id"]}
+             "session_id": s["session_id"],
+             "cloud_agent": _is_cloud_session(s),
+             "cloud_url": s.get("cloud_url") or "",
+             "origin": _session_origin(s)}
             for s in sessions]
     sess.sort(key=lambda x: -x["cost_usd"])
     titles = {s["session_id"]: s["title"] for s in sessions}
@@ -4592,6 +4607,8 @@ def _range_allowance(billed_rows, start, end, mtd, cycles, range_is_current_cycl
     cost = sum(s.get("cost_usd") or 0 for s in rows)
     od = sum(s.get("on_demand_usd") or 0 for s in rows)
     inc = max(0.0, cost - od)
+    cloud_rows = [s for s in rows if _is_cloud_session(s)]
+    local_rows = [s for s in rows if not _is_cloud_session(s)]
     out = {
         "start": start,
         "end": end,
@@ -4599,6 +4616,10 @@ def _range_allowance(billed_rows, start, end, mtd, cycles, range_is_current_cycl
         "included_usd": round(inc, 4),
         "on_demand_usd": round(od, 4),
         "sessions": len(rows),
+        "cloud_sessions": len(cloud_rows),
+        "local_ide_sessions": len(local_rows),
+        "cloud_usd": round(sum(s.get("cost_usd") or 0 for s in cloud_rows), 4),
+        "local_ide_usd": round(sum(s.get("cost_usd") or 0 for s in local_rows), 4),
         "requests": sum(s.get("requests") or 0 for s in rows),
         "total_tokens": sum(s.get("total_tokens") or 0 for s in rows),
         "plan": plan,
@@ -4713,6 +4734,8 @@ def build_payload(start, end, q="", force=False):
     turn_prs = {k: v for k, v in data["turn_prs"].items() if k in keep}
     turn_cost = {k: v for k, v in data["turn_cost"].items() if k in keep}
     on_demand = sum(s.get("on_demand_usd") or 0 for s in billed_rows)
+    cloud_rows = [s for s in billed_rows if _is_cloud_session(s)]
+    local_rows = [s for s in billed_rows if not _is_cloud_session(s)]
     totals = {
         "cost_usd": sum(s["cost_usd"] or 0 for s in billed_rows),
         "est_usd": 0.0 if billed else sum(s.get("est_usd") or 0 for s in billed_rows),
@@ -4727,6 +4750,10 @@ def build_payload(start, end, q="", force=False):
         "measured_tokens": sum(s.get("measured_tokens") or 0 for s in billed_rows),
         "requests": sum(s["requests"] or 0 for s in billed_rows),
         "sessions": len(billed_rows),
+        "cloud_sessions": len(cloud_rows),
+        "local_ide_sessions": len(local_rows),
+        "cloud_usd": round(sum(s["cost_usd"] or 0 for s in cloud_rows), 4),
+        "local_ide_usd": round(sum(s["cost_usd"] or 0 for s in local_rows), 4),
         "other_sessions": len(other_rows),
         "other_est_usd": sum(s["cost_usd"] or 0 for s in other_rows),
     }
@@ -5690,6 +5717,8 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .b.pr{border-color:#3fb950;color:#7ee787}
 .b.prnew{border-color:#d29922;color:#e3b341}
 .b.repo{border-color:#388bfd;color:#79c0ff}
+.b.local{border-color:#8957e5;color:#d2a8ff}
+.b.cloud{border-color:#388bfd;color:#79c0ff;background:#0d1929}
 .b.gitinf{border-color:#8957e5;color:#d2a8ff}
 .git-corr{margin:0 0 10px;padding:8px 10px;background:#1c1425;border:1px solid #8957e5;border-radius:6px;font-size:12px;line-height:1.5}
 .git-near{margin-top:4px}
@@ -5701,6 +5730,7 @@ a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
 .card .split span{white-space:nowrap}
 .card .split .e{color:#e3b341}
 .card .split .s{color:#d2a8ff}
+.card .split .c{color:#79c0ff}
 .card .split i{font-style:normal;font-weight:400;opacity:.75}
 td.cost .split,td.cost .cost-lbl{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:2px 6px;
   margin-top:2px;font-size:11px;font-weight:400;color:var(--dim);line-height:1.35;text-align:right;
@@ -5718,6 +5748,9 @@ section.collapsed > *:not(h2){display:none !important}
 .note{border:1px solid #d29922;background:#1c1710;color:#e3b341;border-radius:8px;
    padding:10px 12px;font-size:12px;line-height:1.5;margin-bottom:14px}
 .tabs button.on{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.origin-tabs{display:inline-flex;gap:4px;margin-left:8px}
+.origin-tabs button{font-size:11px;padding:2px 8px}
+.origin-tabs button.on{background:#388bfd33;border-color:#388bfd;color:#79c0ff}
 .tabs input{margin-left:auto}
 .clearable{position:relative;display:inline-block}
 .tabs > .clearable{margin-left:auto}
@@ -5864,6 +5897,11 @@ section.collapsed > *:not(h2){display:none !important}
       <button data-t="prs">Pull requests</button>
       <button data-t="repos">Repositories</button>
       <button data-t="sessions">Sessions</button>
+      <span id="sessionOriginTabs" class="origin-tabs" style="display:none">
+        <button data-o="all" class="on">All</button>
+        <button data-o="cloud">Cloud</button>
+        <button data-o="local">Local IDE</button>
+      </span>
       <span class="clearable"><input id="rq" placeholder="Search work items…" size="22"><button
         class="clearx" data-for="rq" tabindex="-1" title="Clear search"
         aria-label="Clear search">&times;</button></span>
@@ -5918,7 +5956,7 @@ const costThTitle=billed=>
   billed
     ? 'Metered cost: allowance (included plan/bonus) vs on-demand (cash overage)'
     : 'Estimated cost from local transcript';
-let DATA=null, sortKey='cost_usd', sortDir=-1, tab='jira', LAST_LOAD=null;
+let DATA=null, sortKey='cost_usd', sortDir=-1, tab='jira', sessionOrigin='all', LAST_LOAD=null;
 
 const jiraUrl=k=>(DATA&&DATA.jira_base)?`${DATA.jira_base}/browse/${k}`:null;
 const prUrl=k=>{const [r,n]=k.split('#');return `https://github.com/${r}/pull/${n}`;};
@@ -5956,6 +5994,12 @@ function renderRollup(){
   let items=(DATA.rollup&&DATA.rollup[tab])||[];
   const rq=(document.getElementById('rq').value||'').toLowerCase().trim();
   if(rq) items=items.filter(i=>(i.key+' '+(i.summary||'')+' '+(i.status||'')+' '+(i.type||'')+' '+(i.assignee||'')+' '+(i.titles||[]).join(' ')).toLowerCase().includes(rq));
+  const originTabs=document.getElementById('sessionOriginTabs');
+  if(originTabs) originTabs.style.display=tab==='sessions'?'':'none';
+  const allSessionItems=tab==='sessions'?items.slice():[];
+  if(tab==='sessions'&&sessionOrigin!=='all'){
+    items=items.filter(i=>sessionOrigin==='cloud'?i.origin==='cloud':i.origin!=='cloud');
+  }
   const billed=!!DATA.billed;
   const label={jira:'Jira ticket',prs:'Pull request',repos:'Repository',sessions:'Chat / session'}[tab];
   const link=x=>tab==='jira'?jiraUrl(x.key):tab==='prs'?prUrl(x.key):tab==='repos'?repoUrl(x.key):null;
@@ -5976,9 +6020,16 @@ function renderRollup(){
       const cell = (i.keys&&i.keys.length)
         ? i.keys.map(k=>`<a class="b pr" href="${prUrl(k)}" target="_blank">${esc(k.split('/').pop())}</a>`).join(' ')
           + (i.keys.length>1?` <span class="sub">${i.keys.length} PRs from one segment</span>`:'')
-        : (u?`<a href="${u}" target="_blank">${esc(i.key)}</a>`:esc(i.key));
+        : (tab==='sessions'&&i.cloud_agent&&i.session_id
+          ? `<a href="${esc(i.cloud_url||('https://cursor.com/agents/'+i.session_id))}" target="_blank">${esc(i.key)}</a>`
+          : (u?`<a href="${u}" target="_blank">${esc(i.key)}</a>`:esc(i.key)));
+      const originBadge=tab==='sessions'
+        ? (i.origin==='cloud'
+          ? ` <span class="b cloud" title="Cloud agent session">cloud</span>`
+          : ` <span class="b local" title="Local IDE chat with store history">local IDE</span>`)
+        : '';
       return `<tr>
-      <td>${cell}
+      <td>${cell}${originBadge}
         ${i.est?'<span class="b est" title="Includes estimated token data">est</span>':''}
         ${i.created?'<span class="b prnew">✚ created</span>':''}
         ${i.inferred?'<span class="b gitinf" title="PR inferred from merge commit near billed usage">git ±8h</span>':''}
@@ -5999,6 +6050,17 @@ function renderRollup(){
   const costKey=billed
     ? ' · multi-root workspace chats split by git commit/PR activity (±8h), not evenly'
     : '';
+  let originNote='';
+  if(tab==='sessions'&&allSessionItems.length){
+    const cloud=allSessionItems.filter(i=>i.origin==='cloud');
+    const local=allSessionItems.filter(i=>i.origin!=='cloud');
+    const cloudUsd=cloud.reduce((a,b)=>a+b.cost_usd,0);
+    const localUsd=local.reduce((a,b)=>a+b.cost_usd,0);
+    originNote=` · ${cloud.length} cloud (${usd(cloudUsd)}) · ${local.length} local IDE (${usd(localUsd)})`;
+    if(sessionOrigin!=='all'){
+      originNote+=sessionOrigin==='cloud'?' · showing cloud only':' · showing local IDE only';
+    }
+  }
   let jiraNote='';
   if(tab==='jira'){
     if(DATA.jira_connected) jiraNote=' · Jira API connected';
@@ -6006,8 +6068,9 @@ function renderRollup(){
     else jiraNote=' · run store_atlassian_token.ps1 for Jira summaries';
   }
   document.getElementById('rollupfoot').textContent=
-    `${items.length} ${(items.length===1?label:plural).toLowerCase()} · ${kt(tk)} tokens · ${usd(tot)}`+rec+costKey+jiraNote;
-  document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===tab));
+    `${items.length} ${(items.length===1?label:plural).toLowerCase()} · ${kt(tk)} tokens · ${usd(tot)}`+rec+originNote+costKey+jiraNote;
+  document.querySelectorAll('.tabs button[data-t]').forEach(b=>b.classList.toggle('on',b.dataset.t===tab));
+  document.querySelectorAll('#sessionOriginTabs button').forEach(b=>b.classList.toggle('on',b.dataset.o===sessionOrigin));
 }
 
 let BUSY=0;
@@ -6181,8 +6244,15 @@ function renderRangeAllowance(){
       {v:inc,label:'allowance',cls:'s',title:'Included plan usage'},
       {v:od,label:'on-demand',cls:'e',title:'Usage-based overage'},
     ]);
+  const originCost=(ra.cloud_usd||0)>0.004||(ra.local_ide_usd||0)>0.004
+    ? ` · ${usd(ra.local_ide_usd||0)} local IDE · ${usd(ra.cloud_usd||0)} cloud`
+    : '';
   document.getElementById('rangeTokFoot').textContent=
-    `${num(ra.requests)} requests · ${num(ra.sessions)} chats · ${kt(ra.total_tokens)} tokens`;
+    `${num(ra.requests)} requests · ${num(ra.sessions)} chats`
+    +((ra.cloud_sessions||0)+(ra.local_ide_sessions||0)
+      ? ` (${num(ra.cloud_sessions||0)} cloud · ${num(ra.local_ide_sessions||0)} local IDE)`
+      : '')
+    +` · ${kt(ra.total_tokens)} tokens${originCost}`;
 }
 function render(){
   const t=DATA.totals;
@@ -6255,11 +6325,26 @@ function render(){
   const cash=t.cash_usd!=null?t.cash_usd:((t.subscription_usd||0)+(t.invoice_usage_usd||0));
   const odCash=t.invoice_usage_usd!=null?t.invoice_usage_usd:0;
   const odMetered=t.on_demand_usd||0;
+  const originSplit=(t.cloud_usd>0.004||t.local_ide_usd>0.004)
+    ? ` · ${usd(t.local_ide_usd||0)} local IDE · ${usd(t.cloud_usd||0)} cloud`
+    : '';
   const meteredNote=billed&&t.metered_usd
     ? `<span class="metered-note">${usd(t.metered_usd)} usage metered · `
       +`${usd(odMetered)} on-demand metered · `
-      +`${usd(t.included_usd||0)} allowance (not extra cash)</span>`
+      +`${usd(t.included_usd||0)} allowance (not extra cash)${originSplit}</span>`
     : '';
+  const sessionCounts=(t.cloud_sessions||0)+(t.local_ide_sessions||0)
+    ? `<div class="split">`
+      +`<span class="c">${num(t.cloud_sessions||0)} <i>cloud</i></span>`
+      +`<span class="sep"> / </span>`
+      +`<span class="s">${num(t.local_ide_sessions||0)} <i>local IDE</i></span></div>`
+    : '';
+  const sessionCostSplit=(t.cloud_usd>0.004||t.local_ide_usd>0.004)
+    ? split(t.cost_usd,[
+        {v:t.local_ide_usd||0,label:'local IDE',cls:'s',title:'Chats with local IDE store history'},
+        {v:t.cloud_usd||0,label:'cloud',cls:'c',title:'Cloud agent sessions (bc-* IDs)'},
+      ])
+    : usd(t.cost_usd);
   document.getElementById('cards').innerHTML=[
     ['Cash invoiced', billed
       ? split(cash, [
@@ -6276,7 +6361,11 @@ function render(){
       billed
         ? 'Spend this billing cycle vs your included-usage allowance ($70 on Pro Plus). Included usage is not extra cash beyond the subscription; on-demand is.'
         : 'Spend this month vs the configured monthly budget.']]:[]),
-    ['Chats / sessions',num(t.sessions)],
+    ['Chats / sessions',num(t.sessions)+sessionCounts,
+      'Cloud agents vs chats with local IDE store history on this machine.'],
+    ...(billed&&(t.cloud_usd>0.004||t.local_ide_usd>0.004)?[['Metered by origin',
+      sessionCostSplit,
+      'Usage metered in this view split by cloud agent sessions vs local IDE chats.']]:[]),
     ...(t.other_sessions?[['Other-account chats',
       usd(t.other_est_usd)+`<div class="split"><span class="e">${num(t.other_sessions)} local est.</span></div>`,
       (DATA.previous_email||'A previous Cursor login')+' — not in the signed-in account invoices. Local transcript estimate only.']]:[]) ,
@@ -6548,7 +6637,8 @@ document.getElementById('uploadStore').onchange=async(ev)=>{
   if(!f) return;
   importStore('upload', await f.arrayBuffer());
 };
-document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;renderRollup();});
+document.querySelectorAll('.tabs button[data-t]').forEach(b=>b.onclick=()=>{tab=b.dataset.t;renderRollup();});
+document.querySelectorAll('#sessionOriginTabs button').forEach(b=>b.onclick=()=>{sessionOrigin=b.dataset.o;renderRollup();});
 document.getElementById('rq').oninput=()=>DATA&&renderRollup();
 let qtimer=null;
 document.getElementById('q').oninput=()=>{clearTimeout(qtimer);qtimer=setTimeout(load,250);};
