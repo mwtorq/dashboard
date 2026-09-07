@@ -29,12 +29,15 @@ DOCS = [
 
 # Confluence storage-format TOC macro (auto-generates from page headings)
 TOC_MACRO = (
-    '<ac:structured-macro ac:name="toc" ac:schema-version="1" data-layout="default">'
+    '<ac:structured-macro ac:name="toc" ac:schema-version="1" data-layout="wide">'
     '<ac:parameter ac:name="maxLevel">3</ac:parameter>'
     '<ac:parameter ac:name="minLevel">1</ac:parameter>'
     '<ac:parameter ac:name="outline">true</ac:parameter>'
     '</ac:structured-macro>'
 )
+
+# Table attributes for full-width rendering in Confluence Cloud
+TABLE_WIDE_ATTRS = 'data-layout="full-width" data-table-width="1920"'
 
 
 def credentials():
@@ -129,6 +132,15 @@ def strip_markdown_toc(md):
     )
 
 
+def apply_wide_format(html):
+    """Apply full-width attributes to tables for Confluence Cloud rendering."""
+    return re.sub(
+        r"<table(?![^>]*data-layout)([^>]*)>",
+        lambda m: f"<table {TABLE_WIDE_ATTRS}{m.group(1)}>",
+        html,
+    )
+
+
 def md_to_storage(md):
     """Convert markdown to Confluence storage format (simplified)."""
     try:
@@ -139,7 +151,7 @@ def md_to_storage(md):
         )
     except ImportError:
         html = _simple_md_to_html(md)
-    return TOC_MACRO + html
+    return apply_wide_format(TOC_MACRO + html)
 
 
 def _simple_md_to_html(md):
@@ -166,7 +178,7 @@ def _simple_md_to_html(md):
                 continue
             tag = "th" if not in_table else "td"
             if not in_table:
-                out.append("<table><tbody>")
+                out.append(f"<table {TABLE_WIDE_ATTRS}><tbody>")
                 in_table = True
             row = "".join(f"<{tag}>{c}</{tag}>" for c in cells)
             out.append(f"<tr>{row}</tr>")
@@ -206,6 +218,35 @@ def _inline(text):
         text,
     )
     return text
+
+
+def set_page_full_width(page_id):
+    """Set Confluence page content width to full-width via REST API v2."""
+    for key in ("content-appearance-draft", "content-appearance-published"):
+        body = {"key": key, "value": "full-width"}
+        try:
+            api("POST", f"/api/v2/pages/{page_id}/properties", body)
+        except RuntimeError as exc:
+            if "409" not in str(exc) and "400" not in str(exc):
+                raise
+            # Property already exists — look it up and update
+            props = api("GET", f"/api/v2/pages/{page_id}/properties")
+            prop_id = None
+            for prop in props.get("results") or []:
+                if prop.get("key") == key:
+                    prop_id = prop["id"]
+                    version = prop.get("version", {}).get("number", 1)
+                    break
+            if prop_id:
+                api(
+                    "PUT",
+                    f"/api/v2/pages/{page_id}/properties/{prop_id}",
+                    {
+                        "key": key,
+                        "value": "full-width",
+                        "version": {"number": version + 1},
+                    },
+                )
 
 
 def create_page(space_key, parent_id, title, storage_html):
@@ -258,10 +299,15 @@ def publish_file(docs_dir, filename, title, parent_id, space_key, dry_run=False)
         current = get_page(page_id)
         version = current["version"]["number"]
         result = update_page(page_id, title, version, storage)
-        print(f"  Updated page '{title}' → {CONFLUENCE_BASE}{result['_links']['webui']}")
+        action = "Updated"
     else:
         result = create_page(space_key, parent_id, title, storage)
-        print(f"  Created page '{title}' → {CONFLUENCE_BASE}{result['_links']['webui']}")
+        page_id = result["id"]
+        action = "Created"
+
+    if not dry_run:
+        set_page_full_width(page_id)
+        print(f"  {action} page '{title}' (full-width) → {CONFLUENCE_BASE}{result['_links']['webui']}")
     return result
 
 
