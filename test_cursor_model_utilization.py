@@ -835,6 +835,72 @@ class AdaptiveComposerHeadersTests(unittest.TestCase):
         keys = {p["key"] for p in out["prs"]}
         self.assertEqual(keys, {"acme/app#10", "acme/app#11"})
 
+    def test_bubble_dict_pulls_prs_from_tool_payload(self):
+        """PR URLs buried in tool JSON (not text/richText) must still become refs."""
+        import json
+        raw = json.dumps({
+            "type": 2,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "text": "",
+            "toolFormerData": {
+                "result": "Opened https://github.com/acme/app/pull/10 successfully",
+            },
+        })
+        row = d._bubble_dict_from_raw("bubbleId:cid:tool1", raw)
+        self.assertIsNotNone(row)
+        self.assertIn("pull/10", row["text"])
+
+    def test_hidden_tool_prs_reach_build_refs(self):
+        """Earlier tool-only PRs must not be lost when later visible text has another PR."""
+        import json
+        blobs = [
+            json.dumps({
+                "type": 2, "createdAt": "2026-01-01T00:00:00Z", "text": "",
+                "toolFormerData": {"result": "https://github.com/acme/app/pull/10"},
+            }),
+            json.dumps({
+                "type": 2, "createdAt": "2026-01-01T00:05:00Z",
+                "text": "Also filed https://github.com/acme/app/pull/11",
+            }),
+            json.dumps({
+                "type": 2, "createdAt": "2026-01-01T00:10:00Z", "text": "done",
+                "additionalData": {
+                    "url": "https://api.github.com/repos/acme/app/pulls/12",
+                },
+            }),
+        ]
+        texts = []
+        for i, raw in enumerate(blobs):
+            row = d._bubble_dict_from_raw(f"bubbleId:cid:b{i}", raw)
+            self.assertIsNotNone(row)
+            texts.append(row["text"])
+        refs = d._build_refs([("s1", "\n".join(texts))], {}, set())
+        keys = {p["key"] for p in refs["s1"]["prs"]}
+        self.assertEqual(keys, {"acme/app#10", "acme/app#11", "acme/app#12"})
+
+    def test_truncate_prefer_pr_keeps_links_past_limit(self):
+        filler = "x" * 12050
+        text = filler + "\nSee https://github.com/acme/app/pull/99 at the end"
+        clipped = d._truncate_prefer_pr(text, 12000)
+        self.assertLessEqual(len(clipped), 12000)
+        self.assertIn("pull/99", clipped)
+
+    def test_git_activity_gate_keeps_bare_mentions_without_merge(self):
+        sessions = [{
+            "session_id": "s1", "cost_usd": 1.0,
+            "repository": "acme/app",
+        }]
+        refs = {"s1": {"jira": [], "repos": [{"name": "acme/app", "role": "primary"}],
+                       "prs": [
+                           {"key": "acme/app#10", "repo": "acme/app", "number": 10,
+                            "created": False, "bare": True},
+                           {"key": "acme/app#11", "repo": "acme/app", "number": 11,
+                            "created": True},
+                       ]}}
+        d._apply_git_activity_gate(sessions, refs, {}, [], {})
+        keys = {p["key"] for p in refs["s1"]["prs"] if p.get("role") != "skipped"}
+        self.assertEqual(keys, {"acme/app#10", "acme/app#11"})
+
 
 if __name__ == "__main__":
     unittest.main()
