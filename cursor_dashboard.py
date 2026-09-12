@@ -3337,19 +3337,25 @@ def _save_cloud_agents_cache_file(agents, source="api"):
 
 
 def _normalize_cloud_agent(raw):
-    """Map API / MCP catalog shapes onto one agent record."""
+    """Map API / MCP / cookie background-composer shapes onto one agent record."""
     if not isinstance(raw, dict):
         return None
-    aid = (raw.get("id") or raw.get("bcId") or "").strip()
+    aid = (raw.get("id") or raw.get("bcId") or raw.get("bc_id")
+           or raw.get("composerId") or "").strip()
     if not aid:
         return None
+    # Cookie list sometimes returns bare UUIDs; Cloud Agents API uses bc-*.
+    if not aid.startswith("bc-") and re.match(
+            r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+            r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", aid):
+        aid = "bc-" + aid
     repos = raw.get("repos") or []
     repo_url = ""
     if repos and isinstance(repos[0], dict):
         repo_url = (repos[0].get("url") or "").strip()
-    repo_url = repo_url or (raw.get("repoUrl") or "").strip()
-    repo_name = ""
-    if repo_url:
+    repo_url = repo_url or (raw.get("repoUrl") or raw.get("repo_url") or "").strip()
+    repo_name = (raw.get("repository") or raw.get("repo") or "").strip()
+    if not repo_name and repo_url:
         parts = repo_url.rstrip("/").split("/")
         if len(parts) >= 2:
             repo_name = parts[-2] + "/" + parts[-1]
@@ -3357,7 +3363,7 @@ def _normalize_cloud_agent(raw):
                 repo_name = repo_name[:-4]
         else:
             repo_name = parts[-1]
-    created = raw.get("createdAt") or ""
+    created = raw.get("createdAt") or raw.get("created_at") or ""
     if not created and raw.get("createdAtMs"):
         try:
             created = datetime.datetime.fromtimestamp(
@@ -3365,7 +3371,7 @@ def _normalize_cloud_agent(raw):
                 tz=datetime.timezone.utc).isoformat()
         except Exception:
             created = ""
-    updated = raw.get("updatedAt") or ""
+    updated = raw.get("updatedAt") or raw.get("updated_at") or ""
     if not updated and raw.get("updatedAtMs"):
         try:
             updated = datetime.datetime.fromtimestamp(
@@ -3373,15 +3379,28 @@ def _normalize_cloud_agent(raw):
                 tz=datetime.timezone.utc).isoformat()
         except Exception:
             updated = ""
+    name = ""
+    for key in ("name", "title", "composerName", "displayName", "taskTitle"):
+        val = raw.get(key)
+        if isinstance(val, str) and val.strip():
+            name = val.strip()
+            break
+    if not name:
+        # Some cookie payloads bury the prompt in `nudge` / `taskDescription`.
+        for key in ("taskDescription", "prompt", "summary", "nudge"):
+            val = raw.get(key)
+            if isinstance(val, str) and val.strip():
+                name = _title_from_text(val) or val.strip()[:90]
+                break
     url = (raw.get("url") or f"https://cursor.com/agents/{aid}").strip()
     return {
         "id": aid,
-        "name": (raw.get("name") or "").strip() or aid,
-        "status": raw.get("status") or "",
+        "name": name or aid,
+        "status": raw.get("status") or raw.get("state") or "",
         "url": url,
         "repo_url": repo_url,
         "repository": repo_name,
-        "branch": (raw.get("branchName") or "").strip(),
+        "branch": (raw.get("branchName") or raw.get("branch") or "").strip(),
         "created_at": created,
         "updated_at": updated,
         "model": (raw.get("originalModelName") or raw.get("model") or "auto"),
@@ -3410,6 +3429,62 @@ def _list_cloud_agents_api():
     return agents
 
 
+def _list_background_composers_cookie(cookie):
+    """List cloud/background agents via the IDE session cookie (no API key).
+
+    Cursor's website uses POST /api/background-composer/list with the same
+    WorkosCursorSessionToken the dashboard already has for billing. This is the
+    fallback when CLOUD_AGENTS_API_KEY / CURSOR_API_KEY is unset — without it,
+    every billed UUID orphan stays (untitled).
+    """
+    if not cookie:
+        return []
+    last_err = None
+    payloads = (
+        {"n": 200, "include_status": True},
+        {"n": 200, "includeStatus": True},
+        {"limit": 200, "include_status": True},
+    )
+    paths = (
+        "/api/background-composer/list",
+        "/api/background-composer/get-paginated",
+        "/api/agents/list",
+    )
+    for path in paths:
+        for body in payloads:
+            try:
+                data = _api(cookie, "POST", path, body)
+            except Exception as exc:
+                last_err = exc
+                continue
+            if not isinstance(data, dict):
+                continue
+            items = (
+                data.get("composers")
+                or data.get("backgroundComposers")
+                or data.get("agents")
+                or data.get("items")
+                or data.get("bcs")
+                or []
+            )
+            if not isinstance(items, list) or not items:
+                continue
+            agents = []
+            for raw in items:
+                # Some list endpoints nest the composer under `composer` / `bc`.
+                if isinstance(raw, dict) and not (
+                        raw.get("id") or raw.get("bcId") or raw.get("composerId")):
+                    raw = raw.get("composer") or raw.get("bc") or raw.get("agent") or raw
+                norm = _normalize_cloud_agent(raw)
+                if norm:
+                    agents.append(norm)
+            if agents:
+                return agents
+    if last_err:
+        raise RuntimeError(f"background-composer list failed: {last_err}") from last_err
+    return []
+
+
 def _fetch_agent_usage(agent_id):
     try:
         data = _cloud_api("GET", f"/v1/agents/{quote(agent_id)}/usage")
@@ -3419,8 +3494,8 @@ def _fetch_agent_usage(agent_id):
     return data.get("totalUsage") or {}
 
 
-def fetch_cloud_agents(force=False, with_usage=False):
-    """Return all cloud agents (API + optional local catalog cache)."""
+def fetch_cloud_agents(force=False, with_usage=False, cookie=None):
+    """Return all cloud agents (API key, then IDE cookie, then local cache)."""
     global _CLOUD_AGENTS_CACHE, CLOUD_AGENTS_API_KEY
     if not CLOUD_AGENTS_ENABLED:
         return []
@@ -3452,6 +3527,23 @@ def fetch_cloud_agents(force=False, with_usage=False):
     else:
         err = "no CLOUD_AGENTS_API_KEY / CURSOR_API_KEY in process environment"
         print(f"  cloud agents: {err}", flush=True)
+    # Cookie fallback: same session the billing fetch already uses. Without this,
+    # Pro/solo users who never set an API key keep every UUID row as (untitled).
+    if not agents and cookie:
+        try:
+            print("  cloud agents: trying IDE session cookie (background-composer/list)…",
+                  flush=True)
+            agents = _list_background_composers_cookie(cookie)
+            if agents:
+                source = "cookie"
+                err = ""
+                _save_cloud_agents_cache_file(agents, source="cookie")
+                print(f"  cloud agents: {len(agents)} from cursor.com session cookie",
+                      flush=True)
+        except Exception as exc:
+            cookie_err = str(exc)
+            err = (err + "; " if err else "") + f"cookie list failed ({cookie_err})"
+            print(f"  cloud agents cookie list unavailable ({exc})", flush=True)
     if not agents:
         cached = _load_cloud_agents_cache_file()
         raw_agents = cached.get("agents") or []
@@ -5145,7 +5237,7 @@ def _join_diagnostics(db_path, sample_cids=None):
         "local_composer_ids": 0,
         "bubble_composer_ids": 0,
         "sample": [],
-        "build": "titles-v5",
+        "build": "titles-v6",
     }
     if not db_path or not os.path.isfile(db_path):
         out["error"] = "db-missing"
@@ -5390,7 +5482,15 @@ def scan_cursor(force=False):
         cloud_agents = []
         if CLOUD_AGENTS_ENABLED:
             try:
-                cloud_agents = fetch_cloud_agents(force=force, with_usage=True)
+                cookie = ((billing or {}).get("cookie") or "").strip()
+                if not cookie:
+                    try:
+                        with connect() as c2:
+                            cookie = _cursor_session_cookie(c2) or ""
+                    except Exception:
+                        cookie = ""
+                cloud_agents = fetch_cloud_agents(
+                    force=force, with_usage=True, cookie=cookie)
             except Exception as exc:
                 print(f"  cloud agents skipped ({exc})", flush=True)
         if cloud_agents:
@@ -7213,7 +7313,7 @@ class Handler(BaseHTTPRequestHandler):
                     "counts": _store_row_counts(DB_PATH),
                     "composer_index": _composer_index_stats(DB_PATH),
                     "join": _join_diagnostics(DB_PATH, sample_cids=sample),
-                    "build": "titles-v5",
+                    "build": "titles-v6",
                 }, default=str), "application/json")
             elif url.path in ("/", "/index.html"):
                 self._send(PAGE, "text/html; charset=utf-8")
@@ -7445,7 +7545,7 @@ section.collapsed > *:not(h2){display:none !important}
 </style></head><body>
 <div id="busy"></div>
 <header>
-  <h1>Cursor &mdash; Chat Cost Dashboard <span class="sub" id="buildStamp">· titles-v5</span></h1>
+  <h1>Cursor &mdash; Chat Cost Dashboard <span class="sub" id="buildStamp">· titles-v6</span></h1>
   <label class="sub">From <input type="date" id="start"></label>
   <label class="sub">To <input type="date" id="end"></label>
   <select id="preset">
@@ -7480,7 +7580,7 @@ section.collapsed > *:not(h2){display:none !important}
   <div id="err"></div>
   <div class="note" id="mixnote"></div>
   <section id="modelUtil">
-    <h2>Included in plan <span class="sub" id="modelUtilBuild">· pools-v3 · titles-v5</span></h2>
+    <h2>Included in plan <span class="sub" id="modelUtilBuild">· pools-v3 · titles-v6</span></h2>
     <div class="sub range-meta" id="modelUtilMeta">Loading Cursor Models / Other Models pools…</div>
     <div class="allow-grid" id="modelUtilGrid">
       <div class="allow-card primary">
@@ -7938,7 +8038,7 @@ function pctBar(pct){
 function renderModelUtil(){
   const el=document.getElementById('modelUtil');
   if(!el) return;
-  // Never hide this section · stamp titles-v5 — if you cannot see "Included in plan · pools-v3",
+  // Never hide this section · stamp titles-v6 — if you cannot see "Included in plan · pools-v3",
   // the browser is not talking to this build of cursor_dashboard.py.
   el.style.display='block';
   const build=document.getElementById('modelUtilBuild');
@@ -8133,7 +8233,7 @@ function render(){
         explain+=`<b>Fix:</b> set <code>CLOUD_AGENTS_API_KEY</code> / <code>CURSOR_API_KEY</code> so titles can be `
           +`joined (${esc(DATA.cloud_agents_error)}). `;
       } else if(withCa || DATA.cloud_agents){
-        explain+=`Cloud Agents API is loaded — pull latest dashboard (stamp <b>titles-v5</b>) so `
+        explain+=`Cloud Agents API is loaded — confirm stamp <b>titles-v6</b> (cookie agent list + cloudAgentId join) so `
           +`UUID invoices join via <code>cloudAgentId</code> / time overlap. `;
       } else {
         explain+=`Also rebuild the IDE store and confirm <code>/api/store</code> has local composers. `;
@@ -8385,14 +8485,14 @@ function render(){
           const caHint=DATA.cloud_agents_error
             ? ` Set <code>CLOUD_AGENTS_API_KEY</code> / <code>CURSOR_API_KEY</code> (${esc(DATA.cloud_agents_error)}).`
             : (orphanN/sess.length>=0.8
-              ? ` When nearly all rows are orphan/(untitled), invoice <code>conversationId</code> is usually a plain UUID that does not exist in the local store — titles-v5 joins via <code>cloudAgentId</code> or Cloud Agents API time overlap.`
+              ? ` When nearly all rows are orphan/(untitled), invoice <code>conversationId</code> is usually a plain UUID that does not exist in the local store — titles-v6 joins via <code>cloudAgentId</code> or Cloud Agents API time overlap.`
               : '');
           mix.innerHTML+=(mix.innerHTML?'<br><br>':'')
             +`<b>Chat titles / PR context look thin</b> (${weak} of ${sess.length} chats`
             +(orphanN?`, ${orphanN} orphan`:'')+`). `
             +`Pools come from Cursor billing; names/PRs come from the local IDE store `
             +`(Cursor 3.0+ keeps titles in ItemTable <code>composer.composerHeaders</code>). `
-            +`Confirm page stamp <b>titles-v5</b>. Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>), then hard-refresh. `
+            +`Confirm page stamp <b>titles-v6</b>. Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>), then hard-refresh. `
             +`Check <code>/api/store</code> → <code>composer_index.headers_named</code> &gt; 0.`
             +caHint
             +` Also expand the “Cost by chat / session” section if it is collapsed (▸).`;

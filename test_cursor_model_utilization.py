@@ -1,5 +1,6 @@
 """Tests for subscription included model utilization (allocated / used / remaining)."""
 import datetime
+import os
 import unittest
 
 import cursor_dashboard as d
@@ -487,6 +488,89 @@ class OrphanUuidResolutionTests(unittest.TestCase):
         self.assertFalse(matched.get("orphan_billed"))
         self.assertTrue(matched.get("cloud_agent"))
         self.assertIn("time", (matched.get("title_source") or ""))
+
+    def test_normalize_bare_uuid_becomes_bc_prefix(self):
+        agent = d._normalize_cloud_agent({
+            "bcId": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "name": "Cookie-listed agent",
+            "repoUrl": "https://github.com/mwtorq/dashboard.git",
+            "createdAt": "2026-09-11T12:00:00.000Z",
+        })
+        self.assertEqual(agent["id"], "bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertEqual(agent["name"], "Cookie-listed agent")
+        self.assertEqual(agent["repository"], "mwtorq/dashboard")
+
+    def test_cookie_composer_list_parsed_into_agents(self):
+        calls = []
+
+        def fake_api(cookie, method, path, body=None, timeout=60):
+            calls.append(path)
+            if path.endswith("/list"):
+                return {
+                    "composers": [{
+                        "bcId": "bc-11111111-2222-3333-4444-555555555555",
+                        "name": "From session cookie",
+                        "repoUrl": "https://github.com/acme/app",
+                        "createdAtMs": 1_725_000_000_000,
+                        "updatedAtMs": 1_725_000_100_000,
+                    }]
+                }
+            raise RuntimeError("unexpected path")
+
+        orig = d._api
+        d._api = fake_api
+        try:
+            agents = d._list_background_composers_cookie("WorkosCursorSessionToken=u::t")
+        finally:
+            d._api = orig
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(agents[0]["name"], "From session cookie")
+        self.assertTrue(agents[0]["id"].startswith("bc-"))
+        self.assertTrue(any(p.endswith("/list") for p in calls))
+
+    def test_fetch_cloud_agents_uses_cookie_when_no_api_key(self):
+        d._CLOUD_AGENTS_CACHE = {"at": 0, "agents": None, "error": "", "source": ""}
+        # Ensure no API key in env for this process.
+        old_key = d.CLOUD_AGENTS_API_KEY
+        d.CLOUD_AGENTS_API_KEY = ""
+        env_keys = ["CLOUD_AGENTS_API_KEY", "CURSOR_API_KEY", "CURSOR_CLOUD_API_KEY",
+                    "CURSOR_DASH_API_KEY"]
+        saved = {k: os.environ.pop(k, None) for k in env_keys}
+
+        def fake_list(cookie):
+            return [{
+                "id": "bc-cookie-1",
+                "name": "Cookie agent",
+                "repository": "acme/app",
+                "branch": "main",
+                "url": "https://cursor.com/agents/bc-cookie-1",
+                "created_at": "2026-09-11T00:00:00+00:00",
+                "updated_at": "2026-09-11T01:00:00+00:00",
+                "model": "auto",
+                "usage": {},
+                "status": "FINISHED",
+                "repo_url": "",
+            }]
+
+        orig_list = d._list_background_composers_cookie
+        orig_load = d._load_cloud_agents_cache_file
+        orig_save = d._save_cloud_agents_cache_file
+        d._list_background_composers_cookie = fake_list
+        d._load_cloud_agents_cache_file = lambda: {}
+        d._save_cloud_agents_cache_file = lambda *a, **k: None
+        try:
+            agents = d.fetch_cloud_agents(force=True, cookie="WorkosCursorSessionToken=x")
+        finally:
+            d._list_background_composers_cookie = orig_list
+            d._load_cloud_agents_cache_file = orig_load
+            d._save_cloud_agents_cache_file = orig_save
+            d.CLOUD_AGENTS_API_KEY = old_key
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(agents[0]["name"], "Cookie agent")
+        self.assertEqual(d._CLOUD_AGENTS_CACHE.get("source"), "cookie")
 
 
 class ComposerDataMergeTests(unittest.TestCase):
