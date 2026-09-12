@@ -454,6 +454,40 @@ class OrphanUuidResolutionTests(unittest.TestCase):
             self.assertEqual(sess.get("title_source"), "embedded-id")
             self.assertFalse(sess.get("orphan_billed"))
 
+    def test_agent_id_bc_prefix_counts_as_cloud_agent_id(self):
+        ev = {"agentId": "bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+        self.assertEqual(
+            d._billing_event_cloud_agent_id(ev),
+            "bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertEqual(d._billing_event_cloud_agent_id({"agentId": "local-uuid"}), "")
+
+    def test_enrich_fuzzy_matches_orphan_uuid_to_cloud_agent_by_time(self):
+        cid = "11111111-2222-3333-4444-555555555555"
+        sessions = [{
+            "session_id": cid,
+            "title": "(untitled)",
+            "orphan_billed": True,
+            "cost_usd": 2.0,
+            "billed": True,
+            "days": {"2026-09-12": {"cost_usd": 2.0}},
+        }]
+        agents = [{
+            "id": "bc-99999999-aaaa-bbbb-cccc-dddddddddddd",
+            "name": "Time window agent",
+            "repository": "mwtorq/dashboard",
+            "branch": "main",
+            "url": "https://cursor.com/agents/x",
+            "created_at": "2026-09-12T01:00:00+00:00",
+            "updated_at": "2026-09-12T23:00:00+00:00",
+        }]
+        out, _, _, n = d.enrich_sessions_with_cloud_agents(sessions, {}, {}, agents)
+        self.assertGreaterEqual(n, 1)
+        matched = next(s for s in out if s["session_id"] == cid)
+        self.assertEqual(matched["title"], "Time window agent")
+        self.assertFalse(matched.get("orphan_billed"))
+        self.assertTrue(matched.get("cloud_agent"))
+        self.assertIn("time", (matched.get("title_source") or ""))
+
 
 class ComposerDataMergeTests(unittest.TestCase):
     def test_merge_upgrades_empty_composer_data_name(self):

@@ -3601,6 +3601,156 @@ def _resolve_cloud_agent_for_session(sess, by_id):
     return None
 
 
+def _apply_cloud_agent_to_session(sess, agent, match_how="id"):
+    """Copy Cloud Agents API name/repo onto a billed session and clear orphan."""
+    if not sess or not agent:
+        return False
+    cid = sess.get("session_id") or ""
+    api_id = agent.get("id") or ""
+    changed = False
+    if (_is_untitled(sess.get("title"))
+            or sess.get("orphan_billed") or sess.get("unattributed")):
+        sess["title"] = agent.get("name") or sess.get("title") or cid
+        changed = True
+    if agent.get("repository") and (
+            not sess.get("repository") or sess.get("orphan_billed")):
+        sess["repository"] = agent["repository"]
+        sess["workspace"] = agent["repository"]
+        changed = True
+    if agent.get("branch") and not sess.get("branch"):
+        sess["branch"] = agent["branch"]
+        changed = True
+    sess["cloud_agent"] = True
+    sess["cloud_agent_id"] = sess.get("cloud_agent_id") or api_id
+    sess["cloud_url"] = agent.get("url") or sess.get("cloud_url") or ""
+    sess["source"] = sess.get("source") or "cursor-billed"
+    if sess.get("orphan_billed") or sess.get("unattributed") or changed:
+        extra = ""
+        if match_how == "time":
+            extra = " Matched by overlapping activity window (no cloudAgentId on invoice)."
+        elif cid and api_id and cid != api_id:
+            extra = f" Billing conversationId {cid[:20]}… maps via cloudAgentId."
+        sess["billing_note"] = (
+            f"Cloud agent «{agent.get('name') or api_id or cid}» — costs from Cursor "
+            f"billed usage; title/repo from Cloud Agents API.{extra}"
+        )
+        sess["orphan_billed"] = False
+        sess["title_source"] = sess.get("title_source") or (
+            "cloud-agents-api-time" if match_how == "time" else "cloud-agents-api")
+    if not sess.get("subtitle"):
+        sess["subtitle"] = "Cloud agent"
+    return True
+
+
+def _session_activity_ms(sess, priced_all=None):
+    """Best-effort [start_ms, end_ms] for a session from days / priced turns."""
+    priced_all = priced_all or {}
+    start_ms = end_ms = 0
+    for turn in priced_all.get(sess.get("session_id") or "") or []:
+        raw = turn.get("started_at") or turn.get("timestamp") or 0
+        try:
+            if isinstance(raw, str) and "T" in raw:
+                ms = _parse_iso_ms(raw)
+            else:
+                ms = int(raw or 0)
+                if ms and ms < 10_000_000_000:
+                    ms *= 1000
+        except (TypeError, ValueError):
+            ms = 0
+        if not ms:
+            continue
+        start_ms = ms if not start_ms else min(start_ms, ms)
+        end_ms = max(end_ms, ms)
+    if start_ms:
+        return start_ms, end_ms or start_ms
+    days = sorted(d for d in (sess.get("days") or {}) if d)
+    if not days:
+        return 0, 0
+    try:
+        start_ms = int(datetime.datetime.strptime(days[0], "%Y-%m-%d").replace(
+            tzinfo=datetime.timezone.utc).timestamp() * 1000)
+        end_ms = int(datetime.datetime.strptime(days[-1], "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    except Exception:
+        return 0, 0
+    return start_ms, end_ms
+
+
+def _fuzzy_match_orphans_to_cloud_agents(sessions, agents, priced_all=None,
+                                         window_ms=6 * 3600 * 1000):
+    """When invoice UUIDs omit cloudAgentId, match orphans to agents by time overlap."""
+    if not sessions or not agents:
+        return 0
+    claimed = set()
+    for s in sessions:
+        ca = (s.get("cloud_agent_id") or "").strip()
+        if ca:
+            claimed.add(ca)
+            if ca.startswith("bc-"):
+                claimed.add(ca[3:])
+            else:
+                claimed.add("bc-" + ca)
+        sid = (s.get("session_id") or "").strip()
+        if sid.startswith("bc-"):
+            claimed.add(sid)
+            claimed.add(sid[3:])
+    candidates = []
+    for agent in agents:
+        aid = (agent.get("id") or "").strip()
+        if not aid or aid in claimed or (aid.startswith("bc-") and aid[3:] in claimed):
+            continue
+        created = _parse_iso_ms(agent.get("created_at"))
+        updated = _parse_iso_ms(agent.get("updated_at")) or created
+        if not created and not updated:
+            continue
+        candidates.append((agent, created or updated, updated or created))
+    if not candidates:
+        return 0
+    matched = 0
+    for sess in sessions:
+        if not sess.get("orphan_billed") and not _is_untitled(sess.get("title")):
+            continue
+        if sess.get("cloud_agent_id"):
+            continue
+        sid = sess.get("session_id") or ""
+        if sid.startswith("bc-") or sid in ("_unattributed",):
+            continue
+        start_ms, end_ms = _session_activity_ms(sess, priced_all)
+        if not start_ms:
+            continue
+        best, best_score, second = None, -1, -1
+        for agent, created, updated in candidates:
+            aid = agent["id"]
+            if aid in claimed or (aid.startswith("bc-") and aid[3:] in claimed):
+                continue
+            # Overlap between billing activity and agent lifetime (±window).
+            a0, a1 = created - window_ms, updated + window_ms
+            if end_ms < a0 or start_ms > a1:
+                continue
+            overlap = min(end_ms, a1) - max(start_ms, a0)
+            # Prefer agents whose midpoint is closest to the billed window midpoint.
+            mid_s = (start_ms + end_ms) / 2
+            mid_a = (created + updated) / 2
+            proximity = max(0, window_ms - abs(mid_s - mid_a))
+            score = overlap / 1000.0 + proximity / 1000.0
+            if score > best_score:
+                second = best_score
+                best_score, best = score, agent
+            elif score > second:
+                second = score
+        if not best or best_score < 1:
+            continue
+        # Ambiguous: two agents nearly as good → skip.
+        if second >= 0 and best_score - second < best_score * 0.15:
+            continue
+        if _apply_cloud_agent_to_session(sess, best, match_how="time"):
+            claimed.add(best["id"])
+            if best["id"].startswith("bc-"):
+                claimed.add(best["id"][3:])
+            matched += 1
+    return matched
+
+
 def enrich_sessions_with_cloud_agents(sessions, turns_api, priced_all, agents):
     """Attach cloud-agent titles to billed orphans and append missing agents."""
     if not agents:
@@ -3612,35 +3762,11 @@ def enrich_sessions_with_cloud_agents(sessions, turns_api, priced_all, agents):
         if not agent:
             continue
         matched += 1
-        cid = sess.get("session_id") or ""
-        if (_is_untitled(sess.get("title"))
-                or sess.get("orphan_billed") or sess.get("unattributed")):
-            sess["title"] = agent.get("name") or sess.get("title") or cid
-        if agent.get("repository") and (
-                not sess.get("repository") or sess.get("orphan_billed")):
-            sess["repository"] = agent["repository"]
-            sess["workspace"] = agent["repository"]
-        if agent.get("branch") and not sess.get("branch"):
-            sess["branch"] = agent["branch"]
-        sess["cloud_agent"] = True
-        sess["cloud_agent_id"] = sess.get("cloud_agent_id") or agent.get("id") or ""
-        sess["cloud_url"] = agent.get("url") or sess.get("cloud_url") or ""
-        sess["source"] = sess.get("source") or "cursor-billed"
-        if sess.get("orphan_billed") or sess.get("unattributed"):
-            api_id = agent.get("id") or ""
-            extra = ""
-            if cid and api_id and cid != api_id:
-                extra = (
-                    f" Billing conversationId {cid[:20]}… maps via cloudAgentId."
-                )
-            sess["billing_note"] = (
-                f"Cloud agent «{agent.get('name') or api_id or cid}» — costs from Cursor "
-                f"billed usage; title/repo from Cloud Agents API.{extra}"
-            )
-            sess["orphan_billed"] = False
-            sess["title_source"] = sess.get("title_source") or "cloud-agents-api"
-        if not sess.get("subtitle"):
-            sess["subtitle"] = "Cloud agent"
+        _apply_cloud_agent_to_session(sess, agent, match_how="id")
+    # Invoice often has a plain conversation UUID with no cloudAgentId field —
+    # fall back to unique time-overlap against Cloud Agents API records.
+    matched += _fuzzy_match_orphans_to_cloud_agents(
+        sessions, agents, priced_all=priced_all)
     present = {s.get("session_id") for s in sessions}
     # cloud_agent_id hits count as present so we don't double-add the agent row.
     for s in sessions:
@@ -3958,11 +4084,20 @@ def _billing_str_field(ev, *keys):
 def _billing_event_cloud_agent_id(ev):
     """Cloud-agent run id from a usage event (often bc-*, distinct from conversationId)."""
     aid = _billing_str_field(
-        ev, "cloudAgentId", "cloud_agent_id", "bcId")
+        ev,
+        "cloudAgentId", "cloud_agent_id", "bcId", "bc_id",
+        "backgroundAgentId", "background_agent_id",
+        "backgroundComposerId", "background_composer_id",
+    )
     if aid:
         return aid
+    # agentId is ambiguous (local vs cloud); only accept bc-* values.
+    for key in ("agentId", "agent_id", "composerId", "composer_id"):
+        val = _billing_str_field(ev, key)
+        if val.startswith("bc-"):
+            return val
     # Nested shapes seen in some Cursor payloads.
-    for nest in ("metadata", "conversation", "agent", "cloudAgent"):
+    for nest in ("metadata", "conversation", "agent", "cloudAgent", "backgroundAgent"):
         obj = ev.get(nest) if isinstance(ev, dict) else None
         if isinstance(obj, dict):
             aid = _billing_event_cloud_agent_id(obj)
@@ -7982,11 +8117,27 @@ function render(){
         +`Expand that row for per-turn commit matches.`;
     }
     if(orphanUsd>0.005){
-      explain+=`<br><br><b>Orphan billed chats (${usd(orphanUsd)}):</b> these have a conversation ID on the `
-        +`invoice but no matching chat history on this machine. `
-        +`bc-* ids (or events with <code>cloudAgentId</code>) are cloud agents; plain UUIDs are usually `
-        +`another device, cleared local history, headless/automation usage, or a billing id that differs `
-        +`from the local composer id.`;
+      const orphanRows=(DATA.sessions||[]).filter(s=>s.orphan_billed);
+      const withCa=orphanRows.filter(s=>s.cloud_agent_id||(s.session_id||'').startsWith('bc-')).length;
+      const allOrphan=orphanRows.length>=Math.max(3, Math.floor((DATA.sessions||[]).length*0.8));
+      explain+=`<br><br><b>Orphan billed chats (${usd(orphanUsd)}):</b> conversation ID on the `
+        +`invoice but no matching chat history on this machine. `;
+      if(allOrphan){
+        explain+=`<b>Almost every chat is orphan/(untitled) the same way</b> — this is usually not a `
+          +`missing local title, it is a billing↔store ID mismatch. Invoice rows often use a plain `
+          +`UUID <code>conversationId</code> while Cloud Agents API ids are <code>bc-*</code>. `;
+      }
+      explain+=`bc-* ids (or events with <code>cloudAgentId</code>) are cloud agents; plain UUIDs are usually `
+        +`cloud agents without that field, another device, cleared local history, or headless/automation. `;
+      if(DATA.cloud_agents_error){
+        explain+=`<b>Fix:</b> set <code>CLOUD_AGENTS_API_KEY</code> / <code>CURSOR_API_KEY</code> so titles can be `
+          +`joined (${esc(DATA.cloud_agents_error)}). `;
+      } else if(withCa || DATA.cloud_agents){
+        explain+=`Cloud Agents API is loaded — pull latest dashboard (stamp <b>titles-v5</b>) so `
+          +`UUID invoices join via <code>cloudAgentId</code> / time overlap. `;
+      } else {
+        explain+=`Also rebuild the IDE store and confirm <code>/api/store</code> has local composers. `;
+      }
     }
     if(DATA.cloud_agents){
       explain+=`<br><br><b>Cloud agents (${num(DATA.cloud_agents)}):</b> loaded via `
@@ -8218,7 +8369,8 @@ function render(){
       <td class="cost">${costCell(m,billed)}</td><td style="width:160px"><div class="bar" style="width:${m.cost_usd/mmax*100}%"></div></td></tr>`).join('')+
     '</tbody>';
 
-  // Warn when billed rows lack local titles/repos — usually a stale/empty IDE store join.
+  // Warn when billed rows lack local titles/repos — usually a stale/empty IDE store join
+  // or (when nearly all are orphan) a billing UUID ↔ local composer / bc-* ID mismatch.
   try{
     const sess=DATA.sessions||[];
     if(DATA.billed && sess.length){
@@ -8229,13 +8381,21 @@ function render(){
       if(weak/sess.length>=0.4){
         const mix=document.getElementById('mixnote');
         if(mix){
+          const orphanN=sess.filter(s=>s.orphan_billed).length;
+          const caHint=DATA.cloud_agents_error
+            ? ` Set <code>CLOUD_AGENTS_API_KEY</code> / <code>CURSOR_API_KEY</code> (${esc(DATA.cloud_agents_error)}).`
+            : (orphanN/sess.length>=0.8
+              ? ` When nearly all rows are orphan/(untitled), invoice <code>conversationId</code> is usually a plain UUID that does not exist in the local store — titles-v5 joins via <code>cloudAgentId</code> or Cloud Agents API time overlap.`
+              : '');
           mix.innerHTML+=(mix.innerHTML?'<br><br>':'')
-            +`<b>Chat titles / PR context look thin</b> (${weak} of ${sess.length} chats). `
+            +`<b>Chat titles / PR context look thin</b> (${weak} of ${sess.length} chats`
+            +(orphanN?`, ${orphanN} orphan`:'')+`). `
             +`Pools come from Cursor billing; names/PRs come from the local IDE store `
             +`(Cursor 3.0+ keeps titles in ItemTable <code>composer.composerHeaders</code>). `
             +`Confirm page stamp <b>titles-v5</b>. Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>), then hard-refresh. `
-            +`Check <code>/api/store</code> → <code>composer_index.headers_named</code> &gt; 0. `
-            +`Also expand the “Cost by chat / session” section if it is collapsed (▸).`;
+            +`Check <code>/api/store</code> → <code>composer_index.headers_named</code> &gt; 0.`
+            +caHint
+            +` Also expand the “Cost by chat / session” section if it is collapsed (▸).`;
         }
       }
     }
