@@ -297,10 +297,196 @@ class UntitledTitleJoinTests(unittest.TestCase):
     def test_empty_stub_still_counts_as_orphan(self):
         notes = d._billing_match_notes("abc-123", {"title": "", "text": ""}, [{}])
         self.assertTrue(notes.get("orphan_billed"))
+        self.assertFalse(notes.get("cloud_agent"))
+        self.assertIn("not a bc-* cloud agent id", notes.get("billing_note") or "")
         notes2 = d._billing_match_notes(
             "bc-cloud", {"title": "(untitled)", "text": ""}, [{}])
         self.assertTrue(notes2.get("orphan_billed"))
         self.assertTrue(notes2.get("cloud_agent"))
+        self.assertIn("cloud agent", (notes2.get("billing_note") or "").lower())
+
+
+class OrphanUuidResolutionTests(unittest.TestCase):
+    def test_request_id_is_not_treated_as_conversation_id(self):
+        ev = {"requestId": "req-only-uuid", "timestamp": 1, "model": "gpt-5",
+              "tokenUsage": {"totalCents": 1}}
+        self.assertEqual(d._billing_event_cid(ev), "_unattributed")
+
+    def test_cloud_agent_id_extracted_separately_from_conversation_id(self):
+        ev = {
+            "conversationId": "26f96495-6a2b-4ca9-a111-222233334444",
+            "cloudAgentId": "bc-574a3af1-0292-44f5-b9f1-5197b5c6641b",
+            "timestamp": 1_700_000_000_000,
+            "model": "claude-4.5-sonnet",
+            "kind": "INCLUDED",
+            "tokenUsage": {"totalCents": 50, "inputTokens": 1, "outputTokens": 1,
+                           "cacheWriteTokens": 0, "cacheReadTokens": 0},
+        }
+        self.assertEqual(
+            d._billing_event_cid(ev), "26f96495-6a2b-4ca9-a111-222233334444")
+        self.assertEqual(
+            d._billing_event_cloud_agent_id(ev),
+            "bc-574a3af1-0292-44f5-b9f1-5197b5c6641b")
+        sessions, _, _ = d._sessions_from_billing([ev], {}, {}, {})
+        self.assertEqual(len(sessions), 1)
+        self.assertTrue(sessions[0].get("orphan_billed"))
+        self.assertEqual(
+            sessions[0].get("cloud_agent_id"),
+            "bc-574a3af1-0292-44f5-b9f1-5197b5c6641b")
+        self.assertTrue(sessions[0].get("cloud_agent"))
+        self.assertIn("cloudAgentId", sessions[0].get("billing_note") or "")
+
+    def test_enrich_matches_via_cloud_agent_id_not_only_bc_session_id(self):
+        cid = "26f96495-6a2b-4ca9-a111-222233334444"
+        bc = "bc-574a3af1-0292-44f5-b9f1-5197b5c6641b"
+        sessions = [{
+            "session_id": cid,
+            "title": "(untitled)",
+            "orphan_billed": True,
+            "cloud_agent_id": bc,
+            "cost_usd": 1.0,
+            "billed": True,
+        }]
+        agents = [{
+            "id": bc,
+            "name": "Investigate orphan billing IDs",
+            "repository": "mwtorq/dashboard",
+            "branch": "main",
+            "url": f"https://cursor.com/agents/{bc}",
+        }]
+        out, _, _, n = d.enrich_sessions_with_cloud_agents(sessions, {}, {}, agents)
+        self.assertGreaterEqual(n, 1)
+        matched = next(s for s in out if s["session_id"] == cid)
+        self.assertEqual(matched["title"], "Investigate orphan billing IDs")
+        self.assertFalse(matched.get("orphan_billed"))
+        self.assertTrue(matched.get("cloud_agent"))
+        self.assertEqual(matched.get("repository"), "mwtorq/dashboard")
+
+    def test_plain_uuid_orphan_label_avoids_cloud_agent_claim(self):
+        notes = d._billing_match_notes(
+            "26f96495-6a2b-4ca9-a111-222233334444",
+            {"title": "", "text": ""},
+            [{"isHeadless": False}])
+        self.assertTrue(notes.get("orphan_billed"))
+        self.assertFalse(notes.get("cloud_agent"))
+        note = notes.get("billing_note") or ""
+        self.assertNotIn("likely a cloud agent", note)
+        self.assertIn("not a bc-*", note)
+
+    def test_headless_orphan_label(self):
+        notes = d._billing_match_notes(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            {"title": ""},
+            [{"isHeadless": True}])
+        self.assertIn("headless", (notes.get("billing_note") or "").lower())
+
+    def test_fuzzy_match_orphan_to_nearby_local_chat(self):
+        orphan_id = "bbbbbbbb-1111-2222-3333-444444444444"
+        local_id = "cccccccc-aaaa-bbbb-cccc-dddddddddddd"
+        ts = "2026-01-15T12:00:00+00:00"
+        sess = {
+            "session_id": orphan_id,
+            "title": "(untitled)",
+            "orphan_billed": True,
+            "cost_usd": 1.25,
+            "billed": True,
+            "top_model": "gpt-5",
+        }
+        priced = [{"started_at": ts, "model": "gpt-5", "cost_usd": 1.25}]
+        local = {
+            "session_id": local_id,
+            "title": "Fix dashboard orphan labels",
+            "text": "please fix orphan labeling",
+            "repository": "mwtorq/dashboard",
+            "cost_usd": 1.20,
+            "top_model": "gpt-5",
+            "billed": False,
+        }
+        local_priced = {local_id: [{"started_at": ts, "model": "gpt-5", "cost_usd": 1.2}]}
+        n = d.resolve_orphan_sessions(
+            [sess], {local_id: local},
+            priced_all={orphan_id: priced},
+            local_priced=local_priced, con=None, meta={})
+        self.assertEqual(n, 1)
+        self.assertFalse(sess.get("orphan_billed"))
+        self.assertEqual(sess["title"], "Fix dashboard orphan labels")
+        self.assertEqual(sess.get("title_source"), "fuzzy-local")
+        self.assertEqual(sess.get("matched_local_id"), local_id)
+
+    def test_embedded_billing_uuid_in_composer_data(self):
+        import json, os, sqlite3, tempfile
+        orphan_id = "dddddddd-1111-2222-3333-444444444444"
+        local_id = "eeeeeeee-aaaa-bbbb-cccc-dddddddddddd"
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.row_factory = sqlite3.Row
+            con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+            con.execute(
+                "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+                (f"composerData:{local_id}",
+                 json.dumps({
+                     "name": "Embedded reverse map chat",
+                     "billingConversationId": orphan_id,
+                     "lastUpdatedAt": 1700000000000,
+                 })),
+            )
+            con.commit()
+            sess = {
+                "session_id": orphan_id,
+                "title": "(untitled)",
+                "orphan_billed": True,
+                "cost_usd": 0.5,
+                "billed": True,
+            }
+            local = {
+                "session_id": local_id,
+                "title": "Embedded reverse map chat",
+                "text": "hello",
+                "repository": "acme/app",
+            }
+            n = d.resolve_orphan_sessions(
+                [sess], {local_id: local}, priced_all={}, local_priced={},
+                con=con, meta={})
+            con.close()
+            self.assertEqual(n, 1)
+            self.assertEqual(sess["title"], "Embedded reverse map chat")
+            self.assertEqual(sess.get("title_source"), "embedded-id")
+            self.assertFalse(sess.get("orphan_billed"))
+
+    def test_agent_id_bc_prefix_counts_as_cloud_agent_id(self):
+        ev = {"agentId": "bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
+        self.assertEqual(
+            d._billing_event_cloud_agent_id(ev),
+            "bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        self.assertEqual(d._billing_event_cloud_agent_id({"agentId": "local-uuid"}), "")
+
+    def test_enrich_fuzzy_matches_orphan_uuid_to_cloud_agent_by_time(self):
+        cid = "11111111-2222-3333-4444-555555555555"
+        sessions = [{
+            "session_id": cid,
+            "title": "(untitled)",
+            "orphan_billed": True,
+            "cost_usd": 2.0,
+            "billed": True,
+            "days": {"2026-09-12": {"cost_usd": 2.0}},
+        }]
+        agents = [{
+            "id": "bc-99999999-aaaa-bbbb-cccc-dddddddddddd",
+            "name": "Time window agent",
+            "repository": "mwtorq/dashboard",
+            "branch": "main",
+            "url": "https://cursor.com/agents/x",
+            "created_at": "2026-09-12T01:00:00+00:00",
+            "updated_at": "2026-09-12T23:00:00+00:00",
+        }]
+        out, _, _, n = d.enrich_sessions_with_cloud_agents(sessions, {}, {}, agents)
+        self.assertGreaterEqual(n, 1)
+        matched = next(s for s in out if s["session_id"] == cid)
+        self.assertEqual(matched["title"], "Time window agent")
+        self.assertFalse(matched.get("orphan_billed"))
+        self.assertTrue(matched.get("cloud_agent"))
+        self.assertIn("time", (matched.get("title_source") or ""))
 
 
 class ComposerDataMergeTests(unittest.TestCase):
