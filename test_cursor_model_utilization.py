@@ -904,7 +904,7 @@ class AdaptiveComposerHeadersTests(unittest.TestCase):
 
 
 class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
-    """Full-composer PR scan + mention-day scoping (not session first billed day)."""
+    """Full-composer PR scan + local-day PR scoping on clip."""
 
     def test_full_scan_keeps_all_tool_prs_not_only_latest_two(self):
         import json, os, sqlite3, tempfile
@@ -943,37 +943,118 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             self.assertEqual(keys, {"acme/app#10", "acme/app#11", "acme/app#12", "acme/app#13"})
             self.assertIn(cid, hints)
 
-    def test_clip_keeps_all_session_prs_like_copilot(self):
-        """Match github_copilot_dashboard: clip spend by day, never strip PR refs."""
+    def test_clip_scopes_prs_by_local_first_last_day(self):
+        """Yesterday/Today must not share the same PR dump."""
         sess = {
             "session_id": "s1",
             "title": "multi-day agent",
-            "first_day": "2026-09-12",
+            "first_day": "2026-09-11",
             "last_day": "2026-09-12",
             "days": {
+                "2026-09-11": {
+                    "cost_usd": 2.0, "requests": 1, "total_tokens": 10,
+                    "input_tokens": 5, "output_tokens": 5,
+                    "cache_read_tokens": 0, "cache_write_tokens": 0,
+                    "measured_tokens": 10, "est_usd": 0.0, "on_demand_usd": 0.0,
+                },
                 "2026-09-12": {
                     "cost_usd": 5.0, "requests": 1, "total_tokens": 10,
                     "input_tokens": 5, "output_tokens": 5,
                     "cache_read_tokens": 0, "cache_write_tokens": 0,
                     "measured_tokens": 10, "est_usd": 0.0, "on_demand_usd": 0.0,
-                }
+                },
             },
+            "by_model_day": {},
             "refs": {
                 "jira": [], "repos": [],
                 "prs": [
-                    {"key": "acme/app#20", "repo": "acme/app", "number": 20, "created": True},
-                    {"key": "acme/app#24", "repo": "acme/app", "number": 24, "created": True},
-                    {"key": "acme/app#25", "repo": "acme/app", "number": 25, "created": True},
-                    {"key": "acme/app#26", "repo": "acme/app", "number": 26, "created": True},
-                    {"key": "acme/app#27", "repo": "acme/app", "number": 27, "created": True},
+                    # local-yesterday only
+                    {"key": "acme/app#20", "repo": "acme/app", "number": 20,
+                     "created": True, "first_day": "2026-09-11",
+                     "last_day": "2026-09-11", "days": ["2026-09-11"]},
+                    # create yesterday, merge today → both days
+                    {"key": "acme/app#24", "repo": "acme/app", "number": 24,
+                     "created": True, "first_day": "2026-09-11",
+                     "last_day": "2026-09-12",
+                     "days": ["2026-09-11", "2026-09-12"]},
+                    # today only
+                    {"key": "acme/app#25", "repo": "acme/app", "number": 25,
+                     "created": True, "first_day": "2026-09-12",
+                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
+                    {"key": "acme/app#28", "repo": "acme/app", "number": 28,
+                     "created": True, "first_day": "2026-09-12",
+                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
                 ],
             },
             "billed": True,
         }
+        yesterday = d._clip(sess, "2026-09-11", "2026-09-11")
         today = d._clip(sess, "2026-09-12", "2026-09-12")
         self.assertEqual(
-            [p["key"] for p in today["refs"]["prs"]],
-            ["acme/app#20", "acme/app#24", "acme/app#25", "acme/app#26", "acme/app#27"])
+            [p["number"] for p in yesterday["refs"]["prs"]], [20, 24])
+        self.assertEqual(
+            [p["number"] for p in today["refs"]["prs"]], [24, 25, 28])
+
+    def test_local_day_uses_machine_timezone_not_utc_date(self):
+        """UTC early-morning timestamps must follow machine local calendar day."""
+        import os, time
+        prev = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/Chicago"
+            time.tzset()
+            # 03:18 UTC on Sep 12 is still Sep 11 in America/Chicago.
+            self.assertEqual(d._local_day("2026-09-12T03:18:25Z"), "2026-09-11")
+            os.environ["TZ"] = "UTC"
+            time.tzset()
+            self.assertEqual(d._local_day("2026-09-12T03:18:25Z"), "2026-09-12")
+        finally:
+            if prev is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev
+            time.tzset()
+
+    def test_enrich_cloud_agent_prs_from_github_footer(self):
+        """PRs with bc-* in body attach even when bubbles missed them."""
+        fake = [
+            {"number": 20, "url": "https://github.com/acme/app/pull/20",
+             "createdAt": "2026-09-12T03:18:25Z",
+             "mergedAt": "2026-09-12T03:18:55Z",
+             "body": "footer bc-aaaa"},
+            {"number": 24, "url": "https://github.com/acme/app/pull/24",
+             "createdAt": "2026-09-12T03:53:46Z",
+             "mergedAt": "2026-09-12T12:24:19Z",
+             "body": "footer bc-aaaa"},
+            {"number": 25, "url": "https://github.com/acme/app/pull/25",
+             "createdAt": "2026-09-12T12:38:58Z",
+             "mergedAt": "2026-09-12T23:13:45Z",
+             "body": "footer bc-aaaa"},
+            {"number": 99, "url": "https://github.com/acme/app/pull/99",
+             "createdAt": "2026-09-12T15:00:00Z", "mergedAt": None,
+             "body": "other agent bc-bbbb"},
+        ]
+        prev = d._list_repo_prs_via_gh
+        try:
+            d._list_repo_prs_via_gh = lambda repo, limit=100: fake
+            sess = {
+                "session_id": "bc-aaaa",
+                "cloud_agent": True,
+                "cloud_agent_id": "bc-aaaa",
+                "repository": "acme/app",
+                "refs": {"jira": [], "prs": [], "repos": []},
+            }
+            refs = {"bc-aaaa": sess["refs"]}
+            added = d._enrich_cloud_agent_prs([sess], refs)
+            self.assertEqual(added, 3)
+            nums = sorted(p["number"] for p in refs["bc-aaaa"]["prs"])
+            self.assertEqual(nums, [20, 24, 25])
+            by_n = {p["number"]: p for p in refs["bc-aaaa"]["prs"]}
+            # Stamps come from `_local_day` of create/merge — assert fields exist.
+            self.assertTrue(by_n[20].get("first_day"))
+            self.assertTrue(by_n[24].get("last_day"))
+            self.assertGreaterEqual(by_n[24]["last_day"], by_n[24]["first_day"])
+        finally:
+            d._list_repo_prs_via_gh = prev
 
 
 if __name__ == "__main__":
