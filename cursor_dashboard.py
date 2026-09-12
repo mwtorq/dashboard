@@ -253,7 +253,15 @@ def _merge_cursor_disk_kv(dst, src):
         if cur is None:
             dst.execute("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)", (key, value))
             added += 1
-        elif (cur[0] in (None, b"", "")) and value not in (None, b"", ""):
+            continue
+        old = cur[0]
+        replace = False
+        if old in (None, b"", "") and value not in (None, b"", ""):
+            replace = True
+        elif isinstance(key, str) and key.startswith("composerData:") and _composer_data_richer(value, old):
+            # Re-import must upgrade empty-name composerData left in merged-state.vscdb.
+            replace = True
+        if replace:
             dst.execute("UPDATE cursorDiskKV SET value = ? WHERE key = ?", (value, key))
             updated += 1
     return added, updated
@@ -337,8 +345,12 @@ def merge_stores(base_paths, dest_path, seed_path=None):
     return summary
 
 
-def import_ide_into(current_db, dest_path=None):
-    """Merge the richest local IDE store into dest (default: dashboard merged DB)."""
+def import_ide_into(current_db, dest_path=None, rebuild=True):
+    """Merge local IDE state.vscdb store(s) into dest (default: dashboard merged DB).
+
+    rebuild=True (default) replaces the previous merged copy so stale empty
+    composerData names cannot stick around across imports.
+    """
     ide = ide_store_candidates()
     if not ide:
         searched = [
@@ -348,7 +360,20 @@ def import_ide_into(current_db, dest_path=None):
         raise FileNotFoundError(
             "No IDE state.vscdb found. Searched:\n  - " + "\n  - ".join(searched))
     dest_path = dest_path or _merged_store_path()
-    seed = current_db if current_db and os.path.isfile(current_db) else None
+    seed = None
+    if rebuild and os.path.isfile(dest_path):
+        bak = dest_path + ".bak"
+        try:
+            if os.path.isfile(bak):
+                os.remove(bak)
+            os.replace(dest_path, bak)
+        except OSError:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+    elif not rebuild:
+        seed = current_db if current_db and os.path.isfile(current_db) else None
     # Prefer merging every discovered IDE store so multi-install machines keep chats.
     sources = [c["path"] for c in ide]
     return merge_stores(sources, dest_path, seed_path=seed)
@@ -3412,7 +3437,7 @@ def enrich_sessions_with_cloud_agents(sessions, turns_api, priced_all, agents):
         if not agent:
             continue
         matched += 1
-        if (not sess.get("title") or sess.get("title") in ("(untitled)",)
+        if (_is_untitled(sess.get("title"))
                 or sess.get("orphan_billed") or sess.get("unattributed")):
             sess["title"] = agent.get("name") or sess.get("title") or cid
         if agent.get("repository") and (
@@ -3496,6 +3521,101 @@ def _turns_from_events(evs):
     return priced
 
 
+
+UNTITLED_TITLE = "(untitled)"
+
+
+def _is_untitled(title):
+    t = (title or "").strip()
+    return (not t) or t == UNTITLED_TITLE
+
+
+def _title_from_text(text):
+    """First non-empty line of chat text, trimmed for a session title."""
+    for line in (text or "").splitlines():
+        typed = line.strip()
+        if typed:
+            return " ".join(typed.split())[:90]
+    return ""
+
+
+def _composer_display_name(blob):
+    """Best-effort title fields Cursor has used on composerHeaders / composerData."""
+    if not isinstance(blob, dict):
+        return ""
+    for key in ("name", "customTitle", "title", "displayName", "text"):
+        val = blob.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _local_context_present(local):
+    """True when a local stub/session actually carries title, text, or repo context."""
+    if not local:
+        return False
+    if not _is_untitled(local.get("title")):
+        return True
+    if (local.get("text") or "").strip():
+        return True
+    if (local.get("repository") or "").strip():
+        return True
+    if (local.get("subtitle") or "").strip():
+        return True
+    return False
+
+
+def _fill_missing_title(sess, *text_sources):
+    """If sess title is blank/(untitled), derive one from chat text sources."""
+    if not _is_untitled(sess.get("title")):
+        return False
+    for src in text_sources:
+        if isinstance(src, list):
+            for turn in src:
+                title = _title_from_text((turn or {}).get("text") or "")
+                if title:
+                    sess["title"] = title
+                    return True
+        else:
+            title = _title_from_text(src or "")
+            if title:
+                sess["title"] = title
+                return True
+    return False
+
+
+def _composer_data_richer(new_val, old_val):
+    """Prefer composerData blobs that carry a real name or are clearly newer/richer."""
+    if old_val in (None, b"", ""):
+        return new_val not in (None, b"", "")
+    if new_val in (None, b"", ""):
+        return False
+    nb, ob = _loads(new_val), _loads(old_val)
+    if not isinstance(nb, dict):
+        return False
+    if not isinstance(ob, dict):
+        return True
+    n_name = _composer_display_name(nb)
+    o_name = _composer_display_name(ob)
+    if n_name and not o_name:
+        return True
+    n_upd = nb.get("lastUpdatedAt") or nb.get("updatedAt") or 0
+    o_upd = ob.get("lastUpdatedAt") or ob.get("updatedAt") or 0
+    try:
+        n_upd = int(n_upd or 0)
+        o_upd = int(o_upd or 0)
+    except (TypeError, ValueError):
+        n_upd = o_upd = 0
+    if n_name and n_upd > o_upd:
+        return True
+    if n_name and o_name and n_upd > o_upd:
+        return True
+    # Same emptiness: keep larger payload (more bubbles / metadata).
+    if n_name == o_name and len(str(new_val)) > int(len(str(old_val)) * 1.25) + 64:
+        return True
+    return False
+
+
 def _billing_match_notes(cid, local, evs):
     """Explain billed usage that can't be matched to a local chat title."""
     if cid == "_unattributed":
@@ -3514,7 +3634,7 @@ def _billing_match_notes(cid, local, evs):
         if top:
             note += f" Models: {top}."
         return {"unattributed": True, "billing_note": note}
-    if not local:
+    if not _local_context_present(local):
         agentish = cid.startswith("bc-")
         short = (cid[:20] + "…") if len(cid) > 22 else cid
         if agentish:
@@ -3545,7 +3665,7 @@ def _sessions_from_billing(events, local_by_id, meta, ws_names):
             continue
         local = local_by_id.get(cid) or {}
         info = dict(meta.get(cid) or {})
-        if local.get("title") and local["title"] != "(untitled)":
+        if not _is_untitled(local.get("title")):
             info["title"] = local["title"]
         elif cid == "_unattributed":
             info["title"] = "Other billed usage"
@@ -3565,6 +3685,7 @@ def _sessions_from_billing(events, local_by_id, meta, ws_names):
         sess.update(_billing_match_notes(cid, local, evs))
         if local.get("text"):
             sess["text"] = local["text"]
+            _fill_missing_title(sess, local["text"])
         sessions.append(sess)
         priced_all[cid] = priced
         turns_api[cid] = [{k: t[k] for k in (
@@ -3610,7 +3731,7 @@ def _header_meta(con):
             if branches and isinstance(branches[0], dict):
                 branch = branches[0].get("branchName") or ""
         meta[cid] = {
-            "title": blob.get("name") or "",
+            "title": _composer_display_name(blob),
             "subtitle": blob.get("subtitle") or "",
             "workspace_id": row["workspaceId"] or (ws.get("id") or ""),
             "workspace_path": uri.get("fsPath") or uri.get("path") or "",
@@ -3640,7 +3761,7 @@ def _header_meta(con):
             "created_ms": 0, "updated_ms": 0,
             "mode": "", "subagent": False, "draft": False, "archived": False,
         })
-        entry["title"] = entry["title"] or blob.get("name") or ""
+        entry["title"] = entry["title"] or _composer_display_name(blob)
         entry["created_ms"] = entry["created_ms"] or blob.get("createdAt") or 0
         entry["updated_ms"] = entry["updated_ms"] or blob.get("lastUpdatedAt") or 0
         entry["mode"] = entry["mode"] or blob.get("unifiedMode") or ""
@@ -3774,13 +3895,9 @@ def _session_from_turns(cid, meta, turns, ws_names):
         used[turn["model"]] += turn["requests"]
         blob.append(turn.get("text") or "")
     title = (meta.get("title") or "").strip()
-    if not title:
-        for turn in turns:
-            typed = (turn.get("text") or "").strip().split("\n", 1)[0]
-            if typed:
-                title = " ".join(typed.split())[:90]
-                break
-    title = title or "(untitled)"
+    if _is_untitled(title):
+        title = _title_from_text("\n".join(t.get("text") or "" for t in turns)) or title
+    title = title or UNTITLED_TITLE
     repo = (meta.get("repository") or "").strip()
     if not repo:
         ws_repo = _repo_from_path(meta.get("workspace_path") or "")
@@ -4094,11 +4211,13 @@ def scan_cursor(force=False):
                 stub = _session_stub_from_meta(cid, meta, ws_names)
                 if cid in billed_texts:
                     stub["text"] = billed_texts[cid]
+                    _fill_missing_title(stub, billed_texts[cid])
                 local_by_id[cid] = stub
-                if billed_texts.get(cid):
+                if billed_texts.get(cid) or not _is_untitled(stub.get("title")):
                     texts_by_cid[cid] = (
                         (stub.get("title") or "") + " " + (stub.get("subtitle") or "")
-                        + " " + billed_texts[cid])
+                        + " " + (stub.get("text") or billed_texts.get(cid) or "")
+                    ).strip()
             local_turns, local_priced = turns_api, priced_all
             billed_sessions, turns_api, priced_all = _sessions_from_billing(
                 billing["events"], local_by_id, meta, ws_names)
@@ -4112,6 +4231,19 @@ def scan_cursor(force=False):
                                 dst["text"] = src["text"]
                 if cid in billed_texts:
                     sess["text"] = billed_texts[cid]
+                # Billed turns ship with empty text; titles were frozen as (untitled)
+                # before bubble text was joined. Re-derive once chat text is present.
+                _fill_missing_title(
+                    sess,
+                    sess.get("text") or "",
+                    priced_all.get(cid) or [],
+                    (local_by_id.get(cid) or {}).get("text") or "",
+                )
+                if not _is_untitled(sess.get("title")) or sess.get("text"):
+                    texts_by_cid[cid] = (
+                        (sess.get("title") or "") + " " + (sess.get("subtitle") or "")
+                        + " " + (sess.get("text") or "")
+                    ).strip()
             billed_ids = {s["session_id"] for s in billed_sessions}
             current_uid = account.get("user_id") or ""
             prev_email = account.get("previous_email") or "previous Cursor account"
@@ -4146,7 +4278,7 @@ def scan_cursor(force=False):
             for sess in sessions:
                 local = local_by_id.get(sess["session_id"])
                 sess["account_label"] = sess.get("account_label") or account.get("email") or ""
-                if local and local.get("title") and local["title"] != "(untitled)":
+                if local and not _is_untitled(local.get("title")):
                     sess["title"] = local["title"]
                 if local:
                     if local.get("tracked_repos"):
@@ -5996,7 +6128,8 @@ class Handler(BaseHTTPRequestHandler):
                 mode = (qs.get("mode", ["ide"])[0] or "ide").strip().lower()
                 dest = _merged_store_path()
                 if mode == "ide":
-                    summary = import_ide_into(DB_PATH, dest_path=dest)
+                    rebuild = (qs.get("rebuild", ["1"])[0] or "1").strip() not in ("0", "false", "no")
+                    summary = import_ide_into(DB_PATH, dest_path=dest, rebuild=rebuild)
                 elif mode == "upload":
                     if not body:
                         raise ValueError("POST body must be a state.vscdb file")
@@ -6226,7 +6359,7 @@ section.collapsed > *:not(h2){display:none !important}
     <span id="lastref" title="When the data on this page was last loaded"></span>
   </span>
   <button class="primary" id="refresh"><span class="spin"></span>Refresh</button>
-  <button id="importIde" title="Merge Cursor IDE state.vscdb into this dashboard store">Import IDE store</button>
+  <button id="importIde" title="Rebuild dashboard store from Cursor IDE state.vscdb (replaces stale merged copy)">Rebuild from IDE store</button>
   <label class="sub" title="Upload a state.vscdb to merge into this dashboard store"
     style="display:inline-flex;align-items:center;gap:6px;cursor:pointer">
     Upload store<input type="file" id="uploadStore" accept=".vscdb,application/octet-stream" hidden>
@@ -7121,7 +7254,7 @@ function render(){
           mix.innerHTML+=(mix.innerHTML?'<br><br>':'')
             +`<b>Chat titles / PR context look thin</b> (${weak} of ${sess.length} chats). `
             +`Pools come from Cursor billing; names and PR badges come from the local IDE store. `
-            +`Click <b>Import IDE store</b> (or restart with <code>--import-ide</code>) so composerHeaders join again. `
+            +`Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>) so composerHeaders join again. `
             +`Also expand the “Cost by chat / session” section if it is collapsed (▸).`;
         }
       }
@@ -7190,7 +7323,7 @@ function render(){
     console.error('renderSessions', err);
     const el=document.getElementById('sessions');
     if(el) el.innerHTML='<tr><td class="sub">Could not render chat list ('+esc(err&&err.message||err)
-      +'). Check the browser console, then try Import IDE store + Refresh.</td></tr>';
+      +'). Check the browser console, then try Rebuild from IDE store + Refresh.</td></tr>';
   }
 }
 function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
