@@ -943,14 +943,15 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             self.assertEqual(keys, {"acme/app#10", "acme/app#11", "acme/app#12", "acme/app#13"})
             self.assertIn(cid, hints)
 
-    def test_clip_keeps_today_prs_off_yesterday_view(self):
+    def test_clip_keeps_all_session_prs_like_copilot(self):
+        """Match github_copilot_dashboard: clip spend by day, never strip PR refs."""
         sess = {
             "session_id": "s1",
             "title": "multi-day agent",
-            "first_day": "2026-09-11",
-            "last_day": "2026-09-11",
+            "first_day": "2026-09-12",
+            "last_day": "2026-09-12",
             "days": {
-                "2026-09-11": {
+                "2026-09-12": {
                     "cost_usd": 5.0, "requests": 1, "total_tokens": 10,
                     "input_tokens": 5, "output_tokens": 5,
                     "cache_read_tokens": 0, "cache_write_tokens": 0,
@@ -960,27 +961,19 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             "refs": {
                 "jira": [], "repos": [],
                 "prs": [
-                    {"key": "acme/app#24", "repo": "acme/app", "number": 24,
-                     "created": True, "first_day": "2026-09-11",
-                     "last_day": "2026-09-11", "days": ["2026-09-11"]},
-                    {"key": "acme/app#25", "repo": "acme/app", "number": 25,
-                     "created": True, "first_day": "2026-09-12",
-                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
-                    {"key": "acme/app#26", "repo": "acme/app", "number": 26,
-                     "created": True, "first_day": "2026-09-12",
-                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
+                    {"key": "acme/app#20", "repo": "acme/app", "number": 20, "created": True},
+                    {"key": "acme/app#24", "repo": "acme/app", "number": 24, "created": True},
+                    {"key": "acme/app#25", "repo": "acme/app", "number": 25, "created": True},
+                    {"key": "acme/app#26", "repo": "acme/app", "number": 26, "created": True},
+                    {"key": "acme/app#27", "repo": "acme/app", "number": 27, "created": True},
                 ],
             },
             "billed": True,
         }
-        yesterday = d._clip(sess, "2026-09-11", "2026-09-11")
-        self.assertEqual(
-            [p["key"] for p in yesterday["refs"]["prs"]], ["acme/app#24"])
         today = d._clip(sess, "2026-09-12", "2026-09-12")
-        self.assertIsNotNone(today)
         self.assertEqual(
-            {p["key"] for p in today["refs"]["prs"]},
-            {"acme/app#25", "acme/app#26"})
+            [p["key"] for p in today["refs"]["prs"]],
+            ["acme/app#20", "acme/app#24", "acme/app#25", "acme/app#26", "acme/app#27"])
 
 
 if __name__ == "__main__":
