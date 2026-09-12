@@ -2341,13 +2341,22 @@ def _cents_usd(value):
         return 0.0
 
 
-# Subscription included compute is split into two pools (cursor.com/dashboard):
-# Cursor Models (Auto + Composer) and Other Models (named / third-party APIs).
+# Subscription included compute is split into two pools (Cursor Settings →
+# Plan & Usage): Cursor Models and Other Models.
 POOL_CURSOR = "cursor"
 POOL_OTHER = "other"
 POOL_LABELS = {
     POOL_CURSOR: "Cursor Models",
     POOL_OTHER: "Other Models",
+}
+# Match Cursor Settings copy under Plan & Usage.
+POOL_DETAILS = {
+    POOL_CURSOR: "Includes Cursor Grok and Composer",
+    POOL_OTHER: "Named and third-party model APIs",
+}
+POOL_FOOTNOTES = {
+    POOL_CURSOR: "Additional usage beyond limits consumes Other Models quota or on-demand spend.",
+    POOL_OTHER: "Additional usage beyond limits consumes on-demand spend.",
 }
 RE_PCT_MSG = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
@@ -2415,9 +2424,9 @@ def _first_present(obj, *keys):
 def _model_pool(model, tier=None):
     """Classify a model into the subscription included-usage pool.
 
-    Cursor Models = Auto + Composer (dashboard `autoPercentUsed`).
-    Other Models = named / third-party APIs (dashboard `apiPercentUsed`).
-    `tier` from GetAggregatedUsageEvents: 2 = Cursor models, 1 = named.
+    Cursor Models (Settings: "Includes Cursor Grok and Composer") map to
+    dashboard `autoPercentUsed`. Other Models map to `apiPercentUsed`.
+    `tier` from GetAggregatedUsageEvents: 2 = Cursor Models, 1 = Other Models.
     """
     try:
         t = int(tier)
@@ -2428,7 +2437,8 @@ def _model_pool(model, tier=None):
     if t == 1:
         return POOL_OTHER
     m = _norm_model(model)
-    if m in ("auto", "default") or m.startswith("composer"):
+    # Cursor Models pool: Composer, Cursor Grok, and Auto (routes into this pool).
+    if m in ("auto", "default") or m.startswith("composer") or "grok" in m:
         return POOL_CURSOR
     return POOL_OTHER
 
@@ -2548,9 +2558,14 @@ def _model_utilization(summary, period=None, included_used=None, included_limit=
                 named_msg = "Estimated from Other Models metered spend this cycle"
 
     specs = (
-        ("cursor", "Cursor Models", "Auto + Composer", auto_pct, auto_msg),
-        ("other", "Other Models", "Named / third-party APIs", api_pct, named_msg),
-        ("total", "Total included", "Subscription included compute", total_pct, total_msg),
+        ("cursor", POOL_LABELS[POOL_CURSOR], POOL_DETAILS[POOL_CURSOR],
+         auto_pct, auto_msg or POOL_FOOTNOTES[POOL_CURSOR]),
+        ("other", POOL_LABELS[POOL_OTHER], POOL_DETAILS[POOL_OTHER],
+         api_pct, named_msg or POOL_FOOTNOTES[POOL_OTHER]),
+        # Keep a blended total for digests; the Plan & Usage UI emphasizes the
+        # two pools above (Cursor Models / Other Models).
+        ("total", "Total included", "Subscription included compute",
+         total_pct, total_msg),
     )
     pools = []
     for spec in specs:
@@ -6278,7 +6293,7 @@ section.collapsed > *:not(h2){display:none !important}
     <div class="sub" id="mtdNote"></div>
   </section>
   <section id="modelUtil" style="display:none">
-    <h2>Included model utilization</h2>
+    <h2>Included in plan</h2>
     <div class="sub range-meta" id="modelUtilMeta"></div>
     <div class="allow-grid" id="modelUtilGrid"></div>
     <table id="cycleModels"></table>
@@ -6652,8 +6667,8 @@ function poolBadge(pool){
   const id=pool==='cursor'?'cursor':'other';
   const label=id==='cursor'?'Cursor Models':'Other Models';
   const title=id==='cursor'
-    ? 'Included subscription pool: Auto + Composer'
-    : 'Included subscription pool: named / third-party APIs';
+    ? 'Included subscription pool: Cursor Grok and Composer (Settings → Plan & Usage)'
+    : 'Included subscription pool: named / third-party models (Settings → Plan & Usage)';
   return ` <span class="pool-badge ${id}" title="${title}">${label}</span>`;
 }
 function pctBar(pct){
@@ -6686,17 +6701,26 @@ function renderModelUtil(){
   if(m.reset_date) meta+=` · resets ${m.reset_date}`;
   document.getElementById('modelUtilMeta').textContent=unlim
     ? meta+' · plan reports unlimited included usage — pool percentages are not a cap.'
-    : meta+' · same Auto+Composer / named-model pools as cursor.com/dashboard. '
-      +'Allocated is 100% of each included pool; used and remaining are Cursor utilization '
-      +'(or included spend ÷ limit when Cursor omits percent fields).';
+    : meta+' · same pools as Cursor Settings → Plan & Usage: '
+      +'Cursor Models (Grok + Composer) and Other Models. '
+      +'Allocated is 100% of each included pool; used % matches the Settings bars '
+      +'(autoPercentUsed / apiPercentUsed).';
   const grid=document.getElementById('modelUtilGrid');
-  if(pools.length){
-    grid.innerHTML=pools.map(p=>{
+  // Prefer the two Plan & Usage pools; keep total as a trailing card if present.
+  const showPools=pools.length
+    ? [...pools].sort((a,b)=>{
+        const order={cursor:0,other:1,total:2};
+        return (order[a.id]??9)-(order[b.id]??9);
+      })
+    : [];
+  if(showPools.length){
+    grid.innerHTML=showPools.map(p=>{
       const metered=(p.metered_usd||0)>0.004
         ? `${usd(p.metered_usd)} metered this cycle`
         : '';
+      const primary=p.id==='cursor'?' primary':'';
       if(p.unlimited){
-        return `<div class="allow-card${p.id==='total'?' primary':''}">
+        return `<div class="allow-card${primary}">
           <div class="k">${esc(p.label)}</div>
           <div class="v">Unlimited <span class="sub">${esc(p.detail||'')}</span></div>
           <div class="sub">${esc([p.message,metered].filter(Boolean).join(' · '))}</div>
@@ -6708,12 +6732,12 @@ function renderModelUtil(){
         ? 'Included pool exhausted'
         : `${(rem||0).toFixed(0)}% remaining`;
       const alloc=p.allocated_pct==null?100:p.allocated_pct;
-      return `<div class="allow-card${p.id==='total'?' primary':''}">
-        <div class="k">${esc(p.label)}</div>
+      return `<div class="allow-card${primary}">
+        <div class="k">${esc(p.label)}${p.detail?` <span class="sub">— ${esc(p.detail)}</span>`:''}</div>
         <div class="v">${used.toFixed(0)}% used <span class="sub">of ${alloc}% allocated</span></div>
         <div class="allow-rem${used>=100?' over':''}">${remTxt}</div>
         ${pctBar(used)}
-        <div class="sub">${esc([p.detail,p.message,metered].filter(Boolean).join(' · '))}</div>
+        <div class="sub">${esc([p.message,metered].filter(Boolean).join(' · '))}</div>
       </div>`;
     }).join('');
   } else if(m.included_limit>0){

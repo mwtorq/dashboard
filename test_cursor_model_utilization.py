@@ -82,11 +82,30 @@ class ModelPoolTests(unittest.TestCase):
     def test_named_models_are_other(self):
         self.assertEqual(d._model_pool("claude-4.6-opus"), "other")
         self.assertEqual(d._model_pool("gpt-5"), "other")
-        self.assertEqual(d._model_pool("grok-4.6"), "other")
+
+    def test_grok_is_cursor_models_pool(self):
+        # Settings → Plan & Usage: "Cursor Models — Includes Cursor Grok and Composer"
+        self.assertEqual(d._model_pool("grok-4.6"), "cursor")
+        self.assertEqual(d._model_pool("cursor-grok"), "cursor")
+        self.assertEqual(d._model_pool("grok-code"), "cursor")
 
     def test_tier_overrides_name(self):
         self.assertEqual(d._model_pool("claude-4.6-opus", tier=2), "cursor")
         self.assertEqual(d._model_pool("composer-2", tier=1), "other")
+        self.assertEqual(d._model_pool("grok-4.6", tier=1), "other")
+
+    def test_pool_labels_match_settings_pane(self):
+        util = d._model_utilization({
+            "individualUsage": {
+                "plan": {"autoPercentUsed": 13, "apiPercentUsed": 100, "totalPercentUsed": 40}
+            }
+        }, {})
+        by_id = {p["id"]: p for p in util["pools"]}
+        self.assertEqual(by_id["cursor"]["label"], "Cursor Models")
+        self.assertEqual(by_id["cursor"]["detail"], "Includes Cursor Grok and Composer")
+        self.assertEqual(by_id["cursor"]["used_pct"], 13.0)
+        self.assertEqual(by_id["other"]["label"], "Other Models")
+        self.assertEqual(by_id["other"]["used_pct"], 100.0)
 
 
 class UtilizationTests(unittest.TestCase):
@@ -216,7 +235,8 @@ class PageMarkupTests(unittest.TestCase):
     def test_dashboard_html_includes_utilization_section(self):
         html = d.PAGE
         self.assertIn('id="modelUtil"', html)
-        self.assertIn("Included model utilization", html)
+        self.assertIn("Included in plan", html)
+        self.assertIn("Cursor Models (Grok + Composer)", html)
         self.assertIn("function renderModelUtil()", html)
         self.assertIn("used of", html)
         self.assertIn("allocated", html)

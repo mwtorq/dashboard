@@ -537,7 +537,7 @@ inventing a dollar figure.
 Included subscription compute is also split into two utilization pools, the
 same bars as cursor.com/dashboard:
 
-- **Cursor Models** — Auto + Composer (`autoPercentUsed`)
+- **Cursor Models** — Includes Cursor Grok and Composer (`autoPercentUsed`)
 - **Other Models** — named / third-party APIs (`apiPercentUsed`)
 
 Allocated is 100% of each included pool; used and remaining are Cursor's
@@ -575,14 +575,15 @@ filter.
   budget defaults to **$70** (Pro Plus) and is overridden by the billing API
   when available; `--budget` or the banner input persists to
   `cost-dashboard-state.json` beside the Cursor store.
-- **Included model utilization** — the two subscription compute pools from
-  [cursor.com/dashboard](https://cursor.com/dashboard): *Cursor Models*
-  (Auto + Composer) and *Other Models* (named / third-party APIs), plus the
-  blended total. Each pool shows allocated (100% of included compute), used,
-  and remaining percentages from `autoPercentUsed` / `apiPercentUsed` /
-  `totalPercentUsed` (or the matching display-message fallback on team
-  accounts). A per-model table for the billing cycle comes from
-  `get-aggregated-usage-events` (same source as the official dashboard).
+- **Included in plan** — the two subscription compute pools from
+  Settings → Plan & Usage / [cursor.com/dashboard](https://cursor.com/dashboard):
+  *Cursor Models* (Includes Cursor Grok and Composer) and *Other Models*
+  (named / third-party APIs), plus the blended total. Each pool shows
+  allocated (100% of included compute), used, and remaining percentages from
+  `autoPercentUsed` / `apiPercentUsed` / `totalPercentUsed` (or the matching
+  display-message fallback on team accounts). A per-model table for the
+  billing cycle comes from `get-aggregated-usage-events` (same source as the
+  official dashboard). Grok is classified in the Cursor Models pool.
 - **Daily spend** bar chart, with on-demand called out separately from
   included usage.
 - **Cost by work item** — *Sessions* / *Repositories* / *Pull requests* tabs,
