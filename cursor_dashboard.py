@@ -6319,7 +6319,7 @@ section.collapsed > *:not(h2){display:none !important}
     <div class="sub" id="rollupfoot"></div>
   </section>
   <section><h2>Cost by model</h2><table id="models"></table></section>
-  <section><h2>Cost by chat / session <span class="sub">(click a row for per-turn detail)</span></h2>
+  <section id="chatSessions"><h2>Cost by chat / session <span class="sub">(click a row for per-turn detail)</span></h2>
     <table id="sessions"></table></section>
   <div class="sub" id="foot"></div>
 </main>
@@ -6372,16 +6372,20 @@ const prUrl=k=>{const [r,n]=k.split('#');return `https://github.com/${r}/pull/${
 const repoUrl=r=>`https://github.com/${r}`;
 const MAXB=4;
 function badges(refs){
+  // Defensive: incomplete refs must never abort the sessions table render.
   if(!refs) return '';
+  const jira=refs.jira||[];
+  const prs=refs.prs||[];
+  const repos=refs.repos||[];
   const out=[];
-  refs.jira.slice(0,MAXB).forEach(k=>{const u=jiraUrl(k);
+  jira.slice(0,MAXB).forEach(k=>{const u=jiraUrl(k);
     out.push(u?`<a class="b jira" href="${u}" target="_blank" title="Jira ${k}">${k}</a>`
               :`<span class="b jira" title="Set --jira-base to link">${k}</span>`);});
-  if(refs.jira.length>MAXB) out.push(`<span class="b more">+${refs.jira.length-MAXB} Jira</span>`);
-  refs.prs.slice(0,MAXB).forEach(p=>out.push(
+  if(jira.length>MAXB) out.push(`<span class="b more">+${jira.length-MAXB} Jira</span>`);
+  prs.slice(0,MAXB).forEach(p=>out.push(
     `<a class="b ${p.inferred?'gitinf':(p.created?'prnew':'pr')}" href="${prUrl(p.key)}" target="_blank" title="${p.inferred?'PR inferred from merge commit near billed usage':(p.created?'PR created in this chat':'PR referenced')}: ${p.key}">${p.inferred?'≈ ':''}${p.created?'✚ ':''}#${p.number}</a>`));
-  if(refs.prs.length>MAXB) out.push(`<span class="b more">+${refs.prs.length-MAXB} PR</span>`);
-  refs.repos.filter(r=>r.role==='primary'||r.role==='inferred').slice(0,3).forEach(r=>out.push(
+  if(prs.length>MAXB) out.push(`<span class="b more">+${prs.length-MAXB} PR</span>`);
+  repos.filter(r=>r.role==='primary'||r.role==='inferred').slice(0,3).forEach(r=>out.push(
     `<a class="b ${r.role==='inferred'?'gitinf':'repo'}" href="${repoUrl(r.name)}" target="_blank" title="${r.role==='inferred'?'Inferred from nearby git commits (±8h)':'Primary tracked repo'}">${r.role==='inferred'?'≈ ':''}${r.name.split('/').pop()}</a>`));
   return out.length?`<div class="badges">${out.join('')}</div>`:'';
 }
@@ -7040,8 +7044,9 @@ function render(){
     mtdEl.style.display='none';
   }
 
-  const mx=Math.max(...DATA.daily.map(d=>d.cost_usd),0.0001);
-  document.getElementById('spark').innerHTML=DATA.daily.map(d=>{
+  const daily=DATA.daily||[];
+  const mx=Math.max(...daily.map(d=>d.cost_usd),0.0001);
+  document.getElementById('spark').innerHTML=daily.map(d=>{
     const od=billed?(d.on_demand_usd||0):(d.est_usd||0);
     const base=Math.max(d.cost_usd-od,0);
     const h=Math.max(1,d.cost_usd/mx*100);
@@ -7050,27 +7055,49 @@ function render(){
       +(od>0?` · ${usd(base)} ${billed?'included':'measured'} + ${usd(od)} ${billed?'on-demand':'est.'}`:'')+`">`
       +`<i class="m" style="height:${100-ep}%"></i><i class="e" style="height:${ep}%"></i></div>`;
   }).join('');
-  const anySplit=DATA.daily.some(d=>billed?(d.on_demand_usd||0)>0:(d.est_usd||0)>0);
-  document.getElementById('sparklabel').innerHTML=DATA.daily.length
-    ? `<span class="sparkkey"><span>${DATA.daily[0].day} → ${DATA.daily[DATA.daily.length-1].day} `
+  const anySplit=daily.some(d=>billed?(d.on_demand_usd||0)>0:(d.est_usd||0)>0);
+  document.getElementById('sparklabel').innerHTML=daily.length
+    ? `<span class="sparkkey"><span>${daily[0].day} → ${daily[daily.length-1].day} `
       +`· peak ${usd(mx)}/day</span>`
       +`<span><b style="background:var(--acc)"></b>${billed?'allowance metered':'measured tokens'}</span>`
       +(anySplit?`<span><b style="background:#d29922"></b>${billed?'on-demand metered (USAGE_BASED events)':'estimated from transcript'}</span>`:'')
       +'</span>' : 'no data';
 
-  const mmax=Math.max(...DATA.models.map(m=>m.cost_usd),0.0001);
+  const models=DATA.models||[];
+  const mmax=Math.max(...models.map(m=>m.cost_usd),0.0001);
   document.getElementById('models').innerHTML=
     '<thead><tr><th>Model</th><th>Pool</th><th>Requests</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th>'
     +`<th title="${costThTitle(billed)}">Cost</th><th>Share</th></tr></thead><tbody>`+
-    DATA.models.map(m=>`<tr><td>${m.model}${m.est?' <span class="b est" title="Includes estimated token data">est</span>':''}${m.known_rate?'':' <span class="b more" title="No published rate for this model id; Auto rates assumed">assumed rate</span>'}</td><td>${poolBadge(m.pool||'other')}</td><td>${num(m.requests)}</td><td>${kt(m.input_tokens)}</td>
+    models.map(m=>`<tr><td>${m.model}${m.est?' <span class="b est" title="Includes estimated token data">est</span>':''}${m.known_rate?'':' <span class="b more" title="No published rate for this model id; Auto rates assumed">assumed rate</span>'}</td><td>${poolBadge(m.pool||'other')}</td><td>${num(m.requests)}</td><td>${kt(m.input_tokens)}</td>
       <td>${kt(m.cache_write_tokens)}</td><td>${kt(m.cache_read_tokens)}</td><td>${kt(m.output_tokens)}</td>
       <td class="cost">${costCell(m,billed)}</td><td style="width:160px"><div class="bar" style="width:${m.cost_usd/mmax*100}%"></div></td></tr>`).join('')+
     '</tbody>';
 
+  // Warn when billed rows lack local titles/repos — usually a stale/empty IDE store join.
+  try{
+    const sess=DATA.sessions||[];
+    if(DATA.billed && sess.length){
+      const weak=sess.filter(s=>{
+        const t=(s.title||'').trim();
+        return s.orphan_billed || s.unattributed || !t || t==='(untitled)';
+      }).length;
+      if(weak/sess.length>=0.4){
+        const mix=document.getElementById('mixnote');
+        if(mix){
+          mix.innerHTML+=(mix.innerHTML?'<br><br>':'')
+            +`<b>Chat titles / PR context look thin</b> (${weak} of ${sess.length} chats). `
+            +`Pools come from Cursor billing; names and PR badges come from the local IDE store. `
+            +`Click <b>Import IDE store</b> (or restart with <code>--import-ide</code>) so composerHeaders join again. `
+            +`Also expand the “Cost by chat / session” section if it is collapsed (▸).`;
+        }
+      }
+    }
+  }catch(err){ console.error('storeJoinHint', err); }
   const q=DATA.q||'';
   document.getElementById('qnote').textContent=
     q?`filtered by "${q}" — ${DATA.sessions.length} chat${DATA.sessions.length===1?'':'s'}`:'';
-  let rows=DATA.sessions.slice();
+  try{
+  let rows=(DATA.sessions||[]).slice();
   rows.sort((a,b)=>((a[sortKey]>b[sortKey])-(a[sortKey]<b[sortKey]))*sortDir);
   const cols=[['title','Chat'],['top_model','Model'],['turns','Turns'],['requests','Reqs'],
     ['input_tokens','Input'],['cache_read_tokens','Cache R'],
@@ -7084,9 +7111,15 @@ function render(){
       const wt=s.shared_attribution==='git-weighted'&&s.repo_weights
         ? ' · '+Object.entries(s.repo_weights).map(([n,w])=>n.split('/').pop()+' '+(w*100).toFixed(0)+'%').join(' · ')
         : '';
+      const detailParts=[];
+      if(s.repository) detailParts.push(s.repository);
+      if(s.branch) detailParts.push(s.branch);
+      if(s.subtitle && s.subtitle!==s.title) detailParts.push(s.subtitle);
+      const detailLine=detailParts.length?detailParts.join(' · '):'—';
       const sub=s.billing_note
         ? `<div class="sub billing-note">${esc(s.billing_note)}</div>`
-        : `<div class="sub">${esc(s.repository||'—')}${s.branch?' · '+esc(s.branch):''}${wt}</div>`;
+          + (detailParts.length?`<div class="sub">${esc(detailLine)}${wt}</div>`:'')
+        : `<div class="sub">${esc(detailLine)}${wt}</div>`;
       const sharedBadge=s.shared_attribution==='git-weighted'&&s.repo_weights
         ? ` <span class="b gitinf" title="Multi-root split by git commits/PRs during this chat (not equal shares)">git split · ${Object.keys(s.repo_weights).length} repos</span>`
         : (s.shared_attribution==='unconfirmed'&&(s.repo_split>1||0)
@@ -7119,8 +7152,14 @@ function render(){
     `${rows.length} chats shown · ${DATA.billed?'Cursor billed usage events':'local transcript estimate'}`
     +(billed?' · Cost: allowance (purple) + on-demand (gold)':'')
     +` · ${DATA.db}`;
+  }catch(err){
+    console.error('renderSessions', err);
+    const el=document.getElementById('sessions');
+    if(el) el.innerHTML='<tr><td class="sub">Could not render chat list ('+esc(err&&err.message||err)
+      +'). Check the browser console, then try Import IDE store + Refresh.</td></tr>';
+  }
 }
-function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 async function toggle(tr){
   if(tr.nextElementSibling&&tr.nextElementSibling.classList.contains('turns')){
     tr.nextElementSibling.remove(); tr.querySelector('.expand').textContent='▸'; return;}
@@ -7269,7 +7308,8 @@ document.getElementById('auto').onchange=e=>setAuto(e.target.checked);
 setAuto(document.getElementById('auto').checked);
 document.querySelectorAll('main section').forEach(s=>{
   const h=s.querySelector('h2'); if(!h) return;
-  const key='fold:'+h.textContent.trim().slice(0,40);
+  // Prefer stable section ids so heading stamp changes (pools-vN) do not orphan fold state.
+  const key='fold:'+(s.id || h.textContent.trim().slice(0,40));
   const b=document.createElement('button');
   b.className='fold'; b.title='Collapse or expand this section';
   const paint=c=>{b.textContent=c?'▸':'▾'; b.setAttribute('aria-expanded',!c);};
