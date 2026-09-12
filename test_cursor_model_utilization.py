@@ -240,6 +240,10 @@ class PageMarkupTests(unittest.TestCase):
         self.assertIn("function renderModelUtil()", html)
         self.assertIn("used of", html)
         self.assertIn("allocated", html)
+        # Local visibility: always show when billed; stamp proves new build.
+        self.assertIn("build pools-v2", html)
+        self.assertIn("Always show for billed accounts", html)
+        self.assertIn("Includes Cursor Grok and Composer", html)
 
 
 if __name__ == "__main__":
