@@ -240,10 +240,13 @@ class PageMarkupTests(unittest.TestCase):
         self.assertIn("function renderModelUtil()", html)
         self.assertIn("used of", html)
         self.assertIn("allocated", html)
-        # Local visibility: always show when billed; stamp proves new build.
-        self.assertIn("build pools-v2", html)
-        self.assertIn("Always show for billed accounts", html)
+        # Section must be visible in HTML even before JS runs.
+        self.assertNotIn('id="modelUtil" style="display:none"', html)
+        self.assertIn("pools-v3", html)
+        self.assertIn("Never hide this section", html)
         self.assertIn("Includes Cursor Grok and Composer", html)
+        # Placed above plan-allowance so it is not missed.
+        self.assertLess(html.find('id="modelUtil"'), html.find('id="mtd"'))
 
 
 if __name__ == "__main__":
