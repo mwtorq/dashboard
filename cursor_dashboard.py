@@ -2402,6 +2402,16 @@ def _parse_percent_from_message(msg):
     return _finite_pct(m.group(1)) if m else None
 
 
+def _first_present(obj, *keys):
+    """Return the first present value for any key name (API field aliases)."""
+    if not isinstance(obj, dict):
+        return None
+    for key in keys:
+        if key in obj and obj.get(key) is not None and obj.get(key) != "":
+            return obj.get(key)
+    return None
+
+
 def _model_pool(model, tier=None):
     """Classify a model into the subscription included-usage pool.
 
@@ -2450,39 +2460,93 @@ def _pool_row(pool_id, label, detail, used_pct, message, unlimited):
     }
 
 
-def _model_utilization(summary, period=None):
+def _model_utilization(summary, period=None, included_used=None, included_limit=None,
+                       pool_spend=None):
     """Included model-pool utilization from usage-summary + get-current-period-usage.
 
-    Allocated is 100% of each included pool. Used/remaining are Cursor's
-    `autoPercentUsed` / `apiPercentUsed` / `totalPercentUsed` (or the
-    matching display-message percentages on team accounts). These are not a
-    simple includedSpend/limit split — cursor.com shows them as their own bars.
+    Allocated is 100% of each included pool. Used/remaining prefer Cursor's
+    `autoPercentUsed` / `apiPercentUsed` / `totalPercentUsed` (plus display-message
+    and field-name aliases). When those are absent, fall back to included
+    spend ÷ limit for the total pool and to metered pool share for Auto vs named.
     """
     summary = summary or {}
     period = period or {}
-    indiv = summary.get("individualUsage") or {}
+    indiv = (summary.get("individualUsage") or summary.get("individual_usage")
+             or summary.get("usage") or {})
     plan = indiv.get("plan") or {}
-    plan_usage = (period or {}).get("planUsage") or {}
-    unlimited = bool(summary.get("isUnlimited"))
-    auto_msg = (summary.get("autoModelSelectedDisplayMessage")
-                or period.get("autoModelSelectedDisplayMessage") or "")
-    named_msg = (summary.get("namedModelSelectedDisplayMessage")
-                 or period.get("namedModelSelectedDisplayMessage") or "")
-    total_msg = period.get("displayMessage") or ""
+    plan_usage = ((period or {}).get("planUsage")
+                  or (period or {}).get("plan_usage") or {})
+    unlimited = bool(_first_present(summary, "isUnlimited", "unlimited")
+                     or _first_present(plan, "unlimited"))
+    auto_msg = (_first_present(
+        summary, "autoModelSelectedDisplayMessage",
+        "autoModelSelectedDisplayMessage", "autoModelDisplayMessage")
+        or _first_present(
+            period, "autoModelSelectedDisplayMessage",
+            "autoModelSelectedDisplayMessage", "autoModelDisplayMessage")
+        or "")
+    named_msg = (_first_present(
+        summary, "namedModelSelectedDisplayMessage",
+        "namedModelSelectedDisplayMessage", "namedModelDisplayMessage")
+        or _first_present(
+            period, "namedModelSelectedDisplayMessage",
+            "namedModelSelectedDisplayMessage", "namedModelDisplayMessage")
+        or "")
+    total_msg = (_first_present(period, "displayMessage", "display_message")
+                 or _first_present(summary, "displayMessage", "display_message")
+                 or "")
 
     def _pct(*candidates):
         for raw in candidates:
-            n = _finite_pct(raw)
+            if isinstance(raw, str) and "%" in raw:
+                n = _parse_percent_from_message(raw)
+            else:
+                n = _finite_pct(raw)
             if n is not None:
                 return n
         return None
 
-    auto_pct = _pct(plan.get("autoPercentUsed"), plan_usage.get("autoPercentUsed"),
+    auto_keys = ("autoPercentUsed", "autoPercentUsed", "auto_percent_used",
+                 "autoPctUsed", "auto_pct")
+    api_keys = ("apiPercentUsed", "apiPercentUsed", "api_percent_used",
+                "namedPercentUsed", "apiPctUsed", "api_pct")
+    total_keys = ("totalPercentUsed", "totalPercentUsed", "total_percent_used",
+                  "totalPctUsed", "total_pct")
+
+    auto_pct = _pct(_first_present(plan, *auto_keys),
+                    _first_present(plan_usage, *auto_keys),
                     _parse_percent_from_message(auto_msg))
-    api_pct = _pct(plan.get("apiPercentUsed"), plan_usage.get("apiPercentUsed"),
+    api_pct = _pct(_first_present(plan, *api_keys),
+                   _first_present(plan_usage, *api_keys),
                    _parse_percent_from_message(named_msg))
-    total_pct = _pct(plan.get("totalPercentUsed"), plan_usage.get("totalPercentUsed"),
+    total_pct = _pct(_first_present(plan, *total_keys),
+                     _first_present(plan_usage, *total_keys),
                      _parse_percent_from_message(total_msg))
+
+    # Dollar-limit fallback for the total bar when Cursor omits percent fields.
+    if total_pct is None and included_limit and included_limit > 0 and included_used is not None:
+        total_pct = max(0.0, float(included_used) / float(included_limit) * 100.0)
+        if not total_msg:
+            total_msg = (f"Derived from included spend "
+                         f"(${float(included_used):,.2f} of "
+                         f"${float(included_limit):,.2f})")
+
+    # If Auto / named percents are missing but we have per-pool metered spend,
+    # approximate each pool's share of the included limit (same dollars Cursor
+    # already reports for the cycle). Prefer API percents when present.
+    spend = pool_spend or {}
+    cursor_spend = float(spend.get(POOL_CURSOR) or 0)
+    other_spend = float(spend.get(POOL_OTHER) or 0)
+    if included_limit and included_limit > 0:
+        if auto_pct is None and cursor_spend > 0:
+            auto_pct = max(0.0, cursor_spend / float(included_limit) * 100.0)
+            if not auto_msg:
+                auto_msg = "Estimated from Cursor Models metered spend this cycle"
+        if api_pct is None and other_spend > 0:
+            api_pct = max(0.0, other_spend / float(included_limit) * 100.0)
+            if not named_msg:
+                named_msg = "Estimated from Other Models metered spend this cycle"
+
     specs = (
         ("cursor", "Cursor Models", "Auto + Composer", auto_pct, auto_msg),
         ("other", "Other Models", "Named / third-party APIs", api_pct, named_msg),
@@ -2493,10 +2557,22 @@ def _model_utilization(summary, period=None):
         row = _pool_row(*spec, unlimited)
         if row:
             pools.append(row)
-    on_demand = indiv.get("onDemand") or (summary.get("teamUsage") or {}).get("onDemand") or {}
+
+    # Unlimited plans still get the three cards so the section is visible.
+    if unlimited and not pools:
+        for spec in specs:
+            row = _pool_row(spec[0], spec[1], spec[2], 0.0, spec[4], True)
+            if row:
+                pools.append(row)
+
+    on_demand = (indiv.get("onDemand") or indiv.get("on_demand")
+                 or (summary.get("teamUsage") or {}).get("onDemand")
+                 or (summary.get("teamUsage") or {}).get("on_demand")
+                 or {})
     return {
         "unlimited": unlimited,
-        "membership": summary.get("membershipType") or "",
+        "membership": (_first_present(summary, "membershipType", "membership_type",
+                                      "plan") or ""),
         "pools": pools,
         "auto_pct": auto_pct,
         "api_pct": api_pct,
@@ -2514,13 +2590,20 @@ def _parse_aggregated_usage(raw):
     for item in raw or []:
         if not isinstance(item, dict):
             continue
-        model = _norm_model(item.get("modelIntent") or item.get("model") or "unknown")
-        inn = _int_tokens(item.get("inputTokens"))
-        out = _int_tokens(item.get("outputTokens"))
-        cwrite = _int_tokens(item.get("cacheWriteTokens"))
-        cread = _int_tokens(item.get("cacheReadTokens"))
+        model = _norm_model(
+            item.get("modelIntent") or item.get("model")
+            or item.get("modelName") or item.get("name") or "unknown")
+        inn = _int_tokens(item.get("inputTokens") or item.get("input_tokens"))
+        out = _int_tokens(item.get("outputTokens") or item.get("output_tokens"))
+        cwrite = _int_tokens(
+            item.get("cacheWriteTokens") or item.get("cache_write_tokens"))
+        cread = _int_tokens(
+            item.get("cacheReadTokens") or item.get("cache_read_tokens"))
+        cents = item.get("totalCents")
+        if cents is None:
+            cents = item.get("total_cents")
         try:
-            cost = float(item.get("totalCents") or 0) / 100.0
+            cost = float(cents or 0) / 100.0
         except (TypeError, ValueError):
             cost = 0.0
         pool = _model_pool(model, item.get("tier"))
@@ -2535,7 +2618,9 @@ def _parse_aggregated_usage(raw):
             "cache_read_tokens": cread,
             "total_tokens": inn + out + cwrite + cread,
             "cost_usd": round(cost, 6),
-            "requests": _int_tokens(item.get("requests") or item.get("numRequests")),
+            "requests": _int_tokens(
+                item.get("requests") or item.get("numRequests")
+                or item.get("requestCount")),
         })
     rows.sort(key=lambda r: -r["cost_usd"])
     total = sum(r["cost_usd"] for r in rows)
@@ -2554,17 +2639,38 @@ def _pool_spend(rows):
 
 def _fetch_aggregated_usage(cookie, summary):
     """Per-model cycle totals from cursor.com (same table as the official dashboard)."""
-    start_ms = _iso_to_ms(summary.get("billingCycleStart"))
-    end_ms = _iso_to_ms(summary.get("billingCycleEnd")) or int(
-        time.time() * 1000)
+    start_ms = _iso_to_ms(
+        _first_present(summary, "billingCycleStart", "billing_cycle_start"))
+    end_ms = _iso_to_ms(
+        _first_present(summary, "billingCycleEnd", "billing_cycle_end")) or int(
+            time.time() * 1000)
     if not start_ms:
         return []
-    chunk = _api(cookie, "POST", "/api/dashboard/get-aggregated-usage-events", {
-        "teamId": 0,
-        "startDate": str(start_ms),
-        "endDate": str(end_ms),
-    })
-    return chunk.get("aggregations") or []
+    bodies = [
+        {"teamId": 0, "startDate": str(start_ms), "endDate": str(end_ms)},
+        {"teamId": 0, "startDate": start_ms, "endDate": end_ms},
+    ]
+    paths = (
+        "/api/dashboard/get-aggregated-usage-events",
+        "/api/dashboard/get-aggregated-usage-events",
+    )
+    last_exc = None
+    for path in paths:
+        for body in bodies:
+            try:
+                chunk = _api(cookie, "POST", path, body)
+            except Exception as exc:
+                last_exc = exc
+                continue
+            rows = (chunk.get("aggregations")
+                    or chunk.get("usageAggregations")
+                    or chunk.get("aggregatedUsage")
+                    or [])
+            if rows:
+                return rows
+    if last_exc:
+        raise last_exc
+    return []
 
 
 PLAN_FEE_LABELS = {
@@ -2777,6 +2883,8 @@ def _save_billing_cache(email, one):
         "events": one.get("events") or [],
         "invoices": one.get("invoices") or [],
         "aggregations": one.get("aggregations") or [],
+        "summary": one.get("summary") or {},
+        "period": one.get("period") or {},
     }
     path = _billing_cache_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2800,8 +2908,8 @@ def _cached_account_billing(email):
         "me": {"email": email, "id": entry.get("user_id")},
         "email": email,
         "user_id": entry.get("user_id") or "",
-        "summary": {},
-        "period": {},
+        "summary": entry.get("summary") or {},
+        "period": entry.get("period") or {},
         "events": entry["events"],
         "invoices": entry.get("invoices") or [],
         "aggregations": entry.get("aggregations") or [],
@@ -4806,11 +4914,25 @@ def _cycle_mtd(data, today):
     mtd_sessions = [c for c in (_clip(s, start_s or MIN_DAY, end_s or MAX_DAY)
                                 for s in data["sessions"] if s.get("billed")) if c] if start_s else []
     cycle_tokens = sum(s["total_tokens"] or 0 for s in mtd_sessions)
-    util = _model_utilization(summary, period)
     cycle_models = list(data.get("billing_aggregations") or [])
     if not cycle_models and mtd_sessions:
         cycle_models, _ = _aggregate(mtd_sessions)
     spend = _pool_spend(cycle_models)
+    util = _model_utilization(
+        summary, period,
+        included_used=included_used,
+        included_limit=included_limit,
+        pool_spend=spend,
+    )
+    # Last-resort total bar so the section appears whenever plan allowance does.
+    if not util["pools"] and included_limit and included_limit > 0:
+        pct = (float(included_used or 0) / float(included_limit) * 100.0)
+        row = _pool_row(
+            "total", "Total included", "Subscription included compute",
+            pct, "Derived from included spend ÷ plan limit", False)
+        if row:
+            util["pools"].append(row)
+            util["total_pct"] = pct
     for pool in util["pools"]:
         if pool["id"] in spend:
             pool["metered_usd"] = spend[pool["id"]]
@@ -6546,7 +6668,13 @@ function renderModelUtil(){
   const m=DATA.mtd||{};
   const pools=m.pools||[];
   const rows=DATA.cycle_models||m.cycle_models||[];
-  if(!DATA.billed||(!pools.length&&!rows.length)){
+  if(!DATA.billed){
+    el.style.display='none';
+    return;
+  }
+  // Show whenever we have pool cards, cycle model rows, or a plan allowance
+  // (so the section does not disappear when Cursor omits percent fields).
+  if(!pools.length&&!rows.length&&!(m.included_limit>0)&&!m.unlimited){
     el.style.display='none';
     return;
   }
@@ -6559,8 +6687,8 @@ function renderModelUtil(){
   document.getElementById('modelUtilMeta').textContent=unlim
     ? meta+' · plan reports unlimited included usage — pool percentages are not a cap.'
     : meta+' · same Auto+Composer / named-model pools as cursor.com/dashboard. '
-      +'Allocated is 100% of each included pool; used and remaining are Cursor utilization, '
-      +'not a simple spend ÷ dollar-limit split.';
+      +'Allocated is 100% of each included pool; used and remaining are Cursor utilization '
+      +'(or included spend ÷ limit when Cursor omits percent fields).';
   const grid=document.getElementById('modelUtilGrid');
   if(pools.length){
     grid.innerHTML=pools.map(p=>{
@@ -6588,6 +6716,17 @@ function renderModelUtil(){
         <div class="sub">${esc([p.detail,p.message,metered].filter(Boolean).join(' · '))}</div>
       </div>`;
     }).join('');
+  } else if(m.included_limit>0){
+    const used=m.included_usd||0, lim=m.included_limit||0;
+    const pct=lim?Math.min(999,(used/lim*100)):0;
+    grid.innerHTML=`<div class="allow-card primary">
+      <div class="k">Total included</div>
+      <div class="v">${pct.toFixed(0)}% used <span class="sub">of 100% allocated</span></div>
+      <div class="allow-rem${pct>=100?' over':''}">${pct>=100?'Included pool exhausted'
+        :`${Math.max(0,100-pct).toFixed(0)}% remaining`}</div>
+      ${pctBar(pct)}
+      <div class="sub">Derived from included spend (${usd(used)} of ${usd(lim)}). Cursor did not return Auto/named pool percentages for this account.</div>
+    </div>`;
   } else grid.innerHTML='';
   const tbl=document.getElementById('cycleModels');
   const foot=document.getElementById('cycleModelsFoot');

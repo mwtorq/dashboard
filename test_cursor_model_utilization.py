@@ -141,6 +141,27 @@ class UtilizationTests(unittest.TestCase):
         self.assertEqual(by_id["other"]["used_pct"], 15.0)
         self.assertTrue(util["on_demand_enabled"])
 
+    def test_falls_back_to_included_spend_over_limit(self):
+        # No percent fields and no display messages — still produce a total pool
+        # from included spend ÷ plan limit so the dashboard section can render.
+        summary = {
+            "membershipType": "pro",
+            "isUnlimited": False,
+            "individualUsage": {
+                "plan": {"enabled": True, "used": 2500, "limit": 10000, "remaining": 7500},
+                "onDemand": {"enabled": False},
+            },
+        }
+        util = d._model_utilization(
+            summary, {}, included_used=25.0, included_limit=100.0,
+            pool_spend={"cursor": 10.0, "other": 15.0})
+        by_id = {p["id"]: p for p in util["pools"]}
+        self.assertIn("total", by_id)
+        self.assertEqual(by_id["total"]["used_pct"], 25.0)
+        self.assertEqual(by_id["total"]["allocated_pct"], 100.0)
+        self.assertEqual(by_id["cursor"]["used_pct"], 10.0)
+        self.assertEqual(by_id["other"]["used_pct"], 15.0)
+
     def test_zero_percent_is_kept(self):
         summary = {
             "individualUsage": {
