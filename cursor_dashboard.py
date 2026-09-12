@@ -1288,12 +1288,10 @@ def _apply_git_activity_gate(sessions, refs, priced_all, activities, path_by_git
                 else:
                     kept_prs.append({**p, "role": "skipped"})
                 continue
-            if _pr_has_session_activity(pk, s, priced_all, activities, path_by_github):
-                kept_prs.append(p)
-            elif not p.get("bare"):
-                kept_prs.append(p)
-            else:
-                kept_prs.append({**p, "role": "skipped"})
+            # Keep every explicit mention (URL or bare). Skipping bare PRs without a
+            # nearby merge made multi-PR chats look like they only captured the latest
+            # PR that happened to sit next to a git merge.
+            kept_prs.append(p)
         r["prs"] = kept_prs
 
 
@@ -1850,10 +1848,74 @@ def _raw_mentions_pr(raw):
     if not isinstance(raw, str) or not raw:
         return False
     # Fast reject before regex — most bubbles have no PR markers.
-    if "/pull/" not in raw and "#" not in raw and "PR" not in raw and "pr" not in raw \
+    if "/pull/" not in raw and "/pulls/" not in raw and "#" not in raw \
+            and "PR" not in raw and "pr" not in raw \
             and "pull request" not in raw.lower():
         return False
-    return bool(RE_PR.search(raw) or RE_PR_SHORT.search(raw) or RE_PR_BARE.search(raw))
+    return bool(
+        RE_PR.search(raw) or RE_PR_API.search(raw)
+        or RE_PR_SHORT.search(raw) or RE_PR_BARE.search(raw))
+
+
+def _pr_links_from_raw(raw):
+    """Pull github.com / API PR links (and owner/repo#N) out of bubble JSON.
+
+    Agent tool results often store PR URLs outside `text` / `richText`. Sampling
+    keeps those bubbles, but without this scrape they never reach session refs —
+    so only the latest PR that appears in visible assistant text survives.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (dict, list)):
+        try:
+            raw = json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return []
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if not isinstance(raw, str) or not raw:
+        return []
+    if not _raw_mentions_pr(raw):
+        return []
+    out = []
+    seen = set()
+
+    def _add(s):
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    for owner, repo, num in RE_PR.findall(raw):
+        name = clean_repo(owner, repo)
+        if name:
+            _add(f"https://github.com/{name}/pull/{num}")
+    for owner, repo, num in RE_PR_API.findall(raw):
+        name = clean_repo(owner, repo)
+        if name:
+            _add(f"https://github.com/{name}/pull/{num}")
+    for owner, repo, num in RE_PR_SHORT.findall(raw):
+        name = clean_repo(owner, repo)
+        if name:
+            _add(f"{name}#{num}")
+    return out
+
+
+def _truncate_prefer_pr(text, limit=12000):
+    """Clip turn text but always retain PR links that would otherwise be cut."""
+    if not text or len(text) <= limit:
+        return text or ""
+    links = _pr_links_from_raw(text)
+    # Also keep bare PR # lines when present in the visible text.
+    for ln in text.split("\n"):
+        if RE_PR_BARE.search(ln) and ln.strip() not in links:
+            links.append(ln.strip())
+    clipped = text[:limit]
+    missing = [p for p in links if p not in clipped]
+    if not missing:
+        return clipped
+    tail = "\n" + "\n".join(missing)
+    keep = max(0, limit - len(tail))
+    return (clipped[:keep] + tail)[:limit]
 
 
 def _sample_indices_prefer_pr(n, cap, pr_indices, head_budget=None):
@@ -1927,7 +1989,8 @@ def _pr_candidate_raw_rows(con, prefix):
     try:
         return con.execute(
             "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? AND ("
-            "value LIKE '%/pull/%' OR value LIKE '%PR #%' OR value LIKE '%PR#%' "
+            "value LIKE '%/pull/%' OR value LIKE '%/pulls/%' "
+            "OR value LIKE '%PR #%' OR value LIKE '%PR#%' "
             "OR value LIKE '%pr #%' OR value LIKE '%pull request%' "
             "OR value LIKE '%Pull request%' OR value LIKE '%Pull Request%')",
             (prefix + "%",)).fetchall()
@@ -2001,6 +2064,12 @@ def _bubble_dict_from_raw(key, raw):
     tc = blob.get("tokenCount") or {}
     mi = blob.get("modelInfo") if isinstance(blob.get("modelInfo"), dict) else {}
     text = _bubble_text(blob)
+    # Tool / agent payloads often bury PR URLs outside text/richText — fold them in.
+    extra = _pr_links_from_raw(raw if raw is not None else blob)
+    if extra:
+        for link in extra:
+            if link not in (text or ""):
+                text = f"{text}\n{link}".strip() if text else link
     inn = float(tc.get("inputTokens") or 0)
     out = float(tc.get("outputTokens") or 0)
     btype = blob.get("type") or 2
@@ -2097,7 +2166,7 @@ def _attach_text_to_priced_turns(priced, bubble_rows):
             chunks[ti].append(text)
     for i, turn in enumerate(priced):
         if chunks[i]:
-            turn["text"] = "\n".join(chunks[i])[:12000]
+            turn["text"] = _truncate_prefer_pr("\n".join(chunks[i]), 12000)
 
 
 def _merge_ref_dicts(base, extra):
@@ -4915,6 +4984,9 @@ def _conversation_map_text(blob):
         if not isinstance(msg, dict):
             continue
         t = _bubble_text(msg)
+        for link in _pr_links_from_raw(msg):
+            if link not in (t or ""):
+                t = f"{t}\n{link}".strip() if t else link
         if t:
             texts.append(t)
     if not texts:
@@ -5029,7 +5101,8 @@ def _turns_from_bubbles(bubbles, default_model):
             "total_tokens": t_in + t_out + t_cache,
             "cost_usd": _cost(t_in, t_out, t_cache, model),
             "est": est,
-            "text": (turn["user_text"] + "\n" + turn["text"])[:12000],
+            "text": _truncate_prefer_pr(
+                turn["user_text"] + "\n" + turn["text"], 12000),
         })
     return priced
 
@@ -5677,6 +5750,8 @@ RE_JIRA_URL = re.compile(r"https?://([\w.-]+\.atlassian\.net)/browse/([A-Z][A-Z0
 RE_JIRA_ANY = re.compile(r"atlassian\.net/browse/([A-Z][A-Z0-9]{1,9}-\d+)")
 RE_JIRA_BARE = re.compile(r"\b([A-Z][A-Z0-9]{1,9})-(\d+)\b")
 RE_PR = re.compile(r"(?<![\w.])github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)")
+RE_PR_API = re.compile(
+    r"(?<![\w.])api\.github\.com/repos/([\w.-]+)/([\w.-]+)/pulls/(\d+)")
 RE_PR_SHORT = re.compile(r"(?<![\w./])([\w.-]+)/([\w.-]+)#(\d+)")
 RE_PR_BARE = re.compile(r"\b(?:PR|pull request)\s*#?\s*(\d+)\b", re.I)
 RE_REPO_URL = re.compile(r"(?<![\w.])github\.com/([\w.-]+)/([\w.-]+)")
