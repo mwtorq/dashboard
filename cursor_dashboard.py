@@ -2139,26 +2139,18 @@ def _stamp_pr_mention_days(refs, priced_all, turn_prs, pr_day_hints=None):
 
 
 def _filter_refs_to_day_range(refs_entry, start, end):
-    """Keep only PRs whose mention days overlap [start, end]."""
-    if not refs_entry:
-        return refs_entry
-    prs = []
-    for p in refs_entry.get("prs") or []:
-        fd = p.get("first_day") or ""
-        ld = p.get("last_day") or fd
-        if fd and ld:
-            if ld < start or fd > end:
-                continue
-        elif not (start <= MIN_DAY and end >= MAX_DAY):
-            # Undated PR on a bounded day view: omit so today's PR is not pinned
-            # onto yesterday just because the parent chat still has older spend.
-            continue
-        prs.append(p)
-    if prs == (refs_entry.get("prs") or []):
-        return refs_entry
-    out = dict(refs_entry)
-    out["prs"] = prs
-    return out
+    """Return refs unchanged.
+
+    Earlier day-scoping dropped PRs that lacked first_day/last_day stamps, so a
+    Today view only showed the few PRs that happened to get timestamps (e.g. #20
+    and #25) while other same-day PRs (#24, #26, #27, …) vanished. Session
+    visibility is already clipped by spend/mention days; PR badges must list
+    every PR on that chat, as they did before the day-filter regression.
+    """
+    del start, end
+    return refs_entry
+
+
 
 
 def _truncate_prefer_pr(text, limit=12000):
@@ -5473,38 +5465,27 @@ def _fill_totals(base):
 
 
 def _clip(session, start, end):
-    """Clip session spend to [start, end] and day-scope PR badges/refs.
+    """Restrict one chat to a date range, matching github_copilot_dashboard._vs_clip.
 
-    PRs are filtered by when they were mentioned (first_day/last_day), not by
-    the chat's first billed day — otherwise today's PRs show under yesterday.
+    Clip spend/days only. Keep refs.prs intact — day-filtering PRs hid same-day
+    PRs that lacked timestamps (Today showed only #20 and #25 while #24/#26/#27
+    vanished). Copilot never filters PR badges by day; Cursor must not either.
     """
     first, last = session.get("first_day") or "", session.get("last_day") or ""
-
-    def _with_day_scoped_refs(sess):
-        refs = sess.get("refs")
-        if not refs:
-            return sess
-        scoped = _filter_refs_to_day_range(refs, start, end)
-        if scoped is refs:
-            return sess
-        out = dict(sess)
-        out["refs"] = scoped
-        return out
-
     # Undated sessions (common for brand-new cloud agents) must not disappear on
     # All-time views: empty strings fail start<=first string compares.
     if not first and not last:
         if start <= MIN_DAY and end >= MAX_DAY:
-            return _with_day_scoped_refs(session)
+            return session
         if session.get("cloud_agent") and start <= MIN_DAY:
-            return _with_day_scoped_refs(session)
+            return session
     if first and last and start <= first and last <= end:
-        return _with_day_scoped_refs(session)
+        return session
     days = {d: c for d, c in (session.get("days") or {}).items()
             if d and start <= d <= end}
     if not days:
         # Still surface the chat on days it mentioned/created a PR, even when
-        # billing for that day has not landed yet (today's PR on yesterday's spend).
+        # billing for that day has not landed yet.
         mention_days = []
         for p in (session.get("refs") or {}).get("prs") or []:
             for d in p.get("days") or []:
@@ -5513,9 +5494,9 @@ def _clip(session, start, end):
             fd = p.get("first_day") or ""
             ld = p.get("last_day") or fd
             if fd and ld and not (ld < start or fd > end):
-                if fd >= start and fd <= end:
+                if start <= fd <= end:
                     mention_days.append(fd)
-                if ld >= start and ld <= end:
+                if start <= ld <= end:
                     mention_days.append(ld)
         mention_days = sorted(set(mention_days))
         if not mention_days:
@@ -5534,8 +5515,9 @@ def _clip(session, start, end):
     base = {k: session[k] for k in keep if k in session}
     base["days"] = days
     base["by_model_day"] = bmd
-    base["refs"] = _filter_refs_to_day_range(session.get("refs") or {}, start, end)
+    # Intentionally do NOT filter refs — same as github_copilot_dashboard._vs_clip.
     return _fill_totals(base)
+
 
 
 def _turn_maps_from_priced(priced_by_sid, refs=None, sessions_by_id=None,
