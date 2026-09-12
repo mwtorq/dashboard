@@ -1198,7 +1198,12 @@ def _pr_text_turn_costs(sid, items, turn_prs, turn_cost):
 
 
 def _pr_cost_entries(session, refs_entry, turn_prs=None, turn_cost=None):
-    """Return [(pr_item, cost_usd)] from turn text, git merge correlation, or both."""
+    """Return [(pr_item, cost_usd)] from turn text, git merge correlation, or both.
+
+    Explicitly mentioned (non-inferred) PRs are always included so the PR tab
+    lists every captured link — even when spend landed on a later PR in the
+    same chat. Inferred git-only PRs still require a positive cost.
+    """
     items = [p for p in (refs_entry.get("prs") or []) if p.get("role") != "skipped"]
     if not items:
         return []
@@ -1218,12 +1223,13 @@ def _pr_cost_entries(session, refs_entry, turn_prs=None, turn_cost=None):
             continue
         if p.get("inferred"):
             abs_cost = gc_prs.get(k) or git_costs.get(k) or 0
+            if abs_cost <= 0:
+                continue
         else:
             abs_cost = text_costs.get(k) or 0
             if abs_cost <= 0:
                 abs_cost = gc_prs.get(k) or git_costs.get(k) or 0
-        if abs_cost <= 0:
-            continue
+            # Keep $0 explicit mentions so earlier PRs in a long chat still roll up.
         out.append((p, abs_cost))
         seen.add(k)
     return out
@@ -1828,16 +1834,65 @@ def _bubble_sort_key(row):
     return (ts if ts is not None else 0, btype != 1, bid)
 
 
+def _text_mentions_pr(text):
+    """True when transcript text links or names a pull request."""
+    if not text:
+        return False
+    return bool(RE_PR.search(text) or RE_PR_SHORT.search(text) or RE_PR_BARE.search(text))
+
+
+def _raw_mentions_pr(raw):
+    """Cheap PR-link check on bubble JSON (URLs / short refs / bare PR #)."""
+    if raw is None:
+        return False
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if not isinstance(raw, str) or not raw:
+        return False
+    # Fast reject before regex — most bubbles have no PR markers.
+    if "/pull/" not in raw and "#" not in raw and "PR" not in raw and "pr" not in raw \
+            and "pull request" not in raw.lower():
+        return False
+    return bool(RE_PR.search(raw) or RE_PR_SHORT.search(raw) or RE_PR_BARE.search(raw))
+
+
+def _sample_indices_prefer_pr(n, cap, pr_indices, head_budget=None):
+    """Pick up to `cap` indices: all PR hits (prefer ends if too many), else fill head+tail."""
+    if n <= cap:
+        return list(range(n))
+    head_budget = BUBBLE_HEAD_PER_COMPOSER if head_budget is None else head_budget
+    head = min(head_budget, cap // 2)
+    pr_sorted = sorted({i for i in pr_indices if 0 <= i < n})
+    if len(pr_sorted) >= cap:
+        tail = cap - head
+        if tail <= 0:
+            return pr_sorted[:cap]
+        return pr_sorted[:head] + pr_sorted[-tail:]
+    selected = set(pr_sorted)
+    remaining = cap - len(selected)
+    head_n = min(head, remaining)
+    for i in range(min(head_n, n)):
+        selected.add(i)
+    remaining = cap - len(selected)
+    if remaining > 0:
+        for i in range(n - 1, -1, -1):
+            if i in selected:
+                continue
+            selected.add(i)
+            remaining -= 1
+            if remaining <= 0:
+                break
+    return sorted(selected)
+
+
 def _sample_bubble_rows(rows, cap=BUBBLE_CAP_PER_COMPOSER):
-    """Keep earliest + latest bubbles when a composer exceeds the cap."""
+    """Keep PR-mention bubbles plus earliest/latest when a composer exceeds the cap."""
     if len(rows) <= cap:
         return rows
-    head = min(BUBBLE_HEAD_PER_COMPOSER, cap // 2)
-    tail = cap - head
     rows = sorted(rows, key=_bubble_sort_key)
-    if tail <= 0:
-        return rows[:head]
-    return rows[:head] + rows[-tail:]
+    pr_idx = [i for i, r in enumerate(rows) if _text_mentions_pr(r[1])]
+    keep = _sample_indices_prefer_pr(len(rows), cap, pr_idx)
+    return [rows[i] for i in keep]
 
 
 def _bubble_ts_from_raw(raw):
@@ -1867,8 +1922,21 @@ def _bubble_ts_from_raw(raw):
     return 0
 
 
+def _pr_candidate_raw_rows(con, prefix):
+    """Bubble rows whose JSON likely contains a PR URL or bare PR mention."""
+    try:
+        return con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? AND ("
+            "value LIKE '%/pull/%' OR value LIKE '%PR #%' OR value LIKE '%PR#%' "
+            "OR value LIKE '%pr #%' OR value LIKE '%pull request%' "
+            "OR value LIKE '%Pull request%' OR value LIKE '%Pull Request%')",
+            (prefix + "%",)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
 def _sample_cid_bubble_raws(con, cid, cap=BUBBLE_CAP_PER_COMPOSER):
-    """Return [(key, raw)] for a composer, chronologically head+tail sampled."""
+    """Return [(key, raw)] — PR mentions kept, then chronological head+tail fill."""
     prefix = f"bubbleId:{cid}:"
     try:
         n = con.execute(
@@ -1886,29 +1954,41 @@ def _sample_cid_bubble_raws(con, cid, cap=BUBBLE_CAP_PER_COMPOSER):
         return rows
     head = min(BUBBLE_HEAD_PER_COMPOSER, cap // 2)
     tail = cap - head
+    # Huge composers: avoid loading every value; pull PR candidates via LIKE + ends.
     if n > cap * 10:
+        by_key = {}
+        for key, raw in _pr_candidate_raw_rows(con, prefix):
+            if _raw_mentions_pr(raw):
+                by_key[key] = raw
         keys = [r[0] for r in con.execute(
             "SELECT key FROM cursorDiskKV WHERE key LIKE ? ORDER BY key LIMIT ?",
             (prefix + "%", head))]
         keys += [r[0] for r in con.execute(
             "SELECT key FROM cursorDiskKV WHERE key LIKE ? ORDER BY key DESC LIMIT ?",
             (prefix + "%", tail))]
-        out = []
         for key in keys:
+            if key in by_key:
+                continue
             raw = con.execute(
                 "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)).fetchone()
             if raw:
-                out.append((key, raw[0]))
+                by_key[key] = raw[0]
+        out = list(by_key.items())
         out.sort(key=lambda r: (_bubble_ts_from_raw(r[1]), r[0].split(":")[-1]))
-        return out
+        if len(out) <= cap:
+            return out
+        pr_idx = [i for i, r in enumerate(out) if _raw_mentions_pr(r[1])]
+        keep = _sample_indices_prefer_pr(len(out), cap, pr_idx)
+        return [out[i] for i in keep]
     entries = []
     for key, raw in con.execute(
             "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
             (prefix + "%",)):
         entries.append((_bubble_ts_from_raw(raw), key.split(":")[-1], key, raw))
     entries.sort(key=lambda e: (e[0], e[1]))
-    chosen = entries[:head] + entries[-tail:]
-    return [(e[2], e[3]) for e in chosen]
+    pr_idx = [i for i, e in enumerate(entries) if _raw_mentions_pr(e[3])]
+    keep = _sample_indices_prefer_pr(len(entries), cap, pr_idx)
+    return [(entries[i][2], entries[i][3]) for i in keep]
 
 
 def _bubble_dict_from_raw(key, raw):
@@ -4824,22 +4904,28 @@ def _conversation_map_text(blob):
     cmap = blob.get("conversationMap") or blob.get("conversation") or {}
     if not isinstance(cmap, dict):
         return ""
-    parts = []
     # Preserve insertion order when available; otherwise sort by key.
     items = list(cmap.items())
     try:
         items.sort(key=lambda kv: (kv[1] or {}).get("createdAt") or kv[0])
     except Exception:
         pass
+    texts = []
     for _k, msg in items:
         if not isinstance(msg, dict):
             continue
         t = _bubble_text(msg)
         if t:
-            parts.append(t)
-        if len(parts) >= 12:
-            break
-    return "\n".join(parts)
+            texts.append(t)
+    if not texts:
+        return ""
+    # Prefer PR-bearing messages so older PR links survive the legacy map cap.
+    cap = 40
+    if len(texts) <= cap:
+        return "\n".join(texts)
+    pr_idx = [i for i, t in enumerate(texts) if _text_mentions_pr(t)]
+    keep = _sample_indices_prefer_pr(len(texts), cap, pr_idx, head_budget=8)
+    return "\n".join(texts[i] for i in keep)
 
 
 def _composer_data_fallback_text(con, cid):

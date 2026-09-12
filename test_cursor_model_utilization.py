@@ -737,6 +737,104 @@ class AdaptiveComposerHeadersTests(unittest.TestCase):
             self.assertEqual(sessions[0]["title"], "Refactor the payment webhook handler")
             self.assertEqual(sessions[0]["title_source"], "bubble")
 
+    def test_sample_bubble_rows_keeps_middle_pr_mentions(self):
+        """Long chats must not drop older PR links sitting between head and tail."""
+        cap = 20
+        rows = []
+        for i in range(60):
+            text = f"noise bubble {i}"
+            if i == 25:
+                text = "Opened https://github.com/acme/app/pull/10 for the first fix"
+            if i == 40:
+                text = "Follow-up https://github.com/acme/app/pull/11"
+            rows.append((f"2026-01-01T00:{i:02d}:00Z", text, 2, f"b{i}"))
+        kept = d._sample_bubble_rows(rows, cap=cap)
+        self.assertLessEqual(len(kept), cap)
+        joined = "\n".join(r[1] for r in kept)
+        self.assertIn("pull/10", joined)
+        self.assertIn("pull/11", joined)
+
+    def test_sample_cid_bubble_raws_keeps_middle_pr(self):
+        import json, os, sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.row_factory = sqlite3.Row
+            con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+            cid = "cid-multi-pr"
+            cap = 20
+            for i in range(60):
+                text = f"filler {i}"
+                if i == 30:
+                    text = "See https://github.com/acme/app/pull/22 in the middle"
+                blob = json.dumps({
+                    "type": 2,
+                    "createdAt": f"2026-01-01T01:{i:02d}:00.000Z",
+                    "text": text,
+                })
+                con.execute(
+                    "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                    (f"bubbleId:{cid}:b{i:04d}", blob),
+                )
+            con.commit()
+            sampled = d._sample_cid_bubble_raws(con, cid, cap=cap)
+            con.close()
+            self.assertLessEqual(len(sampled), cap)
+            joined = "\n".join(
+                (r[1].decode() if isinstance(r[1], bytes) else r[1]) for r in sampled)
+            self.assertIn("pull/22", joined)
+
+    def test_pr_cost_entries_keeps_zero_cost_mentioned_prs(self):
+        """Earlier PRs in a session must appear even when spend is on a later PR."""
+        session = {"session_id": "s1", "cost_usd": 5.0, "pr_turn_costs": {}}
+        refs = {"prs": [
+            {"key": "acme/app#10", "repo": "acme/app", "number": 10, "created": True},
+            {"key": "acme/app#11", "repo": "acme/app", "number": 11, "created": True},
+        ]}
+        turn_prs = {"s1": {2: {"acme/app#11": True}}}
+        turn_cost = {"s1": {0: (1.0, 100), 1: (1.0, 100), 2: (3.0, 100)}}
+        entries = d._pr_cost_entries(session, refs, turn_prs, turn_cost)
+        keys = {p["key"] for p, _c in entries}
+        self.assertEqual(keys, {"acme/app#10", "acme/app#11"})
+        by_key = {p["key"]: c for p, c in entries}
+        self.assertEqual(by_key["acme/app#10"], 0)
+        self.assertGreater(by_key["acme/app#11"], 0)
+
+    def test_pr_cost_entries_still_drops_zero_cost_inferred(self):
+        session = {"session_id": "s1", "cost_usd": 5.0, "pr_turn_costs": {}}
+        refs = {"prs": [
+            {"key": "acme/app#99", "repo": "acme/app", "number": 99,
+             "created": False, "inferred": True},
+        ]}
+        entries = d._pr_cost_entries(session, refs, {}, {})
+        self.assertEqual(entries, [])
+
+    def test_build_refs_keeps_multiple_prs_from_one_session(self):
+        rows = [(
+            "s1",
+            "First https://github.com/acme/app/pull/10 then later "
+            "https://github.com/acme/app/pull/11 and acme/app#12",
+        )]
+        refs = d._build_refs(rows, {}, set())
+        keys = {p["key"] for p in refs["s1"]["prs"]}
+        self.assertEqual(keys, {"acme/app#10", "acme/app#11", "acme/app#12"})
+
+    def test_rollup_lists_zero_cost_mentioned_pr(self):
+        sessions = [{
+            "session_id": "s1", "title": "Multi PR chat", "cost_usd": 4.0,
+            "on_demand_usd": 0, "total_tokens": 100, "turns": 2,
+            "billed": True, "est": False, "repository": "acme/app",
+        }]
+        refs = {"s1": {"jira": [], "repos": [], "prs": [
+            {"key": "acme/app#10", "repo": "acme/app", "number": 10, "created": True},
+            {"key": "acme/app#11", "repo": "acme/app", "number": 11, "created": True},
+        ]}}
+        turn_prs = {"s1": {1: {"acme/app#11": True}}}
+        turn_cost = {"s1": {0: (1.0, 50), 1: (3.0, 50)}}
+        out = d.rollup(sessions, refs, turn_prs, turn_cost)
+        keys = {p["key"] for p in out["prs"]}
+        self.assertEqual(keys, {"acme/app#10", "acme/app#11"})
+
 
 if __name__ == "__main__":
     unittest.main()
