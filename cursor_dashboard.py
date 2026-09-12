@@ -2103,6 +2103,7 @@ def _stamp_pr_mention_days(refs, priced_all, turn_prs, pr_day_hints=None):
 
     Day context must follow when the PR was mentioned, not the session's first
     billed day — otherwise today's PRs ride along on yesterday's chat row.
+    Days are local calendar dates via `_local_day` (machine local timezone).
     """
     for sid, r in (refs or {}).items():
         if not r:
@@ -2129,7 +2130,14 @@ def _stamp_pr_mention_days(refs, priced_all, turn_prs, pr_day_hints=None):
         for p in r.get("prs") or []:
             p = dict(p)
             k = p.get("key") or ""
-            ds = sorted(days_by_key.get(k) or [])
+            ds = set(days_by_key.get(k) or [])
+            # Keep any days already present (e.g. GitHub create/merge stamps).
+            ds.update(p.get("days") or [])
+            if p.get("first_day"):
+                ds.add(p["first_day"])
+            if p.get("last_day"):
+                ds.add(p["last_day"])
+            ds = sorted(d for d in ds if d)
             if ds:
                 p["first_day"] = ds[0]
                 p["last_day"] = ds[-1]
@@ -2138,17 +2146,217 @@ def _stamp_pr_mention_days(refs, priced_all, turn_prs, pr_day_hints=None):
         r["prs"] = stamped
 
 
-def _filter_refs_to_day_range(refs_entry, start, end):
-    """Return refs unchanged.
+def _merge_pr_day_fields(pr, *extra_days):
+    """Union local day stamps onto a PR dict; returns the same dict."""
+    days = set(pr.get("days") or [])
+    if pr.get("first_day"):
+        days.add(pr["first_day"])
+    if pr.get("last_day"):
+        days.add(pr["last_day"])
+    for d in extra_days:
+        if d:
+            days.add(d)
+    ds = sorted(d for d in days if d)
+    if ds:
+        pr["first_day"] = ds[0]
+        pr["last_day"] = ds[-1]
+        pr["days"] = ds
+    return pr
 
-    Earlier day-scoping dropped PRs that lacked first_day/last_day stamps, so a
-    Today view only showed the few PRs that happened to get timestamps (e.g. #20
-    and #25) while other same-day PRs (#24, #26, #27, …) vanished. Session
-    visibility is already clipped by spend/mention days; PR badges must list
-    every PR on that chat, as they did before the day-filter regression.
+
+def _normalize_github_repo(repo):
+    """owner/name from a repository field that may be a URL or multi-repo label."""
+    repo = (repo or "").strip()
+    if not repo or " · " in repo:
+        return ""
+    repo = repo.replace("https://github.com/", "").replace("http://github.com/", "")
+    repo = repo.strip().strip("/")
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if repo.count("/") != 1:
+        return ""
+    return repo
+
+
+def _gh_json(args, timeout=60):
+    """Run `gh … --json` and parse stdout; return None on failure."""
+    try:
+        r = subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None
+        return json.loads(r.stdout or "null")
+    except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _list_repo_prs_via_gh(repo, limit=100):
+    """List recent PRs for owner/repo via the gh CLI (empty list on failure)."""
+    repo = _normalize_github_repo(repo)
+    if not repo:
+        return []
+    data = _gh_json([
+        "pr", "list", "--repo", repo, "--state", "all", "--limit", str(limit),
+        "--json", "number,url,createdAt,mergedAt,body,title,state,headRefName",
+    ])
+    return data if isinstance(data, list) else []
+
+
+def _prs_linked_to_cloud_agent(agent_id, repo):
+    """PRs whose body embeds the cloud agent id (Cursor PR footer).
+
+    Stamps first_day/last_day from GitHub createdAt/mergedAt via `_local_day`
+    (machine local timezone).
     """
-    del start, end
-    return refs_entry
+    agent_id = (agent_id or "").strip()
+    repo = _normalize_github_repo(repo)
+    if not agent_id or not repo:
+        return []
+    alts = {agent_id}
+    if agent_id.startswith("bc-"):
+        alts.add(agent_id[3:])
+    else:
+        alts.add("bc-" + agent_id)
+    out = []
+    for raw in _list_repo_prs_via_gh(repo):
+        body = raw.get("body") or ""
+        if not any(a and a in body for a in alts):
+            continue
+        try:
+            num = int(raw.get("number"))
+        except (TypeError, ValueError):
+            continue
+        created = _local_day(raw.get("createdAt") or "")
+        merged = _local_day(raw.get("mergedAt") or "")
+        days = sorted({d for d in (created, merged) if d})
+        out.append({
+            "key": f"{repo}#{num}",
+            "repo": repo,
+            "number": num,
+            "created": True,
+            "url": raw.get("url") or f"https://github.com/{repo}/pull/{num}",
+            "first_day": days[0] if days else "",
+            "last_day": days[-1] if days else "",
+            "days": days,
+            "source": "cloud-agent-github",
+        })
+    return out
+
+
+def _enrich_cloud_agent_prs(sessions, refs):
+    """Attach every GitHub PR linked to a cloud agent — not only scraped bubbles.
+
+    Cloud agent ManagePullRequest footers embed bc-*; local bubble scans often
+    miss older PRs (#21–#24) while keeping a few recent URLs. GitHub is source
+    of truth for the full set and for create/merge local days.
+    """
+    cache = {}
+    added = 0
+    for sess in sessions or []:
+        aid = (sess.get("cloud_agent_id") or "").strip()
+        sid = (sess.get("session_id") or "").strip()
+        if not aid and sid.startswith("bc-"):
+            aid = sid
+        if not (sess.get("cloud_agent") or (aid or "").startswith("bc-")
+                or sid.startswith("bc-")):
+            continue
+        if not aid:
+            continue
+        repo = _normalize_github_repo(sess.get("repository") or "")
+        if not repo:
+            for tr in sess.get("tracked_repos") or []:
+                repo = _normalize_github_repo(tr)
+                if repo:
+                    break
+        if not repo:
+            continue
+        key = (repo, aid)
+        if key not in cache:
+            cache[key] = _prs_linked_to_cloud_agent(aid, repo)
+        found = cache[key]
+        if not found:
+            continue
+        r = refs.setdefault(sid, {"jira": [], "prs": [], "repos": []})
+        existing = {p["key"]: dict(p) for p in r.get("prs") or []}
+        for p in found:
+            if p["key"] not in existing:
+                existing[p["key"]] = dict(p)
+                added += 1
+            else:
+                _merge_pr_day_fields(
+                    existing[p["key"]],
+                    *(p.get("days") or []),
+                    p.get("first_day"), p.get("last_day"))
+                existing[p["key"]]["created"] = (
+                    existing[p["key"]].get("created") or p.get("created"))
+        r["prs"] = sorted(existing.values(), key=lambda p: (p["repo"], p["number"]))
+        sess["refs"] = r
+        # Ensure primary repo badge exists.
+        repos = {x.get("name"): dict(x) for x in r.get("repos") or []}
+        if repo not in repos:
+            repos[repo] = {"name": repo, "role": "primary"}
+            r["repos"] = sorted(repos.values(),
+                                key=lambda x: (x.get("role") != "primary", x["name"]))
+    return added
+
+
+def _stamp_pr_github_dates(refs):
+    """Fill missing PR day stamps from GitHub createdAt/mergedAt (local days)."""
+    need = collections.defaultdict(list)  # repo -> [pr dicts]
+    for r in (refs or {}).values():
+        for p in (r or {}).get("prs") or []:
+            if p.get("first_day") and p.get("last_day"):
+                continue
+            repo = _normalize_github_repo(p.get("repo") or "")
+            if repo and p.get("number") is not None:
+                need[repo].append(p)
+    if not need:
+        return 0
+    stamped = 0
+    for repo, prs in need.items():
+        catalog = {int(x["number"]): x for x in _list_repo_prs_via_gh(repo)
+                   if x.get("number") is not None}
+        for p in prs:
+            meta = catalog.get(int(p["number"]))
+            if not meta:
+                continue
+            created = _local_day(meta.get("createdAt") or "")
+            merged = _local_day(meta.get("mergedAt") or "")
+            before = p.get("first_day"), p.get("last_day")
+            _merge_pr_day_fields(p, created, merged)
+            if (p.get("first_day"), p.get("last_day")) != before:
+                stamped += 1
+    return stamped
+
+
+def _filter_refs_to_day_range(refs_entry, start, end):
+    """Keep PRs whose local first_day/last_day overlap [start, end].
+
+    All-time views keep everything (including undated). Bounded day views keep
+    only PRs that overlap the range — so yesterday never shows today's PRs and
+    today never shows a PR that only lived on yesterday. Undated PRs are omitted
+    on bounded views after GitHub/mention stamping has already run; showing them
+    on every day was the #28 regression (Today and Yesterday both listed
+    #20/#25/#26/#27/#28).
+    """
+    if not refs_entry:
+        return refs_entry
+    if start <= MIN_DAY and end >= MAX_DAY:
+        return refs_entry
+    prs = []
+    for p in refs_entry.get("prs") or []:
+        fd = p.get("first_day") or ""
+        ld = p.get("last_day") or fd
+        if not fd or not ld:
+            continue
+        if ld < start or fd > end:
+            continue
+        prs.append(p)
+    if prs == (refs_entry.get("prs") or []):
+        return refs_entry
+    out = dict(refs_entry)
+    out["prs"] = prs
+    return out
 
 
 
@@ -5465,22 +5673,36 @@ def _fill_totals(base):
 
 
 def _clip(session, start, end):
-    """Restrict one chat to a date range, matching github_copilot_dashboard._vs_clip.
+    """Restrict one chat to a date range.
 
-    Clip spend/days only. Keep refs.prs intact — day-filtering PRs hid same-day
-    PRs that lacked timestamps (Today showed only #20 and #25 while #24/#26/#27
-    vanished). Copilot never filters PR badges by day; Cursor must not either.
+    Spend/days are clipped like github_copilot_dashboard._vs_clip. PR badges are
+    additionally scoped by each PR's local first_day/last_day so Yesterday and
+    Today never share the same undated dump of every session PR. Day stamps use
+    `_local_day` (the machine's local timezone — never a hard-coded offset).
     """
+    def _with_scoped_refs(sess):
+        refs = sess.get("refs")
+        if not refs:
+            return sess
+        scoped = _filter_refs_to_day_range(refs, start, end)
+        if scoped is refs:
+            return sess
+        out = dict(sess)
+        out["refs"] = scoped
+        return out
+
     first, last = session.get("first_day") or "", session.get("last_day") or ""
     # Undated sessions (common for brand-new cloud agents) must not disappear on
     # All-time views: empty strings fail start<=first string compares.
     if not first and not last:
         if start <= MIN_DAY and end >= MAX_DAY:
-            return session
+            return _with_scoped_refs(session)
         if session.get("cloud_agent") and start <= MIN_DAY:
-            return session
+            return _with_scoped_refs(session)
     if first and last and start <= first and last <= end:
-        return session
+        # Session spend fits the range, but PRs may still span other local days
+        # (e.g. multi-day cloud agent). Always day-scope badges on bounded views.
+        return _with_scoped_refs(session)
     days = {d: c for d, c in (session.get("days") or {}).items()
             if d and start <= d <= end}
     if not days:
@@ -5515,7 +5737,7 @@ def _clip(session, start, end):
     base = {k: session[k] for k in keep if k in session}
     base["days"] = days
     base["by_model_day"] = bmd
-    # Intentionally do NOT filter refs — same as github_copilot_dashboard._vs_clip.
+    base["refs"] = _filter_refs_to_day_range(session.get("refs") or {}, start, end)
     return _fill_totals(base)
 
 
@@ -5996,6 +6218,14 @@ def scan_cursor(force=False):
             priced_all, refs, {s["session_id"]: s for s in sessions},
             git_acts, path_by_github)
         _stamp_pr_mention_days(refs, priced_all, turn_prs, pr_day_hints)
+        # Cloud-agent PRs often exist only in GitHub footers (bc-*), not local
+        # bubbles — pull the full set and stamp create/merge with `_local_day`.
+        n_cloud_prs = _enrich_cloud_agent_prs(sessions, refs)
+        n_gh_days = _stamp_pr_github_dates(refs)
+        if n_cloud_prs or n_gh_days:
+            print(f"  cloud-agent GitHub PRs: +{n_cloud_prs} linked, "
+                  f"{n_gh_days} day-stamp(s) from createdAt/mergedAt",
+                  flush=True)
         for sess in sessions:
             sess["refs"] = refs.get(sess["session_id"], sess.get("refs"))
         git_pr_catalog = _git_pr_catalog(git_acts) if git_acts else {}
