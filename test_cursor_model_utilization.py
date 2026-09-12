@@ -329,5 +329,92 @@ class ComposerDataMergeTests(unittest.TestCase):
             dst.close(); src.close()
 
 
+
+class ItemTableComposerIndexTests(unittest.TestCase):
+    def test_header_meta_reads_itemtable_composer_headers(self):
+        import json, os, sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.row_factory = sqlite3.Row
+            con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+            con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+            # No SQL composerHeaders table on purpose — Cursor 3.0+ shape.
+            con.execute(
+                "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+                ("composer.composerHeaders", json.dumps({
+                    "allComposers": [
+                        {
+                            "composerId": "cid-auth",
+                            "name": "Fix auth redirect",
+                            "lastUpdatedAt": 1700000000000,
+                            "workspaceIdentifier": {
+                                "id": "ws1",
+                                "uri": {"fsPath": "/work/acme/webapp"},
+                            },
+                        }
+                    ]
+                })),
+            )
+            con.commit()
+            meta = d._header_meta(con)
+            con.close()
+            self.assertIn("cid-auth", meta)
+            self.assertEqual(meta["cid-auth"]["title"], "Fix auth redirect")
+            self.assertTrue(meta["cid-auth"]["repository"])
+
+    def test_itemtable_merge_upgrades_named_composer_index(self):
+        import json, os, sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            dst = os.path.join(td, "dst.vscdb")
+            src = os.path.join(td, "src.vscdb")
+            for path, name in ((dst, ""), (src, "Real chat title")):
+                con = sqlite3.connect(path)
+                con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+                con.execute(
+                    "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+                    ("composer.composerHeaders", json.dumps({
+                        "allComposers": [{"composerId": "c1", "name": name}]
+                    })),
+                )
+                con.commit(); con.close()
+            dcon = sqlite3.connect(dst)
+            scon = sqlite3.connect(src)
+            added, updated = d._merge_item_table(dcon, scon)
+            self.assertEqual(added, 0)
+            self.assertEqual(updated, 1)
+            raw = dcon.execute(
+                "SELECT value FROM ItemTable WHERE key=?",
+                ("composer.composerHeaders",)).fetchone()[0]
+            blob = json.loads(raw)
+            self.assertEqual(blob["allComposers"][0]["name"], "Real chat title")
+            dcon.close(); scon.close()
+
+    def test_billing_uses_itemtable_title_without_bubbles(self):
+        events = [{
+            "conversationId": "cid-auth",
+            "timestamp": 1_700_000_000_000,
+            "model": "gpt-5",
+            "kind": "INCLUDED",
+            "tokenUsage": {"totalCents": 5, "inputTokens": 3, "outputTokens": 2,
+                           "cacheWriteTokens": 0, "cacheReadTokens": 0},
+        }]
+        meta = {
+            "cid-auth": {
+                "title": "Fix auth redirect",
+                "subtitle": "",
+                "repository": "acme/webapp",
+                "branch": "main",
+                "workspace_path": "/work/acme/webapp",
+                "tracked_repos": ["acme/webapp"],
+            }
+        }
+        local = {
+            "cid-auth": d._session_stub_from_meta("cid-auth", meta, {}),
+        }
+        sessions, _, _ = d._sessions_from_billing(events, local, meta, {})
+        self.assertEqual(sessions[0]["title"], "Fix auth redirect")
+
+
 if __name__ == "__main__":
     unittest.main()

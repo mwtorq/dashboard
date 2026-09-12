@@ -119,6 +119,57 @@ def _store_row_counts(db_path):
         return None
 
 
+
+def _composer_index_stats(db_path):
+    """Summarize Cursor 3.0+ ItemTable chat-name index coverage."""
+    out = {
+        "headers_key": False,
+        "headers_named": 0,
+        "headers_total": 0,
+        "composer_data_named": 0,
+        "sql_composer_headers": 0,
+    }
+    if not db_path or not os.path.isfile(db_path):
+        return out
+    try:
+        with connect(db_path) as con:
+            try:
+                out["sql_composer_headers"] = con.execute(
+                    "SELECT COUNT(*) FROM composerHeaders").fetchone()[0]
+            except sqlite3.OperationalError:
+                out["sql_composer_headers"] = 0
+            for key, named_field, total_field, flag in (
+                ("composer.composerHeaders", "headers_named", "headers_total", "headers_key"),
+                ("composer.composerData", "composer_data_named", None, None),
+            ):
+                try:
+                    row = con.execute(
+                        "SELECT value FROM ItemTable WHERE key = ?", (key,)
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    continue
+                if not row:
+                    continue
+                if flag:
+                    out[flag] = True
+                blob = _loads(row[0]) or {}
+                composers = []
+                if isinstance(blob, dict):
+                    composers = blob.get("allComposers") or blob.get("composers") or []
+                if not isinstance(composers, list):
+                    continue
+                if total_field:
+                    out[total_field] = len(composers)
+                named = 0
+                for entry in composers:
+                    if isinstance(entry, dict) and _composer_display_name(entry):
+                        named += 1
+                out[named_field] = named
+    except sqlite3.Error:
+        pass
+    return out
+
+
 def _store_weight(counts):
     if not counts:
         return -1
@@ -223,6 +274,32 @@ def _copy_store_via_backup(src, dest):
         src_con.close()
 
 
+def _composer_index_named_count(raw):
+    """How many allComposers entries carry a non-empty display name."""
+    blob = _loads(raw) or {}
+    if not isinstance(blob, dict):
+        return 0
+    composers = blob.get("allComposers") or blob.get("composers") or []
+    if not isinstance(composers, list):
+        return 0
+    n = 0
+    for entry in composers:
+        if isinstance(entry, dict) and _composer_display_name(entry):
+            n += 1
+    return n
+
+
+def _item_table_value_richer(key, new_val, old_val):
+    if old_val in (None, b"", ""):
+        return new_val not in (None, b"", "")
+    if new_val in (None, b"", ""):
+        return False
+    if isinstance(key, str) and key.startswith("composer."):
+        # Prefer the index that actually has chat names (Cursor 3.0+ headers).
+        return _composer_index_named_count(new_val) > _composer_index_named_count(old_val)
+    return False
+
+
 def _merge_item_table(dst, src):
     added = updated = 0
     try:
@@ -235,7 +312,7 @@ def _merge_item_table(dst, src):
         if cur is None:
             dst.execute("INSERT INTO ItemTable(key, value) VALUES (?, ?)", (key, value))
             added += 1
-        elif (cur[0] in (None, b"", "")) and value not in (None, b"", ""):
+        elif _item_table_value_richer(key, value, cur[0]):
             dst.execute("UPDATE ItemTable SET value = ? WHERE key = ?", (value, key))
             updated += 1
     return added, updated
@@ -3769,7 +3846,174 @@ def _header_meta(con):
         entry["max_mode"] = bool(mc.get("maxMode"))
         if blob.get("isAgentic") and not entry["mode"]:
             entry["mode"] = "agent"
+    _apply_itemtable_composer_index(con, meta)
     return meta
+
+
+def _empty_meta_entry():
+    return {
+        "title": "", "subtitle": "", "workspace_id": "", "workspace_path": "",
+        "repository": "", "branch": "", "tracked_repos": [], "tracked_repo_paths": [],
+        "created_ms": 0, "updated_ms": 0,
+        "mode": "", "subagent": False, "draft": False, "archived": False,
+    }
+
+
+def _upsert_composer_index_entry(meta, entry, source="itemtable"):
+    """Merge one allComposers / composerHeaders entry into meta."""
+    if not isinstance(entry, dict):
+        return False
+    cid = (entry.get("composerId") or entry.get("composer_id") or
+           entry.get("id") or "").strip()
+    if not cid:
+        return False
+    title = _composer_display_name(entry)
+    ws = entry.get("workspaceIdentifier") or entry.get("workspace") or {}
+    if not isinstance(ws, dict):
+        ws = {}
+    uri = ws.get("uri") if isinstance(ws.get("uri"), dict) else {}
+    ws_path = ""
+    if isinstance(uri, dict):
+        ws_path = uri.get("fsPath") or uri.get("path") or ""
+    if not ws_path:
+        ws_path = entry.get("workspacePath") or ""
+    repo = _repo_from_path(ws_path) if ws_path else ""
+    created = entry.get("createdAt") or entry.get("created_ms") or 0
+    updated = (entry.get("lastUpdatedAt") or entry.get("updatedAt")
+               or entry.get("updated_ms") or created or 0)
+    mode = entry.get("unifiedMode") or entry.get("forceMode") or entry.get("mode") or ""
+    row = meta.setdefault(cid, _empty_meta_entry())
+    changed = False
+    if title and (_is_untitled(row.get("title")) or (
+            (updated or 0) >= (row.get("updated_ms") or 0) and title != row.get("title"))):
+        row["title"] = title
+        changed = True
+    if ws.get("id") and not row.get("workspace_id"):
+        row["workspace_id"] = ws.get("id") or ""
+        changed = True
+    if ws_path and not row.get("workspace_path"):
+        row["workspace_path"] = ws_path
+        changed = True
+    if repo and not row.get("repository"):
+        row["repository"] = repo
+        changed = True
+    if created and not row.get("created_ms"):
+        row["created_ms"] = created
+        changed = True
+    if updated and (updated or 0) >= (row.get("updated_ms") or 0):
+        row["updated_ms"] = updated
+        changed = True
+    if mode and not row.get("mode"):
+        row["mode"] = mode
+        changed = True
+    row["title_source"] = row.get("title_source") or (source if title else "")
+    return changed
+
+
+def _apply_itemtable_composer_index(con, meta):
+    """Cursor 3.0+ keeps chat names in ItemTable composer.composerHeaders.allComposers."""
+    keys = (
+        "composer.composerHeaders",
+        "composer.composerData",
+        "composerData",
+    )
+    applied = 0
+    for key in keys:
+        try:
+            row = con.execute(
+                "SELECT value FROM ItemTable WHERE key = ?", (key,)).fetchone()
+        except sqlite3.OperationalError:
+            continue
+        if not row:
+            continue
+        blob = _loads(row[0] if not isinstance(row, sqlite3.Row) else row["value"]) or {}
+        if not isinstance(blob, dict):
+            continue
+        composers = blob.get("allComposers") or blob.get("composers") or []
+        if not isinstance(composers, list):
+            continue
+        for entry in composers:
+            if _upsert_composer_index_entry(meta, entry, source=f"itemtable:{key}"):
+                applied += 1
+    return applied
+
+
+def _workspace_composer_titles(meta):
+    """Supplement titles from workspaceStorage/*/state.vscdb (pre-3.0 + unmigrated)."""
+    root = os.path.join(_cursor_user_dir(), "workspaceStorage")
+    if not os.path.isdir(root):
+        return 0
+    applied = 0
+    for wid in os.listdir(root):
+        db = os.path.join(root, wid, "state.vscdb")
+        if not os.path.isfile(db):
+            continue
+        try:
+            with connect(db) as con:
+                for key in ("composer.composerData", "composer.composerHeaders"):
+                    try:
+                        row = con.execute(
+                            "SELECT value FROM ItemTable WHERE key = ?", (key,)
+                        ).fetchone()
+                    except sqlite3.OperationalError:
+                        continue
+                    if not row:
+                        continue
+                    blob = _loads(row[0] if not isinstance(row, sqlite3.Row) else row["value"]) or {}
+                    if not isinstance(blob, dict):
+                        continue
+                    composers = blob.get("allComposers") or blob.get("composers") or []
+                    if not isinstance(composers, list):
+                        continue
+                    for entry in composers:
+                        # Ensure workspace id is present for path mapping.
+                        if isinstance(entry, dict) and not entry.get("workspaceIdentifier"):
+                            entry = dict(entry)
+                            entry["workspaceIdentifier"] = {"id": wid}
+                        if _upsert_composer_index_entry(
+                                meta, entry, source=f"workspace:{wid}"):
+                            applied += 1
+        except sqlite3.Error:
+            continue
+    return applied
+
+
+def _conversation_map_text(blob):
+    """Legacy composerData.conversationMap text when bubbleId rows are missing."""
+    if not isinstance(blob, dict):
+        return ""
+    cmap = blob.get("conversationMap") or blob.get("conversation") or {}
+    if not isinstance(cmap, dict):
+        return ""
+    parts = []
+    # Preserve insertion order when available; otherwise sort by key.
+    items = list(cmap.items())
+    try:
+        items.sort(key=lambda kv: (kv[1] or {}).get("createdAt") or kv[0])
+    except Exception:
+        pass
+    for _k, msg in items:
+        if not isinstance(msg, dict):
+            continue
+        t = _bubble_text(msg)
+        if t:
+            parts.append(t)
+        if len(parts) >= 12:
+            break
+    return "\n".join(parts)
+
+
+def _composer_data_fallback_text(con, cid):
+    try:
+        row = con.execute(
+            "SELECT value FROM cursorDiskKV WHERE key = ?",
+            (f"composerData:{cid}",)).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    if not row:
+        return ""
+    blob = _loads(row[0] if not isinstance(row, sqlite3.Row) else row["value"]) or {}
+    return _conversation_map_text(blob)
 
 
 def _turns_from_bubbles(bubbles, default_model):
@@ -4164,6 +4408,7 @@ def scan_cursor(force=False):
         with connect() as con:
             account = _signed_in_account(con)
             meta = _header_meta(con)
+            _workspace_composer_titles(meta)
             t_meta = time.perf_counter()
             t_billing = t_meta
             if API_ENABLED:
@@ -4181,6 +4426,14 @@ def scan_cursor(force=False):
             if skip_bubbles:
                 billed_texts, billed_rows, billed_text_rows = _load_bubble_texts_for_cids(
                     con, skip_bubbles)
+                # Legacy / sparse chats: pull text from composerData.conversationMap
+                # when bubbleId rows are missing so titles/PRs can still resolve.
+                for cid in list(skip_bubbles):
+                    if billed_texts.get(cid):
+                        continue
+                    fallback = _composer_data_fallback_text(con, cid)
+                    if fallback:
+                        billed_texts[cid] = fallback
         t_bubbles = time.perf_counter()
         if skip_bubbles:
             print(f"  billed chat text: {len(billed_texts)} composer(s), "
@@ -6104,6 +6357,7 @@ class Handler(BaseHTTPRequestHandler):
                     "merged": _merged_store_path(),
                     "ide": ide,
                     "counts": _store_row_counts(DB_PATH),
+                    "composer_index": _composer_index_stats(DB_PATH),
                 }, default=str), "application/json")
             elif url.path in ("/", "/index.html"):
                 self._send(PAGE, "text/html; charset=utf-8")
@@ -7253,8 +7507,10 @@ function render(){
         if(mix){
           mix.innerHTML+=(mix.innerHTML?'<br><br>':'')
             +`<b>Chat titles / PR context look thin</b> (${weak} of ${sess.length} chats). `
-            +`Pools come from Cursor billing; names and PR badges come from the local IDE store. `
-            +`Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>) so composerHeaders join again. `
+            +`Pools come from Cursor billing; names/PRs come from the local IDE store `
+            +`(Cursor 3.0+ keeps titles in ItemTable <code>composer.composerHeaders</code>). `
+            +`Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>), then hard-refresh. `
+            +`Check <code>/api/store</code> → <code>composer_index.headers_named</code> &gt; 0. `
             +`Also expand the “Cost by chat / session” section if it is collapsed (▸).`;
         }
       }
