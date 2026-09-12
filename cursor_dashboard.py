@@ -344,33 +344,92 @@ def _merge_cursor_disk_kv(dst, src):
     return added, updated
 
 
+def _table_columns(con, table):
+    try:
+        return {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def _pick_col(cols, *candidates):
+    lower = {c.lower(): c for c in cols}
+    for name in candidates:
+        if name in cols:
+            return name
+        if name.lower() in lower:
+            return lower[name.lower()]
+    return None
+
+
+def _read_composer_header_rows(con):
+    """Schema-adaptive read of SQL composerHeaders (column names differ by Cursor build)."""
+    cols = _table_columns(con, "composerHeaders")
+    if not cols:
+        cols = _table_columns(con, "composer_headers")
+        table = "composer_headers" if cols else None
+    else:
+        table = "composerHeaders"
+    if not table:
+        return []
+    cid_c = _pick_col(cols, "composerId", "composer_id", "id")
+    val_c = _pick_col(cols, "value", "data", "json")
+    if not cid_c:
+        return []
+    ws_c = _pick_col(cols, "workspaceId", "workspace_id", "workspace")
+    created_c = _pick_col(cols, "createdAt", "created_at", "created")
+    updated_c = _pick_col(cols, "lastUpdatedAt", "last_updated_at", "updatedAt",
+                          "updated_at", "recency", "checkpointAt")
+    arch_c = _pick_col(cols, "isArchived", "is_archived", "archived")
+    sub_c = _pick_col(cols, "isSubagent", "is_subagent", "subagent")
+    select = [cid_c]
+    for c in (ws_c, created_c, updated_c, arch_c, sub_c, val_c):
+        select.append(c if c else "NULL")
+    sql = "SELECT " + ", ".join(select) + f" FROM {table}"
+    try:
+        raw_rows = con.execute(sql).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out = []
+    for row in raw_rows:
+        out.append({
+            "composerId": row[0],
+            "workspaceId": row[1] or "",
+            "createdAt": row[2] or 0,
+            "lastUpdatedAt": row[3] or 0,
+            "isArchived": row[4] or 0,
+            "isSubagent": row[5] or 0,
+            "value": row[6],
+        })
+    return out
+
+
 def _merge_composer_headers(dst, src):
     added = updated = 0
-    try:
-        rows = src.execute(
-            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, "
-            "isArchived, isSubagent, value FROM composerHeaders"
-        ).fetchall()
-    except sqlite3.OperationalError:
+    rows = _read_composer_header_rows(src)
+    if not rows:
         return added, updated
     for row in rows:
-        cid = row[0]
+        cid = row["composerId"]
+        if not cid:
+            continue
         cur = dst.execute(
             "SELECT lastUpdatedAt FROM composerHeaders WHERE composerId = ?",
             (cid,)).fetchone()
+        vals = (row["workspaceId"], row["createdAt"], row["lastUpdatedAt"],
+                row["isArchived"], row["isSubagent"], row["value"])
         if cur is None:
             dst.execute(
                 "INSERT INTO composerHeaders("
                 "composerId, workspaceId, createdAt, lastUpdatedAt, "
                 "isArchived, isSubagent, value) VALUES (?,?,?,?,?,?,?)",
-                tuple(row))
+                (cid,) + vals)
             added += 1
-        elif (row[3] or 0) >= (cur[0] or 0):
+        elif (row["lastUpdatedAt"] or 0) >= (cur[0] or 0):
             dst.execute(
                 "UPDATE composerHeaders SET workspaceId=?, createdAt=?, "
                 "lastUpdatedAt=?, isArchived=?, isSubagent=?, value=? "
                 "WHERE composerId=?",
-                (row[1], row[2], row[3], row[4], row[5], row[6], cid))
+                vals + (cid,))
             updated += 1
     return added, updated
 
@@ -3732,7 +3791,7 @@ def _sessions_from_billing(events, local_by_id, meta, ws_names):
     """One session per billed conversationId; titles/repos from the local store."""
     groups = collections.defaultdict(list)
     for ev in events:
-        cid = ev.get("conversationId") or ev.get("composerId") or "_unattributed"
+        cid = _billing_event_cid(ev)
         groups[cid].append(ev)
     sessions, turns_api, priced_all = [], {}, {}
     for cid, evs in groups.items():
@@ -3773,19 +3832,169 @@ def _sessions_from_billing(events, local_by_id, meta, ws_names):
     return sessions, turns_api, priced_all
 
 
+
+def _billing_event_cid(ev):
+    """Best-effort conversation/composer id from a usage event."""
+    if not isinstance(ev, dict):
+        return "_unattributed"
+    for key in (
+        "conversationId", "composerId", "chatId", "composer_id",
+        "conversation_id", "agentId", "requestId",
+    ):
+        val = ev.get(key)
+        if isinstance(val, str) and val.strip() and val.strip() not in ("-", "null", "None"):
+            return val.strip()
+        if isinstance(val, (int, float)) and val:
+            return str(val)
+    # Nested shapes seen in some Cursor payloads.
+    for nest in ("conversation", "composer", "chat", "metadata"):
+        obj = ev.get(nest)
+        if isinstance(obj, dict):
+            cid = _billing_event_cid(obj)
+            if cid != "_unattributed":
+                return cid
+    return "_unattributed"
+
+
+def _first_user_bubble_title(con, cid, cap=40):
+    """Derive a title from the earliest user bubble text for composer cid."""
+    if not cid or cid in ("_unattributed", "empty-state-draft"):
+        return ""
+    try:
+        rows = _sample_cid_bubble_raws(con, cid, cap=cap)
+    except Exception:
+        return ""
+    # Prefer type==1 (user) bubbles; fall back to any text.
+    user_text = ""
+    any_text = ""
+    for key, raw in rows:
+        row = _bubble_dict_from_raw(key, raw)
+        if not row:
+            continue
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        if not any_text:
+            any_text = text
+        if row.get("type") == 1 and not user_text:
+            user_text = text
+            break
+    return _title_from_text(user_text or any_text)
+
+
+def _agent_transcript_roots():
+    roots = []
+    home = os.path.expanduser("~")
+    for base in (
+        os.path.join(home, ".cursor", "projects"),
+        os.path.join(home, "AppData", "Roaming", "Cursor", "User"),
+    ):
+        if os.path.isdir(base):
+            roots.append(base)
+    # Workspace-local .cursor folders under home (shallow).
+    return roots
+
+
+def _title_from_agent_transcripts(cid):
+    """Use ~/.cursor/projects/*/agent-transcripts/{cid}.* first line as title."""
+    if not cid or cid.startswith("_"):
+        return ""
+    needle = cid
+    for root in _agent_transcript_roots():
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                if "agent-transcripts" not in dirpath.replace("\\", "/"):
+                    # Fast reject: only descend into agent-transcripts trees.
+                    if "agent-transcripts" not in dirnames and not dirpath.endswith("projects"):
+                        # still allow walking projects to find agent-transcripts
+                        pass
+                base = os.path.basename(dirpath)
+                if base != "agent-transcripts" and needle not in base:
+                    # Keep walking; don't open every file.
+                    continue
+                for fn in filenames:
+                    if needle not in fn and needle not in base:
+                        continue
+                    path = os.path.join(dirpath, fn)
+                    try:
+                        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                            for line in fh:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                # jsonl: {"role":"user","text":"..."} or plain text
+                                if line.startswith("{"):
+                                    try:
+                                        obj = json.loads(line)
+                                    except Exception:
+                                        title = _title_from_text(line)
+                                        return title
+                                    for key in ("text", "content", "title", "message"):
+                                        val = obj.get(key)
+                                        if isinstance(val, str) and val.strip():
+                                            return _title_from_text(val)
+                                        if isinstance(val, list):
+                                            for part in val:
+                                                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                                    t = _title_from_text(part["text"])
+                                                    if t:
+                                                        return t
+                                else:
+                                    return _title_from_text(line)
+                    except OSError:
+                        continue
+                # Don't walk forever.
+                if dirpath.count(os.sep) - root.count(os.sep) > 6:
+                    dirnames[:] = []
+        except OSError:
+            continue
+    return ""
+
+
+def _fill_titles_from_local_content(con, sessions, meta=None):
+    """Last-resort titles for billed/(untitled) rows using bubbles + transcripts."""
+    meta = meta or {}
+    filled = 0
+    for sess in sessions or []:
+        if not _is_untitled(sess.get("title")):
+            continue
+        cid = sess.get("session_id") or ""
+        title = ""
+        # Prefer meta again (ItemTable may have landed after stub creation).
+        if meta.get(cid) and not _is_untitled(meta[cid].get("title")):
+            title = meta[cid]["title"]
+            src = meta[cid].get("title_source") or "meta"
+        if not title:
+            title = _first_user_bubble_title(con, cid)
+            src = "bubble"
+        if not title:
+            title = _title_from_agent_transcripts(cid)
+            src = "transcript"
+        if not title:
+            # conversationMap fallback
+            title = _title_from_text(_composer_data_fallback_text(con, cid))
+            src = "composerData"
+        if title:
+            sess["title"] = title
+            sess["title_source"] = src
+            filled += 1
+        else:
+            sess["title_status"] = "no-local-name-or-text"
+    return filled
+
+
 def _header_meta(con):
     """composerId -> metadata from the composerHeaders table and composerData rows."""
     meta = {}
-    try:
-        rows = con.execute("SELECT composerId, workspaceId, createdAt, lastUpdatedAt, "
-                           "isArchived, isSubagent, value FROM composerHeaders").fetchall()
-    except sqlite3.OperationalError:
-        rows = []
-    for row in rows:
-        blob = _loads(row["value"]) or {}
-        cid = row["composerId"]
+    for row in _read_composer_header_rows(con):
+        blob = _loads(row.get("value")) or {}
+        cid = row.get("composerId")
+        if not cid:
+            continue
         ws = blob.get("workspaceIdentifier") or {}
         uri = (ws.get("uri") or ws.get("configPath") or {})
+        if not isinstance(uri, dict):
+            uri = {}
         repos = blob.get("trackedGitRepos") or []
         tracked_paths = [r.get("repoPath") for r in repos if isinstance(r, dict) and r.get("repoPath")]
         tracked_folders = [_repo_from_path(p) for p in tracked_paths]
@@ -3810,18 +4019,19 @@ def _header_meta(con):
         meta[cid] = {
             "title": _composer_display_name(blob),
             "subtitle": blob.get("subtitle") or "",
-            "workspace_id": row["workspaceId"] or (ws.get("id") or ""),
+            "workspace_id": row.get("workspaceId") or (ws.get("id") or ""),
             "workspace_path": uri.get("fsPath") or uri.get("path") or "",
             "repository": repo,
             "branch": branch,
             "tracked_repos": tracked_folders,
             "tracked_repo_paths": tracked_paths,
-            "created_ms": row["createdAt"] or blob.get("createdAt") or 0,
-            "updated_ms": row["lastUpdatedAt"] or blob.get("lastUpdatedAt") or 0,
+            "created_ms": row.get("createdAt") or blob.get("createdAt") or 0,
+            "updated_ms": row.get("lastUpdatedAt") or blob.get("lastUpdatedAt") or 0,
             "mode": blob.get("unifiedMode") or "",
-            "subagent": bool(row["isSubagent"] or blob.get("isBestOfNSubcomposer")),
+            "subagent": bool(row.get("isSubagent") or blob.get("isBestOfNSubcomposer")),
             "draft": bool(blob.get("isDraft")),
-            "archived": bool(row["isArchived"] or blob.get("isArchived")),
+            "archived": bool(row.get("isArchived") or blob.get("isArchived")),
+            "title_source": "sql:composerHeaders" if _composer_display_name(blob) else "",
         }
     try:
         composer_rows = con.execute(
@@ -4292,7 +4502,9 @@ def _turn_maps_from_priced(priced_by_sid, refs=None, sessions_by_id=None,
 def _billed_composer_ids(billing):
     ids = set()
     for ev in (billing or {}).get("events") or []:
-        cid = ev.get("conversationId") or ev.get("composerId")
+        cid = _billing_event_cid(ev)
+        if cid == "_unattributed":
+            cid = None
         if cid:
             ids.add(cid)
     return ids
@@ -4383,6 +4595,64 @@ def _load_bubbles(con, meta, skip_cids=None, cap=BUBBLE_CAP_PER_COMPOSER):
             "model": "auto",
         })
     return bubbles, composer_owners, loaded
+
+
+
+def _join_diagnostics(db_path, sample_cids=None):
+    """Explain why billed chats may still be (untitled)."""
+    out = {
+        "db": db_path,
+        "composer_index": _composer_index_stats(db_path),
+        "local_composer_ids": 0,
+        "bubble_composer_ids": 0,
+        "sample": [],
+        "build": "titles-v4",
+    }
+    if not db_path or not os.path.isfile(db_path):
+        out["error"] = "db-missing"
+        return out
+    try:
+        with connect(db_path) as con:
+            try:
+                bubble_ids = set()
+                for (key,) in con.execute(
+                        "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' LIMIT 200000"):
+                    parts = key.split(":")
+                    if len(parts) >= 2 and parts[1]:
+                        bubble_ids.add(parts[1])
+                out["bubble_composer_ids"] = len(bubble_ids)
+            except sqlite3.OperationalError:
+                bubble_ids = set()
+            try:
+                data_ids = set()
+                for (key,) in con.execute(
+                        "SELECT key FROM cursorDiskKV WHERE key LIKE 'composerData:%' LIMIT 200000"):
+                    cid = key.split(":", 1)[-1]
+                    if cid:
+                        data_ids.add(cid)
+                out["local_composer_ids"] = len(data_ids | bubble_ids)
+            except sqlite3.OperationalError:
+                data_ids = set()
+            meta = _header_meta(con)
+            out["meta_titles"] = sum(1 for m in meta.values() if not _is_untitled(m.get("title")))
+            out["meta_total"] = len(meta)
+            for cid in list(sample_cids or [])[:12]:
+                row = {
+                    "cid": cid,
+                    "in_meta": cid in meta,
+                    "meta_title": (meta.get(cid) or {}).get("title") or "",
+                    "has_bubbles": cid in bubble_ids,
+                    "has_composer_data": cid in data_ids,
+                    "bubble_title": "",
+                    "transcript_title": "",
+                }
+                if _is_untitled(row["meta_title"]):
+                    row["bubble_title"] = _first_user_bubble_title(con, cid)
+                    row["transcript_title"] = _title_from_agent_transcripts(cid)
+                out["sample"].append(row)
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out
 
 
 def scan_cursor(force=False):
@@ -4572,6 +4842,22 @@ def scan_cursor(force=False):
                         (texts_by_cid.get(sess["session_id"]) or "")
                         + " " + sess.get("title", "") + " " + (sess.get("subtitle") or "")
                     ).strip()
+
+        # Final title pass: ItemTable/SQL names may still be empty while bubble
+        # text or agent transcripts exist under the billed conversation id.
+        try:
+            n_fill = _fill_titles_from_local_content(con, sessions, meta)
+            if n_fill:
+                print(f"  filled {n_fill} untitled title(s) from local bubbles/transcripts",
+                      flush=True)
+                for sess in sessions:
+                    if sess.get("title_source") and sess.get("session_id"):
+                        texts_by_cid[sess["session_id"]] = (
+                            (texts_by_cid.get(sess["session_id"]) or "")
+                            + " " + (sess.get("title") or "")
+                        ).strip()
+        except Exception as exc:
+            print(f"  title backfill skipped ({exc})", flush=True)
 
         allow = JIRA_KEY_ALLOW | _dynamic_jira_keys(texts_by_cid.values())
         sess_repo = {s["session_id"]: s["repository"] for s in sessions if s.get("repository")}
@@ -6352,12 +6638,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(json.dumps(turns, default=str), "application/json")
             elif url.path == "/api/store":
                 ide = ide_store_candidates()
+                sample = []
+                try:
+                    # Prefer currently loaded billed session ids when available.
+                    cached = (_CACHE.get("data") or {}).get("sessions") or []
+                    sample = [s.get("session_id") for s in cached
+                              if s.get("billed") and _is_untitled(s.get("title"))][:12]
+                except Exception:
+                    sample = []
                 self._send(json.dumps({
                     "db": DB_PATH,
                     "merged": _merged_store_path(),
                     "ide": ide,
                     "counts": _store_row_counts(DB_PATH),
                     "composer_index": _composer_index_stats(DB_PATH),
+                    "join": _join_diagnostics(DB_PATH, sample_cids=sample),
+                    "build": "titles-v4",
                 }, default=str), "application/json")
             elif url.path in ("/", "/index.html"):
                 self._send(PAGE, "text/html; charset=utf-8")
@@ -6589,7 +6885,7 @@ section.collapsed > *:not(h2){display:none !important}
 </style></head><body>
 <div id="busy"></div>
 <header>
-  <h1>Cursor &mdash; Chat Cost Dashboard</h1>
+  <h1>Cursor &mdash; Chat Cost Dashboard <span class="sub" id="buildStamp">· titles-v4</span></h1>
   <label class="sub">From <input type="date" id="start"></label>
   <label class="sub">To <input type="date" id="end"></label>
   <select id="preset">
@@ -6624,7 +6920,7 @@ section.collapsed > *:not(h2){display:none !important}
   <div id="err"></div>
   <div class="note" id="mixnote"></div>
   <section id="modelUtil">
-    <h2>Included in plan <span class="sub" id="modelUtilBuild">· pools-v3</span></h2>
+    <h2>Included in plan <span class="sub" id="modelUtilBuild">· pools-v3 · titles-v4</span></h2>
     <div class="sub range-meta" id="modelUtilMeta">Loading Cursor Models / Other Models pools…</div>
     <div class="allow-grid" id="modelUtilGrid">
       <div class="allow-card primary">
@@ -7082,7 +7378,7 @@ function pctBar(pct){
 function renderModelUtil(){
   const el=document.getElementById('modelUtil');
   if(!el) return;
-  // Never hide this section — if you cannot see "Included in plan · pools-v3",
+  // Never hide this section · stamp titles-v4 — if you cannot see "Included in plan · pools-v3",
   // the browser is not talking to this build of cursor_dashboard.py.
   el.style.display='block';
   const build=document.getElementById('modelUtilBuild');
@@ -7509,7 +7805,7 @@ function render(){
             +`<b>Chat titles / PR context look thin</b> (${weak} of ${sess.length} chats). `
             +`Pools come from Cursor billing; names/PRs come from the local IDE store `
             +`(Cursor 3.0+ keeps titles in ItemTable <code>composer.composerHeaders</code>). `
-            +`Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>), then hard-refresh. `
+            +`Confirm page stamp <b>titles-v4</b>. Click <b>Rebuild from IDE store</b> (or restart with <code>--import-ide</code>), then hard-refresh. `
             +`Check <code>/api/store</code> → <code>composer_index.headers_named</code> &gt; 0. `
             +`Also expand the “Cost by chat / session” section if it is collapsed (▸).`;
         }
@@ -7559,7 +7855,7 @@ function render(){
       const gitBadge=(s.git_correlation&&s.git_correlation.matched)
         ? ` <span class="b gitinf" title="Repos inferred from nearby git commits">git matched</span>`:'';
       return `<tr class="row${s.unattributed||s.orphan_billed?' unattr':''}" data-id="${s.session_id}">
-      <td><span class="expand">▸</span> ${esc(s.title)}${cloudBadge}${s.est?' <span class="b est" title="Includes tokens inferred from transcript length">est</span>':''}${unBadge}${gitBadge}${s.billed&&s.account_label&&(DATA.billing_emails||[]).length>1?` <span class="b more">${esc(s.account_label)}</span>`:''}${s.billed===false&&DATA.billed?` <span class="b more" title="On this machine but not billed to ${esc((DATA.billing_emails||[DATA.billing_email]).filter(Boolean).join(' / ')||'the signed-in account')}${s.account_label?' — likely '+esc(s.account_label):''}">${esc(s.account_label||'other account')}</span>`:''}${s.subagent?' <span class="b more">subagent</span>':''}${sub}${badges(s.refs)}</td>
+      <td><span class="expand">▸</span> ${esc(s.title)}${s.title_source?` <span class="b more" title="Title recovered from ${esc(s.title_source)}">${esc(s.title_source)}</span>`:``}${s.title_status?` <span class="b more" title="${esc(s.title_status)}">no local title</span>`:``}${cloudBadge}${s.est?' <span class="b est" title="Includes tokens inferred from transcript length">est</span>':''}${unBadge}${gitBadge}${s.billed&&s.account_label&&(DATA.billing_emails||[]).length>1?` <span class="b more">${esc(s.account_label)}</span>`:''}${s.billed===false&&DATA.billed?` <span class="b more" title="On this machine but not billed to ${esc((DATA.billing_emails||[DATA.billing_email]).filter(Boolean).join(' / ')||'the signed-in account')}${s.account_label?' — likely '+esc(s.account_label):''}">${esc(s.account_label||'other account')}</span>`:''}${s.subagent?' <span class="b more">subagent</span>':''}${sub}${badges(s.refs)}</td>
       <td>${s.top_model}${s.models>1?' <span class="sub">+'+(s.models-1)+'</span>':''}</td>
       <td>${num(s.turns)}</td><td>${num(s.requests)}</td><td>${kt(s.input_tokens)}</td>
       <td>${kt(s.cache_read_tokens)}</td><td>${kt(s.output_tokens)}</td>

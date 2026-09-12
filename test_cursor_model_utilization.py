@@ -416,5 +416,57 @@ class ItemTableComposerIndexTests(unittest.TestCase):
         self.assertEqual(sessions[0]["title"], "Fix auth redirect")
 
 
+
+class AdaptiveComposerHeadersTests(unittest.TestCase):
+    def test_reads_alternate_sql_column_names(self):
+        import json, os, sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.row_factory = sqlite3.Row
+            # Simulate a Cursor build with snake_case columns.
+            con.execute(
+                "CREATE TABLE composerHeaders ("
+                "composer_id TEXT PRIMARY KEY, workspace_id TEXT, created_at INT, "
+                "updated_at INT, archived INT, subagent INT, data BLOB)"
+            )
+            con.execute(
+                "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)"
+            )
+            con.execute(
+                "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)"
+            )
+            con.execute(
+                "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?)",
+                ("cid-sql", "ws", 1, 2, 0, 0,
+                 json.dumps({"name": "SQL header title", "subtitle": "from sql"})),
+            )
+            con.commit()
+            meta = d._header_meta(con)
+            con.close()
+            self.assertEqual(meta["cid-sql"]["title"], "SQL header title")
+
+    def test_fill_titles_from_bubbles_for_untitled_sessions(self):
+        import json, os, sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.row_factory = sqlite3.Row
+            con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+            con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+            con.execute(
+                "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                ("bubbleId:cid-b1:u1",
+                 json.dumps({"type": 1, "text": "Refactor the payment webhook handler"})),
+            )
+            con.commit()
+            sessions = [{"session_id": "cid-b1", "title": d.UNTITLED_TITLE}]
+            n = d._fill_titles_from_local_content(con, sessions, {})
+            con.close()
+            self.assertEqual(n, 1)
+            self.assertEqual(sessions[0]["title"], "Refactor the payment webhook handler")
+            self.assertEqual(sessions[0]["title_source"], "bubble")
+
+
 if __name__ == "__main__":
     unittest.main()
