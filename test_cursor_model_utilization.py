@@ -902,5 +902,86 @@ class AdaptiveComposerHeadersTests(unittest.TestCase):
         self.assertEqual(keys, {"acme/app#10", "acme/app#11"})
 
 
+
+class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
+    """Full-composer PR scan + mention-day scoping (not session first billed day)."""
+
+    def test_full_scan_keeps_all_tool_prs_not_only_latest_two(self):
+        import json, os, sqlite3, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+            cid = "chat-many-prs"
+            for i, n in enumerate([10, 11, 12, 13]):
+                blob = json.dumps({
+                    "type": 2,
+                    "createdAt": f"2026-09-{10 + i:02d}T12:00:00.000Z",
+                    "text": "",
+                    "toolFormerData": {
+                        "result": f"Opened https://github.com/acme/app/pull/{n}"
+                    },
+                })
+                con.execute(
+                    "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                    (f"bubbleId:{cid}:b{i}", blob),
+                )
+            for i in range(50, 400):
+                con.execute(
+                    "INSERT INTO cursorDiskKV VALUES (?, ?)",
+                    (f"bubbleId:{cid}:n{i}",
+                     json.dumps({"type": 2, "createdAt": f"2026-09-12T01:{i % 60:02d}:00Z",
+                                 "text": f"noise {i}"})),
+                )
+            con.commit()
+            texts = {}
+            added, hints = d._inject_composer_pr_links(con, texts, [cid])
+            con.close()
+            self.assertGreaterEqual(added, 4)
+            refs = d._build_refs([(cid, texts[cid])], {}, set())
+            keys = {p["key"] for p in refs[cid]["prs"]}
+            self.assertEqual(keys, {"acme/app#10", "acme/app#11", "acme/app#12", "acme/app#13"})
+            self.assertIn(cid, hints)
+
+    def test_clip_keeps_today_prs_off_yesterday_view(self):
+        sess = {
+            "session_id": "s1",
+            "title": "multi-day agent",
+            "first_day": "2026-09-11",
+            "last_day": "2026-09-11",
+            "days": {
+                "2026-09-11": {
+                    "cost_usd": 5.0, "requests": 1, "total_tokens": 10,
+                    "input_tokens": 5, "output_tokens": 5,
+                    "cache_read_tokens": 0, "cache_write_tokens": 0,
+                    "measured_tokens": 10, "est_usd": 0.0, "on_demand_usd": 0.0,
+                }
+            },
+            "refs": {
+                "jira": [], "repos": [],
+                "prs": [
+                    {"key": "acme/app#24", "repo": "acme/app", "number": 24,
+                     "created": True, "first_day": "2026-09-11",
+                     "last_day": "2026-09-11", "days": ["2026-09-11"]},
+                    {"key": "acme/app#25", "repo": "acme/app", "number": 25,
+                     "created": True, "first_day": "2026-09-12",
+                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
+                    {"key": "acme/app#26", "repo": "acme/app", "number": 26,
+                     "created": True, "first_day": "2026-09-12",
+                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
+                ],
+            },
+            "billed": True,
+        }
+        yesterday = d._clip(sess, "2026-09-11", "2026-09-11")
+        self.assertEqual(
+            [p["key"] for p in yesterday["refs"]["prs"]], ["acme/app#24"])
+        today = d._clip(sess, "2026-09-12", "2026-09-12")
+        self.assertIsNotNone(today)
+        self.assertEqual(
+            {p["key"] for p in today["refs"]["prs"]},
+            {"acme/app#25", "acme/app#26"})
+
+
 if __name__ == "__main__":
     unittest.main()
