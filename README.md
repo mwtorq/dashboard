@@ -534,6 +534,16 @@ Those are the same numbers you see on cursor.com. Local `state.vscdb` is used
 for **titles, repos, and chat text** (Jira / PR / repo attribution), not for
 inventing a dollar figure.
 
+Included subscription compute is also split into two utilization pools, the
+same bars as cursor.com/dashboard:
+
+- **Cursor Models** — Auto + Composer (`autoPercentUsed`)
+- **Other Models** — named / third-party APIs (`apiPercentUsed`)
+
+Allocated is 100% of each included pool; used and remaining are Cursor's
+utilization percentages (they are not a simple `includedSpend / limit` split).
+Per-model cycle totals come from `get-aggregated-usage-events`.
+
 `--no-api` skips the Cursor API and falls back to local transcript estimates
 from published per-model rates. That undercounts invoices and is a last resort
 (offline, unsigned-in, or debugging).
@@ -560,19 +570,27 @@ filter.
   plus explicit From / To boxes. Presets re-anchor on every refresh.
 - **KPI cards** — total cost, chats, requests, tokens, included vs on-demand
   split, and subscription invoice totals in range.
-- **Plan allowance this cycle** — included usage vs the plan limit, bonus
+- **Plan allowance this cycle** — included usage **used of allocated**, bonus
   usage, on-demand pool used/remaining, and tokens this cycle. The included
   budget defaults to **$70** (Pro Plus) and is overridden by the billing API
   when available; `--budget` or the banner input persists to
   `cost-dashboard-state.json` beside the Cursor store.
+- **Included model utilization** — the two subscription compute pools from
+  [cursor.com/dashboard](https://cursor.com/dashboard): *Cursor Models*
+  (Auto + Composer) and *Other Models* (named / third-party APIs), plus the
+  blended total. Each pool shows allocated (100% of included compute), used,
+  and remaining percentages from `autoPercentUsed` / `apiPercentUsed` /
+  `totalPercentUsed` (or the matching display-message fallback on team
+  accounts). A per-model table for the billing cycle comes from
+  `get-aggregated-usage-events` (same source as the official dashboard).
 - **Daily spend** bar chart, with on-demand called out separately from
   included usage.
 - **Cost by work item** — *Sessions* / *Repositories* / *Pull requests* tabs,
   plus a keyword search on the active tab. Repo and PR attribution uses local
   git activity around billed turns when a multi-root workspace would otherwise
   split cost evenly.
-- **Cost by model** and a **per-chat table**. Click a row for a per-turn
-  breakdown.
+- **Cost by model** (with Cursor Models vs Other Models pool badges) and a
+  **per-chat table**. Click a row for a per-turn breakdown.
 - **Global chat filter** — the top-bar keyword recomputes the whole page
   against matching chats (title, repo, Jira, PR).
 - **Manual refresh** plus a 15-minute auto-refresh (on by default), with the

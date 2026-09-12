@@ -2341,6 +2341,232 @@ def _cents_usd(value):
         return 0.0
 
 
+# Subscription included compute is split into two pools (cursor.com/dashboard):
+# Cursor Models (Auto + Composer) and Other Models (named / third-party APIs).
+POOL_CURSOR = "cursor"
+POOL_OTHER = "other"
+POOL_LABELS = {
+    POOL_CURSOR: "Cursor Models",
+    POOL_OTHER: "Other Models",
+}
+RE_PCT_MSG = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+
+def _int_tokens(value):
+    if value in (None, ""):
+        return 0
+    try:
+        return int(float(str(value).replace(",", "")))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _iso_to_ms(value):
+    """RFC3339 / unix seconds / unix ms -> unix milliseconds."""
+    if not value:
+        return 0
+    try:
+        if isinstance(value, (int, float)) or (
+                isinstance(value, str) and str(value).strip().isdigit()):
+            n = int(value)
+            return n if n >= 10 ** 12 else n * 1000
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except (TypeError, ValueError, OSError):
+        return 0
+
+
+def _finite_pct(value):
+    """Return a non-negative finite percentage, or None if missing/unusable."""
+    if value is None or value == "":
+        return None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    if n != n or n in (float("inf"), float("-inf")):
+        return None
+    return max(0.0, n)
+
+
+def _parse_percent_from_message(msg):
+    """Pull the leading N% out of Cursor display copy, e.g. 'You've used 98%…'."""
+    if not msg:
+        return None
+    m = RE_PCT_MSG.search(str(msg))
+    return _finite_pct(m.group(1)) if m else None
+
+
+def _model_pool(model, tier=None):
+    """Classify a model into the subscription included-usage pool.
+
+    Cursor Models = Auto + Composer (dashboard `autoPercentUsed`).
+    Other Models = named / third-party APIs (dashboard `apiPercentUsed`).
+    `tier` from GetAggregatedUsageEvents: 2 = Cursor models, 1 = named.
+    """
+    try:
+        t = int(tier)
+    except (TypeError, ValueError):
+        t = None
+    if t == 2:
+        return POOL_CURSOR
+    if t == 1:
+        return POOL_OTHER
+    m = _norm_model(model)
+    if m in ("auto", "default") or m.startswith("composer"):
+        return POOL_CURSOR
+    return POOL_OTHER
+
+
+def _pool_row(pool_id, label, detail, used_pct, message, unlimited):
+    if unlimited:
+        return {
+            "id": pool_id,
+            "label": label,
+            "detail": detail,
+            "unlimited": True,
+            "used_pct": None,
+            "remaining_pct": None,
+            "allocated_pct": None,
+            "message": message or "Unlimited included usage",
+        }
+    if used_pct is None:
+        return None
+    used = float(used_pct)
+    return {
+        "id": pool_id,
+        "label": label,
+        "detail": detail,
+        "unlimited": False,
+        "used_pct": round(used, 1),
+        "remaining_pct": round(max(0.0, 100.0 - used), 1),
+        "allocated_pct": 100.0,
+        "message": message or "",
+    }
+
+
+def _model_utilization(summary, period=None):
+    """Included model-pool utilization from usage-summary + get-current-period-usage.
+
+    Allocated is 100% of each included pool. Used/remaining are Cursor's
+    `autoPercentUsed` / `apiPercentUsed` / `totalPercentUsed` (or the
+    matching display-message percentages on team accounts). These are not a
+    simple includedSpend/limit split — cursor.com shows them as their own bars.
+    """
+    summary = summary or {}
+    period = period or {}
+    indiv = summary.get("individualUsage") or {}
+    plan = indiv.get("plan") or {}
+    plan_usage = (period or {}).get("planUsage") or {}
+    unlimited = bool(summary.get("isUnlimited"))
+    auto_msg = (summary.get("autoModelSelectedDisplayMessage")
+                or period.get("autoModelSelectedDisplayMessage") or "")
+    named_msg = (summary.get("namedModelSelectedDisplayMessage")
+                 or period.get("namedModelSelectedDisplayMessage") or "")
+    total_msg = period.get("displayMessage") or ""
+
+    def _pct(*candidates):
+        for raw in candidates:
+            n = _finite_pct(raw)
+            if n is not None:
+                return n
+        return None
+
+    auto_pct = _pct(plan.get("autoPercentUsed"), plan_usage.get("autoPercentUsed"),
+                    _parse_percent_from_message(auto_msg))
+    api_pct = _pct(plan.get("apiPercentUsed"), plan_usage.get("apiPercentUsed"),
+                   _parse_percent_from_message(named_msg))
+    total_pct = _pct(plan.get("totalPercentUsed"), plan_usage.get("totalPercentUsed"),
+                     _parse_percent_from_message(total_msg))
+    specs = (
+        ("cursor", "Cursor Models", "Auto + Composer", auto_pct, auto_msg),
+        ("other", "Other Models", "Named / third-party APIs", api_pct, named_msg),
+        ("total", "Total included", "Subscription included compute", total_pct, total_msg),
+    )
+    pools = []
+    for spec in specs:
+        row = _pool_row(*spec, unlimited)
+        if row:
+            pools.append(row)
+    on_demand = indiv.get("onDemand") or (summary.get("teamUsage") or {}).get("onDemand") or {}
+    return {
+        "unlimited": unlimited,
+        "membership": summary.get("membershipType") or "",
+        "pools": pools,
+        "auto_pct": auto_pct,
+        "api_pct": api_pct,
+        "total_pct": total_pct,
+        "auto_msg": auto_msg,
+        "named_msg": named_msg,
+        "display_msg": total_msg,
+        "on_demand_enabled": bool(on_demand.get("enabled")),
+    }
+
+
+def _parse_aggregated_usage(raw):
+    """Normalize GetAggregatedUsageEvents rows into dashboard model rows."""
+    rows = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        model = _norm_model(item.get("modelIntent") or item.get("model") or "unknown")
+        inn = _int_tokens(item.get("inputTokens"))
+        out = _int_tokens(item.get("outputTokens"))
+        cwrite = _int_tokens(item.get("cacheWriteTokens"))
+        cread = _int_tokens(item.get("cacheReadTokens"))
+        try:
+            cost = float(item.get("totalCents") or 0) / 100.0
+        except (TypeError, ValueError):
+            cost = 0.0
+        pool = _model_pool(model, item.get("tier"))
+        rows.append({
+            "model": model,
+            "pool": pool,
+            "pool_label": POOL_LABELS.get(pool, "Other Models"),
+            "tier": item.get("tier"),
+            "input_tokens": inn,
+            "output_tokens": out,
+            "cache_write_tokens": cwrite,
+            "cache_read_tokens": cread,
+            "total_tokens": inn + out + cwrite + cread,
+            "cost_usd": round(cost, 6),
+            "requests": _int_tokens(item.get("requests") or item.get("numRequests")),
+        })
+    rows.sort(key=lambda r: -r["cost_usd"])
+    total = sum(r["cost_usd"] for r in rows)
+    for row in rows:
+        row["share"] = (row["cost_usd"] / total) if total else 0.0
+    return rows
+
+
+def _pool_spend(rows):
+    out = {POOL_CURSOR: 0.0, POOL_OTHER: 0.0}
+    for row in rows or []:
+        pool = row.get("pool") or POOL_OTHER
+        out[pool] = out.get(pool, 0.0) + (row.get("cost_usd") or 0)
+    return {k: round(v, 4) for k, v in out.items()}
+
+
+def _fetch_aggregated_usage(cookie, summary):
+    """Per-model cycle totals from cursor.com (same table as the official dashboard)."""
+    start_ms = _iso_to_ms(summary.get("billingCycleStart"))
+    end_ms = _iso_to_ms(summary.get("billingCycleEnd")) or int(
+        time.time() * 1000)
+    if not start_ms:
+        return []
+    chunk = _api(cookie, "POST", "/api/dashboard/get-aggregated-usage-events", {
+        "teamId": 0,
+        "startDate": str(start_ms),
+        "endDate": str(end_ms),
+    })
+    return chunk.get("aggregations") or []
+
+
 PLAN_FEE_LABELS = {
     2000: "Pro",
     6000: "Pro Plus",
@@ -2550,6 +2776,7 @@ def _save_billing_cache(email, one):
         "fetched_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "events": one.get("events") or [],
         "invoices": one.get("invoices") or [],
+        "aggregations": one.get("aggregations") or [],
     }
     path = _billing_cache_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -2577,6 +2804,7 @@ def _cached_account_billing(email):
         "period": {},
         "events": entry["events"],
         "invoices": entry.get("invoices") or [],
+        "aggregations": entry.get("aggregations") or [],
         "cookie": "",
         "cached_at": entry.get("fetched_at") or "",
     }
@@ -2590,6 +2818,12 @@ def _fetch_account_billing(cookie, fallback_email="", fallback_user_id=""):
         raise RuntimeError("Could not resolve Cursor user id.")
     summary = _api(cookie, "GET", "/api/usage-summary")
     period = _api(cookie, "POST", "/api/dashboard/get-current-period-usage", {})
+    aggregations = []
+    try:
+        aggregations = _fetch_aggregated_usage(cookie, summary)
+    except Exception as exc:
+        print(f"  aggregated usage unavailable for {email or user_id} ({exc})",
+              flush=True)
     start = BILLING_START
     end = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
     events, page = [], 1
@@ -2625,6 +2859,7 @@ def _fetch_account_billing(cookie, fallback_email="", fallback_user_id=""):
         "user_id": user_id,
         "summary": summary,
         "period": period,
+        "aggregations": aggregations,
         "events": events,
         "invoices": invoices,
         "cookie": cookie,
@@ -2691,7 +2926,8 @@ def fetch_billing(con, force=False):
                 _save_billing_cache(email, one)
             emails.append(email)
         print(f"  {email or 'account'}: {len(one['events'])} billed events, "
-              f"{len(one['invoices'])} invoices", flush=True)
+              f"{len(one['invoices'])} invoices, "
+              f"{len(one.get('aggregations') or [])} model aggregations", flush=True)
         if email.lower() == LEGACY_INVOICE_EMAIL:
             inv_net = sum(
                 _cents_usd(i.get("amountCents")) - _cents_usd(i.get("refundAmount"))
@@ -2715,6 +2951,7 @@ def fetch_billing(con, force=False):
         "me": primary["me"],
         "summary": primary["summary"],
         "period": primary["period"],
+        "aggregations": primary.get("aggregations") or [],
         "events": merged_events,
         "invoices": merged_invoices,
         "emails": emails,
@@ -3871,6 +4108,8 @@ def scan_cursor(force=False):
             "billing_error": billing_error,
             "billing_summary": (billing or {}).get("summary"),
             "billing_period": (billing or {}).get("period"),
+            "billing_aggregations": _parse_aggregated_usage(
+                (billing or {}).get("aggregations")),
             "billing_email": account.get("email") or "",
             "billing_emails": (billing or {}).get("emails") or (
                 [account.get("email")] if account.get("email") else []),
@@ -4465,6 +4704,8 @@ def _aggregate(sessions):
           "cost_usd": c["cost_usd"],
           "on_demand_usd": c["on_demand_usd"],
           "est": bool(c["est"]),
+          "pool": _model_pool(k),
+          "pool_label": POOL_LABELS.get(_model_pool(k), "Other Models"),
           "known_rate": True if any(s.get("billed") for s in sessions) else _known_rate(k)}
          for k, c in models.items()),
         key=lambda m: -m["cost_usd"])
@@ -4565,6 +4806,14 @@ def _cycle_mtd(data, today):
     mtd_sessions = [c for c in (_clip(s, start_s or MIN_DAY, end_s or MAX_DAY)
                                 for s in data["sessions"] if s.get("billed")) if c] if start_s else []
     cycle_tokens = sum(s["total_tokens"] or 0 for s in mtd_sessions)
+    util = _model_utilization(summary, period)
+    cycle_models = list(data.get("billing_aggregations") or [])
+    if not cycle_models and mtd_sessions:
+        cycle_models, _ = _aggregate(mtd_sessions)
+    spend = _pool_spend(cycle_models)
+    for pool in util["pools"]:
+        if pool["id"] in spend:
+            pool["metered_usd"] = spend[pool["id"]]
     return {
         "which": "current",
         "month": f"{start_s} → {end_s}" if start_s else today.strftime("%Y-%m"),
@@ -4584,14 +4833,17 @@ def _cycle_mtd(data, today):
         "on_demand_usd": od_used,
         "on_demand_limit": od_limit,
         "on_demand_remaining": od_remaining,
-        "auto_pct": plan.get("autoPercentUsed"),
-        "api_pct": plan.get("apiPercentUsed"),
-        "total_pct": plan.get("totalPercentUsed"),
-        "auto_msg": (summary.get("autoModelSelectedDisplayMessage")
-                     or period.get("autoModelSelectedDisplayMessage") or ""),
-        "named_msg": (summary.get("namedModelSelectedDisplayMessage")
-                      or period.get("namedModelSelectedDisplayMessage") or ""),
-        "display_msg": period.get("displayMessage") or "",
+        "auto_pct": util.get("auto_pct"),
+        "api_pct": util.get("api_pct"),
+        "total_pct": util.get("total_pct"),
+        "auto_msg": util.get("auto_msg") or "",
+        "named_msg": util.get("named_msg") or "",
+        "display_msg": util.get("display_msg") or "",
+        "unlimited": util.get("unlimited"),
+        "pools": util.get("pools") or [],
+        "pool_spend": spend,
+        "cycle_models": cycle_models,
+        "on_demand_enabled": util.get("on_demand_enabled"),
         "budget": budget,
         "pct": (included_used / included_limit * 100) if included_limit else None,
         "remaining": included_remaining,
@@ -4865,6 +5117,7 @@ def build_payload(start, end, q="", force=False):
         "cycles": cycles,
         "range_is_current_cycle": range_is_current_cycle,
         "range_allowance": range_allowance,
+        "cycle_models": (mtd or {}).get("cycle_models") or [],
         "rollup": _enrich_jira_rollup(rollup(billed_rows, refs, turn_prs, turn_cost,
                                             data.get("git_pr_catalog"),
                                             data.get("path_by_github"))),
@@ -5333,6 +5586,11 @@ def _digest_html(d):
     cards = [("Spend", _money(t["cost_usd"]))]
     if billed:
         cards += [("Included", _money(incl)), ("On-demand", _money(od))]
+        mtd = p.get("mtd") or {}
+        if mtd.get("auto_pct") is not None:
+            cards.append(("Cursor Models", f"{mtd['auto_pct']:.0f}% used"))
+        if mtd.get("api_pct") is not None:
+            cards.append(("Other Models", f"{mtd['api_pct']:.0f}% used"))
     cards += [("Requests", f"{t['requests']:,}"),
               ("Chats", f"{t['sessions']:,}"),
               ("Tokens", f"{(t.get('total_tokens') or 0):,}")]
@@ -5781,6 +6039,13 @@ section.collapsed > *:not(h2){display:none !important}
 #rangeAllowance{margin-bottom:16px}
 #rangeAllowance h2{font-size:15px;margin:0 0 6px;font-weight:600}
 #rangeAllowance .range-meta{margin-bottom:10px}
+#modelUtil h2{font-size:15px;margin:0 0 6px;font-weight:600}
+#modelUtil .range-meta{margin-bottom:10px}
+#cycleModels{margin-top:12px}
+.pool-badge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:8px;
+  border:1px solid var(--line);color:var(--dim);margin-left:6px;vertical-align:middle}
+.pool-badge.cursor{border-color:#388bfd;color:#79c0ff}
+.pool-badge.other{border-color:#d2a8ff;color:#d2a8ff}
 .meter{height:12px;background:#0d1117;border:1px solid var(--line);border-radius:6px;overflow:hidden}
 .meter>div{height:100%;background:var(--good);transition:width .3s}
 .meter>div.warn{background:#d29922}.meter>div.over{background:#f85149}
@@ -5865,7 +6130,7 @@ section.collapsed > *:not(h2){display:none !important}
     <div class="allow-grid">
       <div class="allow-card primary">
         <div class="k">Included usage allowance</div>
-        <div class="v"><span id="cycleIncUsed"></span> <span class="sub">of <span id="cycleIncLimit"></span></span></div>
+        <div class="v"><span id="cycleIncUsed"></span> <span class="sub">used of <span id="cycleIncLimit"></span> allocated</span></div>
         <div class="allow-rem" id="cycleIncRem"></div>
         <div class="meter"><div id="mtdBar"></div></div>
         <div class="sub" id="cycleIncDetail"></div>
@@ -5877,7 +6142,7 @@ section.collapsed > *:not(h2){display:none !important}
       </div>
       <div class="allow-card">
         <div class="k">On-demand pool</div>
-        <div class="v"><span id="cycleOdUsed"></span> <span class="sub">of <span id="cycleOdLimit"></span></span></div>
+        <div class="v"><span id="cycleOdUsed"></span> <span class="sub">used of <span id="cycleOdLimit"></span> allocated</span></div>
         <div class="allow-rem" id="cycleOdRem"></div>
         <div class="sub">Cash overage invoiced when this pool is used.</div>
       </div>
@@ -5889,6 +6154,13 @@ section.collapsed > *:not(h2){display:none !important}
     </div>
     <div class="sub" id="mtdFoot"></div>
     <div class="sub" id="mtdNote"></div>
+  </section>
+  <section id="modelUtil" style="display:none">
+    <h2>Included model utilization</h2>
+    <div class="sub range-meta" id="modelUtilMeta"></div>
+    <div class="allow-grid" id="modelUtilGrid"></div>
+    <table id="cycleModels"></table>
+    <div class="sub" id="cycleModelsFoot"></div>
   </section>
   <section><h2>Daily spend</h2><div class="spark" id="spark"></div><div class="sub" id="sparklabel"></div></section>
   <section><h2>Cost by work item</h2>
@@ -6254,10 +6526,99 @@ function renderRangeAllowance(){
       : '')
     +` · ${kt(ra.total_tokens)} tokens${originCost}`;
 }
+function poolBadge(pool){
+  const id=pool==='cursor'?'cursor':'other';
+  const label=id==='cursor'?'Cursor Models':'Other Models';
+  const title=id==='cursor'
+    ? 'Included subscription pool: Auto + Composer'
+    : 'Included subscription pool: named / third-party APIs';
+  return ` <span class="pool-badge ${id}" title="${title}">${label}</span>`;
+}
+function pctBar(pct){
+  const p=Math.max(0, pct||0);
+  const w=Math.min(100,p);
+  const cls=p>=100?'over':p>=80?'warn':'';
+  return `<div class="meter"><div class="${cls}" style="width:${w}%"></div></div>`;
+}
+function renderModelUtil(){
+  const el=document.getElementById('modelUtil');
+  if(!el) return;
+  const m=DATA.mtd||{};
+  const pools=m.pools||[];
+  const rows=DATA.cycle_models||m.cycle_models||[];
+  if(!DATA.billed||(!pools.length&&!rows.length)){
+    el.style.display='none';
+    return;
+  }
+  el.style.display='';
+  const plan=(m.plan||DATA.plan||'').replace(/_/g,' ');
+  const unlim=!!m.unlimited;
+  let meta=plan?(plan+' · '):'';
+  meta+=`cycle ${m.start||''} → ${m.end||''}`;
+  if(m.reset_date) meta+=` · resets ${m.reset_date}`;
+  document.getElementById('modelUtilMeta').textContent=unlim
+    ? meta+' · plan reports unlimited included usage — pool percentages are not a cap.'
+    : meta+' · same Auto+Composer / named-model pools as cursor.com/dashboard. '
+      +'Allocated is 100% of each included pool; used and remaining are Cursor utilization, '
+      +'not a simple spend ÷ dollar-limit split.';
+  const grid=document.getElementById('modelUtilGrid');
+  if(pools.length){
+    grid.innerHTML=pools.map(p=>{
+      const metered=(p.metered_usd||0)>0.004
+        ? `${usd(p.metered_usd)} metered this cycle`
+        : '';
+      if(p.unlimited){
+        return `<div class="allow-card${p.id==='total'?' primary':''}">
+          <div class="k">${esc(p.label)}</div>
+          <div class="v">Unlimited <span class="sub">${esc(p.detail||'')}</span></div>
+          <div class="sub">${esc([p.message,metered].filter(Boolean).join(' · '))}</div>
+        </div>`;
+      }
+      const used=p.used_pct||0;
+      const rem=p.remaining_pct;
+      const remTxt=used>=100
+        ? 'Included pool exhausted'
+        : `${(rem||0).toFixed(0)}% remaining`;
+      const alloc=p.allocated_pct==null?100:p.allocated_pct;
+      return `<div class="allow-card${p.id==='total'?' primary':''}">
+        <div class="k">${esc(p.label)}</div>
+        <div class="v">${used.toFixed(0)}% used <span class="sub">of ${alloc}% allocated</span></div>
+        <div class="allow-rem${used>=100?' over':''}">${remTxt}</div>
+        ${pctBar(used)}
+        <div class="sub">${esc([p.detail,p.message,metered].filter(Boolean).join(' · '))}</div>
+      </div>`;
+    }).join('');
+  } else grid.innerHTML='';
+  const tbl=document.getElementById('cycleModels');
+  const foot=document.getElementById('cycleModelsFoot');
+  if(!rows.length){
+    tbl.innerHTML='';
+    foot.textContent='';
+    return;
+  }
+  const max=Math.max(...rows.map(r=>r.cost_usd||0),0.0001);
+  tbl.innerHTML='<thead><tr><th>Model</th><th>Pool</th><th>Input</th><th>Cache write</th>'
+    +'<th>Cache read</th><th>Output</th><th>Cost this cycle</th><th>Share</th></tr></thead><tbody>'
+    +rows.map(r=>{
+      const pool=r.pool||'other';
+      return `<tr><td>${esc(r.model)}</td><td>${poolBadge(pool)}</td>`
+        +`<td>${kt(r.input_tokens)}</td><td>${kt(r.cache_write_tokens)}</td>`
+        +`<td>${kt(r.cache_read_tokens)}</td><td>${kt(r.output_tokens)}</td>`
+        +`<td class="cost">${usd(r.cost_usd)}</td>`
+        +`<td style="width:160px"><div class="bar" style="width:${(r.cost_usd||0)/max*100}%"></div></td></tr>`;
+    }).join('')+'</tbody>';
+  const spend=m.pool_spend||{};
+  const cursorUsd=spend.cursor||0;
+  const otherUsd=spend.other||0;
+  foot.textContent=`Official cycle aggregations from Cursor (GetAggregatedUsageEvents) — `
+    +`${usd(cursorUsd)} Cursor Models · ${usd(otherUsd)} Other Models. `
+    +`These are included-subscription totals for the billing cycle, independent of the date-range filter.`;
+}
 function render(){
   const t=DATA.totals;
   renderDigest();
   renderRangeAllowance();
+  renderModelUtil();
   const budget=DATA.range_is_current_cycle?(DATA.mtd||{}).budget:null;
   const mix=document.getElementById('mixnote');
   if(DATA.billing_error && !DATA.billed){
@@ -6396,7 +6757,9 @@ function render(){
       const incPct=incLimit?Math.min(100,incUsed/incLimit*100):0;
       const exhausted=!isLast&&incLimit>0.004&&incRem<=0.004;
       document.getElementById('cycleIncUsed').textContent=usd(incUsed);
-      document.getElementById('cycleIncLimit').textContent=incLimit?usd(incLimit):'—';
+      document.getElementById('cycleIncLimit').textContent=m.unlimited
+        ? 'unlimited'
+        : (incLimit?usd(incLimit):'—');
       const incRemEl=document.getElementById('cycleIncRem');
       incRemEl.textContent=isLast
         ? (incLimit
@@ -6505,9 +6868,9 @@ function render(){
 
   const mmax=Math.max(...DATA.models.map(m=>m.cost_usd),0.0001);
   document.getElementById('models').innerHTML=
-    '<thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th>'
+    '<thead><tr><th>Model</th><th>Pool</th><th>Requests</th><th>Input</th><th>Cache write</th><th>Cache read</th><th>Output</th>'
     +`<th title="${costThTitle(billed)}">Cost</th><th>Share</th></tr></thead><tbody>`+
-    DATA.models.map(m=>`<tr><td>${m.model}${m.est?' <span class="b est" title="Includes estimated token data">est</span>':''}${m.known_rate?'':' <span class="b more" title="No published rate for this model id; Auto rates assumed">assumed rate</span>'}</td><td>${num(m.requests)}</td><td>${kt(m.input_tokens)}</td>
+    DATA.models.map(m=>`<tr><td>${m.model}${m.est?' <span class="b est" title="Includes estimated token data">est</span>':''}${m.known_rate?'':' <span class="b more" title="No published rate for this model id; Auto rates assumed">assumed rate</span>'}</td><td>${poolBadge(m.pool||'other')}</td><td>${num(m.requests)}</td><td>${kt(m.input_tokens)}</td>
       <td>${kt(m.cache_write_tokens)}</td><td>${kt(m.cache_read_tokens)}</td><td>${kt(m.output_tokens)}</td>
       <td class="cost">${costCell(m,billed)}</td><td style="width:160px"><div class="bar" style="width:${m.cost_usd/mmax*100}%"></div></td></tr>`).join('')+
     '</tbody>';
