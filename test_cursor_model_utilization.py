@@ -249,5 +249,17 @@ class PageMarkupTests(unittest.TestCase):
         self.assertLess(html.find('id="modelUtil"'), html.find('id="mtd"'))
 
 
+
+class SessionContextMarkupTests(unittest.TestCase):
+    def test_session_context_render_is_defensive(self):
+        html = d.PAGE
+        self.assertIn("const jira=refs.jira||[]", html)
+        self.assertIn("s.subtitle", html)
+        self.assertIn('id="chatSessions"', html)
+        self.assertIn("renderSessions", html)
+        self.assertIn("Chat titles / PR context look thin", html)
+        self.assertIn("fold:'+(s.id", html)
+
+
 if __name__ == "__main__":
     unittest.main()
