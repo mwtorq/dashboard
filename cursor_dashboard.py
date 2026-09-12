@@ -6680,25 +6680,45 @@ function pctBar(pct){
 function renderModelUtil(){
   const el=document.getElementById('modelUtil');
   if(!el) return;
-  const m=DATA.mtd||{};
-  const pools=m.pools||[];
+  const m=DATA.mtd||DATA.view_cycle||{};
+  let pools=m.pools||[];
   const rows=DATA.cycle_models||m.cycle_models||[];
   if(!DATA.billed){
     el.style.display='none';
     return;
   }
-  // Show whenever we have pool cards, cycle model rows, or a plan allowance
-  // (so the section does not disappear when Cursor omits percent fields).
-  if(!pools.length&&!rows.length&&!(m.included_limit>0)&&!m.unlimited){
-    el.style.display='none';
-    return;
+  // Always show for billed accounts (Settings → Plan & Usage pools). Synthesize
+  // cards from top-level percents when the pools array is empty so the section
+  // cannot disappear when usage-summary is partial or cached without percents.
+  if(!pools.length){
+    const synth=[];
+    const mk=(id,label,detail,pct,msg)=>{
+      if(pct==null && !m.unlimited) return;
+      const used=pct==null?0:+pct;
+      synth.push({
+        id, label, detail, unlimited:!!m.unlimited,
+        used_pct:m.unlimited?null:used,
+        remaining_pct:m.unlimited?null:Math.max(0,100-used),
+        allocated_pct:m.unlimited?null:100,
+        message:msg||'',
+        metered_usd:(m.pool_spend&&m.pool_spend[id])||0,
+      });
+    };
+    mk('cursor','Cursor Models','Includes Cursor Grok and Composer',
+      m.auto_pct, m.auto_msg||'Additional usage beyond limits consumes Other Models quota or on-demand spend.');
+    mk('other','Other Models','Named and third-party model APIs',
+      m.api_pct, m.named_msg||'Additional usage beyond limits consumes on-demand spend.');
+    if(m.total_pct!=null || m.unlimited)
+      mk('total','Total included','Subscription included compute', m.total_pct, m.display_msg||'');
+    pools=synth;
   }
-  el.style.display='';
+  el.style.display='block';
   const plan=(m.plan||DATA.plan||'').replace(/_/g,' ');
   const unlim=!!m.unlimited;
   let meta=plan?(plan+' · '):'';
   meta+=`cycle ${m.start||''} → ${m.end||''}`;
   if(m.reset_date) meta+=` · resets ${m.reset_date}`;
+  meta+=' · build pools-v2';
   document.getElementById('modelUtilMeta').textContent=unlim
     ? meta+' · plan reports unlimited included usage — pool percentages are not a cap.'
     : meta+' · same pools as Cursor Settings → Plan & Usage: '
@@ -6751,7 +6771,15 @@ function renderModelUtil(){
       ${pctBar(pct)}
       <div class="sub">Derived from included spend (${usd(used)} of ${usd(lim)}). Cursor did not return Auto/named pool percentages for this account.</div>
     </div>`;
-  } else grid.innerHTML='';
+  } else {
+    grid.innerHTML=`<div class="allow-card primary">
+      <div class="k">Cursor Models <span class="sub">— Includes Cursor Grok and Composer</span></div>
+      <div class="v">—</div>
+      <div class="sub">No pool percentages in the usage-summary response yet.
+        Click Refresh. If this persists, the local process may be on an old build or
+        usage-summary auth failed${DATA.billing_error?` (${esc(DATA.billing_error)})`:''}.</div>
+    </div>`;
+  }
   const tbl=document.getElementById('cycleModels');
   const foot=document.getElementById('cycleModelsFoot');
   if(!rows.length){
@@ -6779,9 +6807,10 @@ function renderModelUtil(){
 }
 function render(){
   const t=DATA.totals;
-  renderDigest();
-  renderRangeAllowance();
-  renderModelUtil();
+  // Plan & Usage pools first — do not let later render steps abort them.
+  try{ renderModelUtil(); }catch(err){ console.error('renderModelUtil', err); }
+  try{ renderDigest(); }catch(err){ console.error('renderDigest', err); }
+  try{ renderRangeAllowance(); }catch(err){ console.error('renderRangeAllowance', err); }
   const budget=DATA.range_is_current_cycle?(DATA.mtd||{}).budget:null;
   const mix=document.getElementById('mixnote');
   if(DATA.billing_error && !DATA.billed){
