@@ -261,5 +261,73 @@ class SessionContextMarkupTests(unittest.TestCase):
         self.assertIn("fold:'+(s.id", html)
 
 
+
+class UntitledTitleJoinTests(unittest.TestCase):
+    def test_fill_missing_title_from_bubble_text(self):
+        sess = {"title": "(untitled)"}
+        self.assertTrue(d._fill_missing_title(
+            sess, "Fix the auth redirect in login flow\nmore"))
+        self.assertEqual(sess["title"], "Fix the auth redirect in login flow")
+
+    def test_billing_join_uses_local_chat_text_as_title(self):
+        cid = "conv-1"
+        events = [{
+            "conversationId": cid,
+            "timestamp": 1_700_000_000_000,
+            "model": "gpt-5",
+            "kind": "INCLUDED",
+            "tokenUsage": {"totalCents": 12, "inputTokens": 10, "outputTokens": 5,
+                           "cacheWriteTokens": 0, "cacheReadTokens": 0},
+        }]
+        local = {
+            cid: {
+                "title": "",
+                "text": "Implement PR review checklist\nsecond line",
+                "repository": "acme/app",
+                "branch": "main",
+                "subtitle": "",
+            }
+        }
+        sessions, _, _ = d._sessions_from_billing(events, local, {}, {})
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["title"], "Implement PR review checklist")
+        self.assertEqual(sessions[0]["repository"], "acme/app")
+        self.assertFalse(sessions[0].get("orphan_billed"))
+
+    def test_empty_stub_still_counts_as_orphan(self):
+        notes = d._billing_match_notes("abc-123", {"title": "", "text": ""}, [{}])
+        self.assertTrue(notes.get("orphan_billed"))
+        notes2 = d._billing_match_notes(
+            "bc-cloud", {"title": "(untitled)", "text": ""}, [{}])
+        self.assertTrue(notes2.get("orphan_billed"))
+        self.assertTrue(notes2.get("cloud_agent"))
+
+
+class ComposerDataMergeTests(unittest.TestCase):
+    def test_merge_upgrades_empty_composer_data_name(self):
+        import json, sqlite3, tempfile, os
+        with tempfile.TemporaryDirectory() as td:
+            dst_path = os.path.join(td, "dst.vscdb")
+            src_path = os.path.join(td, "src.vscdb")
+            for path, name in ((dst_path, ""), (src_path, "Real chat title")):
+                con = sqlite3.connect(path)
+                con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+                blob = json.dumps({"name": name, "lastUpdatedAt": 200 if name else 100})
+                con.execute(
+                    "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+                    ("composerData:cid-1", blob))
+                con.commit(); con.close()
+            dst = sqlite3.connect(dst_path)
+            src = sqlite3.connect(src_path)
+            added, updated = d._merge_cursor_disk_kv(dst, src)
+            self.assertEqual(added, 0)
+            self.assertEqual(updated, 1)
+            raw = dst.execute(
+                "SELECT value FROM cursorDiskKV WHERE key=?",
+                ("composerData:cid-1",)).fetchone()[0]
+            self.assertEqual(json.loads(raw)["name"], "Real chat title")
+            dst.close(); src.close()
+
+
 if __name__ == "__main__":
     unittest.main()
