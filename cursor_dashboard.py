@@ -6236,6 +6236,24 @@ section.collapsed > *:not(h2){display:none !important}
   <div id="loadnote"><span class="spin"></span><span id="loadmsg">Loading…</span></div>
   <div id="err"></div>
   <div class="note" id="mixnote"></div>
+  <section id="modelUtil">
+    <h2>Included in plan <span class="sub" id="modelUtilBuild">· pools-v3</span></h2>
+    <div class="sub range-meta" id="modelUtilMeta">Loading Cursor Models / Other Models pools…</div>
+    <div class="allow-grid" id="modelUtilGrid">
+      <div class="allow-card primary">
+        <div class="k">Cursor Models <span class="sub">— Includes Cursor Grok and Composer</span></div>
+        <div class="v">…</div>
+        <div class="sub">Waiting for billed usage-summary (autoPercentUsed / apiPercentUsed).</div>
+      </div>
+      <div class="allow-card">
+        <div class="k">Other Models</div>
+        <div class="v">…</div>
+        <div class="sub">Named and third-party model APIs.</div>
+      </div>
+    </div>
+    <table id="cycleModels"></table>
+    <div class="sub" id="cycleModelsFoot"></div>
+  </section>
   <section id="rangeAllowance" style="display:none">
     <h2 id="rangeAllowHeading">Allowance usage</h2>
     <div class="sub range-meta" id="rangeAllowMeta"></div>
@@ -6291,13 +6309,6 @@ section.collapsed > *:not(h2){display:none !important}
     </div>
     <div class="sub" id="mtdFoot"></div>
     <div class="sub" id="mtdNote"></div>
-  </section>
-  <section id="modelUtil" style="display:none">
-    <h2>Included in plan</h2>
-    <div class="sub range-meta" id="modelUtilMeta"></div>
-    <div class="allow-grid" id="modelUtilGrid"></div>
-    <table id="cycleModels"></table>
-    <div class="sub" id="cycleModelsFoot"></div>
   </section>
   <section><h2>Daily spend</h2><div class="spark" id="spark"></div><div class="sub" id="sparklabel"></div></section>
   <section><h2>Cost by work item</h2>
@@ -6680,16 +6691,42 @@ function pctBar(pct){
 function renderModelUtil(){
   const el=document.getElementById('modelUtil');
   if(!el) return;
+  // Never hide this section — if you cannot see "Included in plan · pools-v3",
+  // the browser is not talking to this build of cursor_dashboard.py.
+  el.style.display='block';
+  const build=document.getElementById('modelUtilBuild');
+  if(build) build.textContent='· pools-v3';
   const m=DATA.mtd||DATA.view_cycle||{};
   let pools=m.pools||[];
   const rows=DATA.cycle_models||m.cycle_models||[];
-  if(!DATA.billed){
-    el.style.display='none';
+  const metaEl=document.getElementById('modelUtilMeta');
+  const grid=document.getElementById('modelUtilGrid');
+  if(!DATA || DATA.billed==null){
+    metaEl.textContent='Waiting for /api/data… · build pools-v3';
     return;
   }
-  // Always show for billed accounts (Settings → Plan & Usage pools). Synthesize
-  // cards from top-level percents when the pools array is empty so the section
-  // cannot disappear when usage-summary is partial or cached without percents.
+  if(!DATA.billed){
+    metaEl.textContent=(DATA.billing_error
+      ? (`Billed usage not loaded (${DATA.billing_error}). `)
+      : 'Billed usage not loaded. ')
+      +'Run without --no-api and sign into Cursor so usage-summary can return '
+      +'Cursor Models / Other Models percentages. · build pools-v3';
+    grid.innerHTML=`<div class="allow-card primary">
+      <div class="k">Cursor Models <span class="sub">— Includes Cursor Grok and Composer</span></div>
+      <div class="v">unavailable</div>
+      <div class="sub">Need billed usage-summary (autoPercentUsed). Do not pass --no-api.</div>
+    </div><div class="allow-card">
+      <div class="k">Other Models</div>
+      <div class="v">unavailable</div>
+      <div class="sub">Need billed usage-summary (apiPercentUsed).</div>
+    </div>`;
+    const tbl=document.getElementById('cycleModels');
+    const foot=document.getElementById('cycleModelsFoot');
+    if(tbl) tbl.innerHTML='';
+    if(foot) foot.textContent='';
+    return;
+  }
+  // Synthesize cards from top-level percents when pools array is empty.
   if(!pools.length){
     const synth=[];
     const mk=(id,label,detail,pct,msg)=>{
@@ -6712,20 +6749,18 @@ function renderModelUtil(){
       mk('total','Total included','Subscription included compute', m.total_pct, m.display_msg||'');
     pools=synth;
   }
-  el.style.display='block';
   const plan=(m.plan||DATA.plan||'').replace(/_/g,' ');
   const unlim=!!m.unlimited;
   let meta=plan?(plan+' · '):'';
   meta+=`cycle ${m.start||''} → ${m.end||''}`;
   if(m.reset_date) meta+=` · resets ${m.reset_date}`;
-  meta+=' · build pools-v2';
-  document.getElementById('modelUtilMeta').textContent=unlim
+  meta+=' · build pools-v3';
+  metaEl.textContent=unlim
     ? meta+' · plan reports unlimited included usage — pool percentages are not a cap.'
     : meta+' · same pools as Cursor Settings → Plan & Usage: '
       +'Cursor Models (Grok + Composer) and Other Models. '
       +'Allocated is 100% of each included pool; used % matches the Settings bars '
       +'(autoPercentUsed / apiPercentUsed).';
-  const grid=document.getElementById('modelUtilGrid');
   // Prefer the two Plan & Usage pools; keep total as a trailing card if present.
   const showPools=pools.length
     ? [...pools].sort((a,b)=>{
@@ -6775,9 +6810,8 @@ function renderModelUtil(){
     grid.innerHTML=`<div class="allow-card primary">
       <div class="k">Cursor Models <span class="sub">— Includes Cursor Grok and Composer</span></div>
       <div class="v">—</div>
-      <div class="sub">No pool percentages in the usage-summary response yet.
-        Click Refresh. If this persists, the local process may be on an old build or
-        usage-summary auth failed${DATA.billing_error?` (${esc(DATA.billing_error)})`:''}.</div>
+      <div class="sub">Billed session is up, but usage-summary did not include autoPercentUsed/apiPercentUsed.
+        Click Refresh. ${DATA.billing_error?esc(DATA.billing_error):''}</div>
     </div>`;
   }
   const tbl=document.getElementById('cycleModels');
