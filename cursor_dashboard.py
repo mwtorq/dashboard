@@ -1839,44 +1839,154 @@ def _text_mentions_pr(text):
     return bool(RE_PR.search(text) or RE_PR_SHORT.search(text) or RE_PR_BARE.search(text))
 
 
-def _raw_mentions_pr(raw):
-    """Cheap PR-link check on bubble JSON (URLs / short refs / bare PR #)."""
-    if raw is None:
+_PR_RAW_MARKERS = (
+    "/pull/", "/pulls/", "pullNumber", "prNumber", "pull_number", "pr_number",
+    "pullRequest", "CreatePullRequest", "create_pull_request", "html_url",
+    "PR #", "PR#", "pr #", "pull request", "Pull request", "Pull Request",
+    "gh pr ",
+)
+
+
+def _cheap_pr_marker(raw):
+    """Fast substring gate before regex / JSON walks."""
+    if not raw:
         return False
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", "replace")
-    if not isinstance(raw, str) or not raw:
+    if not isinstance(raw, str):
         return False
-    # Fast reject before regex — most bubbles have no PR markers.
-    if "/pull/" not in raw and "/pulls/" not in raw and "#" not in raw \
-            and "PR" not in raw and "pr" not in raw \
-            and "pull request" not in raw.lower():
-        return False
-    return bool(
-        RE_PR.search(raw) or RE_PR_API.search(raw)
-        or RE_PR_SHORT.search(raw) or RE_PR_BARE.search(raw))
+    if any(m in raw for m in _PR_RAW_MARKERS):
+        return True
+    # Short owner/repo#N refs and bare PR mentions.
+    return ("#" in raw and ("PR" in raw or "pr" in raw or "/" in raw))
+
+
+def _raw_mentions_pr(raw):
+    """True when bubble JSON contains a PR URL, structured pullNumber, or bare PR #."""
+    return bool(_pr_links_from_raw(raw))
+
+
+def _walk_structured_pr_links(obj, add, depth=0):
+    """Pull PR links from toolFormerData / GitHub API-shaped objects."""
+    if depth > 14 or obj is None:
+        return
+    if isinstance(obj, list):
+        for item in obj[:200]:
+            _walk_structured_pr_links(item, add, depth + 1)
+        return
+    if not isinstance(obj, dict):
+        if isinstance(obj, str) and _cheap_pr_marker(obj):
+            for owner, repo, num in RE_PR.findall(obj):
+                name = clean_repo(owner, repo)
+                if name:
+                    add(f"https://github.com/{name}/pull/{num}")
+            for owner, repo, num in RE_PR_API.findall(obj):
+                name = clean_repo(owner, repo)
+                if name:
+                    add(f"https://github.com/{name}/pull/{num}")
+            for owner, repo, num in RE_PR_SHORT.findall(obj):
+                name = clean_repo(owner, repo)
+                if name:
+                    add(f"{name}#{num}")
+        return
+
+    # Nested JSON strings (toolFormerData.params / result / rawArgs).
+    for key in ("params", "rawArgs", "result", "additionalData", "toolFormerData",
+                "tool_former_data", "data", "payload"):
+        val = obj.get(key)
+        if isinstance(val, str) and val[:1] in "{[":
+            try:
+                _walk_structured_pr_links(json.loads(val), add, depth + 1)
+            except (TypeError, ValueError):
+                _walk_structured_pr_links(val, add, depth + 1)
+        elif isinstance(val, (dict, list)):
+            _walk_structured_pr_links(val, add, depth + 1)
+
+    lower = {str(k).lower(): v for k, v in obj.items()}
+    num = None
+    for nk in ("pullnumber", "prnumber", "pull_number", "pr_number",
+               "pullrequestnumber", "pr_num"):
+        if nk in lower and lower[nk] is not None and lower[nk] != "":
+            try:
+                num = int(lower[nk])
+                break
+            except (TypeError, ValueError):
+                continue
+    owner = None
+    repo = None
+    for ok in ("owner", "repoowner", "org", "organization"):
+        if isinstance(lower.get(ok), str) and lower[ok].strip():
+            owner = lower[ok].strip()
+            break
+    for rk in ("repo", "reponame", "repository"):
+        val = lower.get(rk)
+        if isinstance(val, str) and val.strip():
+            val = val.strip()
+            if "/" in val:
+                parts = val.split("/", 1)
+                owner = owner or parts[0]
+                repo = parts[1]
+            else:
+                repo = val
+            break
+    if num and owner and repo:
+        name = clean_repo(owner, repo)
+        if name:
+            add(f"https://github.com/{name}/pull/{num}")
+    elif num:
+        # Bare number from CreatePullRequest-style tools — resolve later via hints.
+        add(f"PR #{num}")
+
+    for key in ("html_url", "url", "prurl", "pullrequesturl", "pr_url", "permalink"):
+        val = lower.get(key)
+        if not isinstance(val, str):
+            continue
+        for owner, repo, n in RE_PR.findall(val):
+            name = clean_repo(owner, repo)
+            if name:
+                add(f"https://github.com/{name}/pull/{n}")
+        for owner, repo, n in RE_PR_API.findall(val):
+            name = clean_repo(owner, repo)
+            if name:
+                add(f"https://github.com/{name}/pull/{n}")
+
+    for val in obj.values():
+        if isinstance(val, (dict, list)):
+            _walk_structured_pr_links(val, add, depth + 1)
+        elif isinstance(val, str) and len(val) >= 12 and _cheap_pr_marker(val):
+            _walk_structured_pr_links(val, add, depth + 1)
 
 
 def _pr_links_from_raw(raw):
-    """Pull github.com / API PR links (and owner/repo#N) out of bubble JSON.
+    """Extract every PR link from bubble JSON — URLs, API paths, and tool fields.
 
-    Agent tool results often store PR URLs outside `text` / `richText`. Sampling
-    keeps those bubbles, but without this scrape they never reach session refs —
-    so only the latest PR that appears in visible assistant text survives.
+    Refs must not depend on head/tail bubble sampling. Callers that scan all
+    PR-candidate rows use this so older tool-only PRs are not dropped when only
+    the latest assistant text still has a visible github.com URL.
     """
     if raw is None:
         return []
+    obj = None
     if isinstance(raw, (dict, list)):
+        obj = raw
         try:
-            raw = json.dumps(raw, ensure_ascii=False)
+            text = json.dumps(raw, ensure_ascii=False)
         except (TypeError, ValueError):
-            return []
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", "replace")
-    if not isinstance(raw, str) or not raw:
+            text = ""
+    elif isinstance(raw, bytes):
+        text = raw.decode("utf-8", "replace")
+    elif isinstance(raw, str):
+        text = raw
+    else:
         return []
-    if not _raw_mentions_pr(raw):
+    if text and text.lstrip()[:1] in "{[":
+        try:
+            obj = json.loads(text)
+        except (TypeError, ValueError):
+            pass
+    if text and not _cheap_pr_marker(text) and obj is None:
         return []
+
     out = []
     seen = set()
 
@@ -1885,18 +1995,169 @@ def _pr_links_from_raw(raw):
             seen.add(s)
             out.append(s)
 
-    for owner, repo, num in RE_PR.findall(raw):
-        name = clean_repo(owner, repo)
-        if name:
-            _add(f"https://github.com/{name}/pull/{num}")
-    for owner, repo, num in RE_PR_API.findall(raw):
-        name = clean_repo(owner, repo)
-        if name:
-            _add(f"https://github.com/{name}/pull/{num}")
-    for owner, repo, num in RE_PR_SHORT.findall(raw):
-        name = clean_repo(owner, repo)
-        if name:
-            _add(f"{name}#{num}")
+    if text:
+        for owner, repo, num in RE_PR.findall(text):
+            name = clean_repo(owner, repo)
+            if name:
+                _add(f"https://github.com/{name}/pull/{num}")
+        for owner, repo, num in RE_PR_API.findall(text):
+            name = clean_repo(owner, repo)
+            if name:
+                _add(f"https://github.com/{name}/pull/{num}")
+        for owner, repo, num in RE_PR_SHORT.findall(text):
+            name = clean_repo(owner, repo)
+            if name:
+                _add(f"{name}#{num}")
+        for num in RE_PR_BARE.findall(text):
+            _add(f"PR #{int(num)}")
+    if obj is not None:
+        _walk_structured_pr_links(obj, _add)
+    return out
+
+
+def _all_pr_links_for_cid(con, cid):
+    """Full-composer PR scan — not head/tail sampled.
+
+    Returns (links, days_by_link) where days_by_link maps each link string to
+    local calendar days from bubble createdAt. Refs must not depend on the
+    text sample that only keeps recent assistant messages.
+    """
+    if not cid:
+        return [], {}
+    prefix = f"bubbleId:{cid}:"
+    try:
+        rows = con.execute(
+            "SELECT value FROM cursorDiskKV WHERE key LIKE ? AND ("
+            "value LIKE '%/pull/%' OR value LIKE '%/pulls/%' "
+            "OR value LIKE '%pullNumber%' OR value LIKE '%prNumber%' "
+            "OR value LIKE '%pull_number%' OR value LIKE '%pr_number%' "
+            "OR value LIKE '%CreatePullRequest%' OR value LIKE '%create_pull_request%' "
+            "OR value LIKE '%html_url%' OR value LIKE '%PR #%' OR value LIKE '%PR#%' "
+            "OR value LIKE '%pr #%' OR value LIKE '%pull request%' "
+            "OR value LIKE '%Pull request%' OR value LIKE '%Pull Request%' "
+            "OR value LIKE '%gh pr %')",
+            (prefix + "%",)).fetchall()
+    except sqlite3.OperationalError:
+        return [], {}
+    out, seen = [], set()
+    days_by_link = collections.defaultdict(set)
+    for row in rows:
+        raw = row[0] if not isinstance(row, sqlite3.Row) else row["value"]
+        day = ""
+        ts = _bubble_ts_from_raw(raw)
+        if ts:
+            day = _local_day(ts)
+        for link in _pr_links_from_raw(raw):
+            if link not in seen:
+                seen.add(link)
+                out.append(link)
+            if day:
+                days_by_link[link].add(day)
+    return out, {k: sorted(v) for k, v in days_by_link.items()}
+
+
+def _inject_composer_pr_links(con, texts_by_cid, cids):
+    """Merge full-scan PR links into per-session text before _build_refs.
+
+    Returns (added_link_count, day_hints) where day_hints is
+    {cid: {link: [YYYY-MM-DD, ...]}}.
+    """
+    if not texts_by_cid and not cids:
+        return 0, {}
+    added = 0
+    hints = {}
+    for cid in cids:
+        if not cid or cid in ("_unattributed", "empty-state-draft"):
+            continue
+        links, days_by_link = _all_pr_links_for_cid(con, cid)
+        if days_by_link:
+            hints[cid] = days_by_link
+        if not links:
+            continue
+        prev = texts_by_cid.get(cid) or ""
+        missing = [l for l in links if l not in prev]
+        if not missing:
+            continue
+        texts_by_cid[cid] = (prev + "\n" + "\n".join(missing)).strip()
+        added += len(missing)
+    return added, hints
+
+
+def _link_matches_pr_key(link, key):
+    """True when a scraped link string refers to refs PR key owner/repo#N."""
+    if not link or not key or "#" not in key:
+        return False
+    if key in link:
+        return True
+    repo, _, num = key.partition("#")
+    if not repo or not num:
+        return False
+    if link in (f"PR #{num}", f"PR#{num}", f"pull/{num}", f"pulls/{num}"):
+        return True
+    return (f"/{repo}/pull/{num}" in link or f"/{repo}/pulls/{num}" in link
+            or link.endswith(f"#{num}") and repo.split("/")[-1] in link)
+
+
+def _stamp_pr_mention_days(refs, priced_all, turn_prs, pr_day_hints=None):
+    """Stamp first_day/last_day on each PR from turn text and bubble timestamps.
+
+    Day context must follow when the PR was mentioned, not the session's first
+    billed day — otherwise today's PRs ride along on yesterday's chat row.
+    """
+    for sid, r in (refs or {}).items():
+        if not r:
+            continue
+        days_by_key = collections.defaultdict(set)
+        day_by_ti = {}
+        for turn in (priced_all or {}).get(sid) or []:
+            day = _local_day(turn.get("started_at") or "")
+            ti = turn.get("turn_index")
+            if day and ti is not None:
+                day_by_ti[ti] = day
+        for ti, found in ((turn_prs or {}).get(sid) or {}).items():
+            day = day_by_ti.get(ti)
+            if not day:
+                continue
+            for k in found:
+                days_by_key[k].add(day)
+        for link, days in ((pr_day_hints or {}).get(sid) or {}).items():
+            for p in r.get("prs") or []:
+                k = p.get("key") or ""
+                if _link_matches_pr_key(link, k):
+                    days_by_key[k].update(days)
+        stamped = []
+        for p in r.get("prs") or []:
+            p = dict(p)
+            k = p.get("key") or ""
+            ds = sorted(days_by_key.get(k) or [])
+            if ds:
+                p["first_day"] = ds[0]
+                p["last_day"] = ds[-1]
+                p["days"] = ds
+            stamped.append(p)
+        r["prs"] = stamped
+
+
+def _filter_refs_to_day_range(refs_entry, start, end):
+    """Keep only PRs whose mention days overlap [start, end]."""
+    if not refs_entry:
+        return refs_entry
+    prs = []
+    for p in refs_entry.get("prs") or []:
+        fd = p.get("first_day") or ""
+        ld = p.get("last_day") or fd
+        if fd and ld:
+            if ld < start or fd > end:
+                continue
+        elif not (start <= MIN_DAY and end >= MAX_DAY):
+            # Undated PR on a bounded day view: omit so today's PR is not pinned
+            # onto yesterday just because the parent chat still has older spend.
+            continue
+        prs.append(p)
+    if prs == (refs_entry.get("prs") or []):
+        return refs_entry
+    out = dict(refs_entry)
+    out["prs"] = prs
     return out
 
 
@@ -5212,20 +5473,55 @@ def _fill_totals(base):
 
 
 def _clip(session, start, end):
+    """Clip session spend to [start, end] and day-scope PR badges/refs.
+
+    PRs are filtered by when they were mentioned (first_day/last_day), not by
+    the chat's first billed day — otherwise today's PRs show under yesterday.
+    """
     first, last = session.get("first_day") or "", session.get("last_day") or ""
+
+    def _with_day_scoped_refs(sess):
+        refs = sess.get("refs")
+        if not refs:
+            return sess
+        scoped = _filter_refs_to_day_range(refs, start, end)
+        if scoped is refs:
+            return sess
+        out = dict(sess)
+        out["refs"] = scoped
+        return out
+
     # Undated sessions (common for brand-new cloud agents) must not disappear on
     # All-time views: empty strings fail start<=first string compares.
     if not first and not last:
         if start <= MIN_DAY and end >= MAX_DAY:
-            return session
+            return _with_day_scoped_refs(session)
         if session.get("cloud_agent") and start <= MIN_DAY:
-            return session
+            return _with_day_scoped_refs(session)
     if first and last and start <= first and last <= end:
-        return session
+        return _with_day_scoped_refs(session)
     days = {d: c for d, c in (session.get("days") or {}).items()
             if d and start <= d <= end}
     if not days:
-        return None
+        # Still surface the chat on days it mentioned/created a PR, even when
+        # billing for that day has not landed yet (today's PR on yesterday's spend).
+        mention_days = []
+        for p in (session.get("refs") or {}).get("prs") or []:
+            for d in p.get("days") or []:
+                if start <= d <= end:
+                    mention_days.append(d)
+            fd = p.get("first_day") or ""
+            ld = p.get("last_day") or fd
+            if fd and ld and not (ld < start or fd > end):
+                if fd >= start and fd <= end:
+                    mention_days.append(fd)
+                if ld >= start and ld <= end:
+                    mention_days.append(ld)
+        mention_days = sorted(set(mention_days))
+        if not mention_days:
+            return None
+        days = {d: {"cost_usd": 0.0, "on_demand_usd": 0.0, "total_tokens": 0,
+                    "requests": 0, "est_usd": 0.0} for d in mention_days}
     bmd = {d: c for d, c in (session.get("by_model_day") or {}).items() if d in days}
     keep = {"session_id", "title", "repository", "workspace", "branch", "subtitle",
             "text", "subagent", "draft", "refs", "billed", "source", "account_label",
@@ -5238,6 +5534,7 @@ def _clip(session, start, end):
     base = {k: session[k] for k in keep if k in session}
     base["days"] = days
     base["by_model_day"] = bmd
+    base["refs"] = _filter_refs_to_day_range(session.get("refs") or {}, start, end)
     return _fill_totals(base)
 
 
@@ -5678,6 +5975,15 @@ def scan_cursor(force=False):
         except Exception as exc:
             print(f"  title backfill skipped ({exc})", flush=True)
 
+        # Full-composer PR scan (not head/tail sampled) so older tool-only PRs
+        # still reach refs — sampling alone kept only the newest visible URLs.
+        pr_cids = list({s["session_id"] for s in sessions if s.get("session_id")}
+                       | set(texts_by_cid))
+        n_pr_links, pr_day_hints = _inject_composer_pr_links(con, texts_by_cid, pr_cids)
+        if n_pr_links:
+            print(f"  full-scan PR links: +{n_pr_links} across {len(pr_day_hints)} chat(s)",
+                  flush=True)
+
         allow = JIRA_KEY_ALLOW | _dynamic_jira_keys(texts_by_cid.values())
         sess_repo = {s["session_id"]: s["repository"] for s in sessions if s.get("repository")}
         refs = _build_refs(list(texts_by_cid.items()), sess_repo, allow)
@@ -5707,6 +6013,9 @@ def scan_cursor(force=False):
         turn_prs, turn_cost = _turn_maps_from_priced(
             priced_all, refs, {s["session_id"]: s for s in sessions},
             git_acts, path_by_github)
+        _stamp_pr_mention_days(refs, priced_all, turn_prs, pr_day_hints)
+        for sess in sessions:
+            sess["refs"] = refs.get(sess["session_id"], sess.get("refs"))
         git_pr_catalog = _git_pr_catalog(git_acts) if git_acts else {}
         data = {
             "sessions": sessions,
@@ -6280,6 +6589,11 @@ def rollup(sessions, refs, turn_prs, turn_cost, git_pr_catalog=None, path_by_git
                     e["titles"].append(s["title"])
                 if isinstance(it, dict) and it.get("created"):
                     e["created"] = True
+                if isinstance(it, dict) and it.get("first_day"):
+                    prev = e.get("first_day") or it["first_day"]
+                    e["first_day"] = min(prev, it["first_day"])
+                    e["last_day"] = max(e.get("last_day") or it.get("last_day") or it["first_day"],
+                                       it.get("last_day") or it["first_day"])
                 if isinstance(it, dict) and it.get("inferred"):
                     e["inferred"] = True
         prs = sorted(prs_map.values(), key=lambda x: (-x["cost_usd"], x["key"]))
