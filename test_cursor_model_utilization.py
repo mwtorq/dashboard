@@ -943,8 +943,8 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             self.assertEqual(keys, {"acme/app#10", "acme/app#11", "acme/app#12", "acme/app#13"})
             self.assertIn(cid, hints)
 
-    def test_clip_keeps_all_session_prs_like_before(self):
-        """Match pre-#27 / Copilot: clip spend, never strip refs.prs."""
+    def test_clip_scopes_prs_by_github_local_days(self):
+        """Yesterday/Today list different PRs from GitHub local create/merge days."""
         sess = {
             "session_id": "s1",
             "title": "multi-day agent",
@@ -968,17 +968,81 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             "refs": {
                 "jira": [], "repos": [],
                 "prs": [
-                    {"key": "acme/app#20", "repo": "acme/app", "number": 20, "created": True},
-                    {"key": "acme/app#24", "repo": "acme/app", "number": 24, "created": True},
-                    {"key": "acme/app#25", "repo": "acme/app", "number": 25, "created": True},
-                    {"key": "acme/app#28", "repo": "acme/app", "number": 28, "created": True},
+                    {"key": "acme/app#20", "repo": "acme/app", "number": 20,
+                     "created": True, "first_day": "2026-09-11",
+                     "last_day": "2026-09-11", "days": ["2026-09-11"],
+                     "day_source": "github"},
+                    {"key": "acme/app#24", "repo": "acme/app", "number": 24,
+                     "created": True, "first_day": "2026-09-11",
+                     "last_day": "2026-09-12",
+                     "days": ["2026-09-11", "2026-09-12"],
+                     "day_source": "github"},
+                    {"key": "acme/app#25", "repo": "acme/app", "number": 25,
+                     "created": True, "first_day": "2026-09-12",
+                     "last_day": "2026-09-12", "days": ["2026-09-12"],
+                     "day_source": "github"},
+                    {"key": "acme/app#28", "repo": "acme/app", "number": 28,
+                     "created": True, "first_day": "2026-09-12",
+                     "last_day": "2026-09-12", "days": ["2026-09-12"],
+                     "day_source": "github"},
                 ],
             },
             "billed": True,
         }
+        yesterday = d._clip(sess, "2026-09-11", "2026-09-11")
         today = d._clip(sess, "2026-09-12", "2026-09-12")
         self.assertEqual(
-            [p["number"] for p in today["refs"]["prs"]], [20, 24, 25, 28])
+            [p["number"] for p in yesterday["refs"]["prs"]], [20, 24])
+        self.assertEqual(
+            [p["number"] for p in today["refs"]["prs"]], [24, 25, 28])
+
+    def test_github_days_override_today_remention_of_old_pr(self):
+        """Re-mentioning #20 today must not put it on Today's badge list."""
+        import os, time
+        prev = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "America/Chicago"
+            time.tzset()
+            fake = [
+                {"number": 20, "createdAt": "2026-09-12T03:18:25Z",
+                 "mergedAt": "2026-09-12T03:18:55Z"},
+                {"number": 25, "createdAt": "2026-09-12T12:38:58Z",
+                 "mergedAt": "2026-09-12T23:13:45Z"},
+            ]
+            prev_list = d._list_repo_prs_via_gh
+            d._list_repo_prs_via_gh = lambda repo, limit=100: fake
+            refs = {"s": {"jira": [], "repos": [], "prs": [
+                {"key": "acme/app#20", "repo": "acme/app", "number": 20,
+                 "created": True, "first_day": "2026-09-12",
+                 "last_day": "2026-09-12", "days": ["2026-09-12"],
+                 "day_source": "mention"},
+                {"key": "acme/app#25", "repo": "acme/app", "number": 25,
+                 "created": True},
+            ]}}
+            d._stamp_pr_github_dates(refs)
+            d._stamp_pr_mention_days(
+                refs,
+                {"s": [{"turn_index": 0, "started_at": "2026-09-12T20:00:00-05:00"}]},
+                {"s": {0: ["acme/app#20"]}},
+                None)
+            sess = {
+                "session_id": "s", "first_day": "2026-09-12", "last_day": "2026-09-12",
+                "days": {"2026-09-12": {
+                    "cost_usd": 1, "requests": 1, "total_tokens": 1,
+                    "input_tokens": 1, "output_tokens": 0, "cache_read_tokens": 0,
+                    "cache_write_tokens": 0, "measured_tokens": 1, "est_usd": 0,
+                    "on_demand_usd": 0}},
+                "by_model_day": {}, "refs": refs["s"], "billed": True,
+            }
+            today = d._clip(sess, "2026-09-12", "2026-09-12")
+            self.assertEqual([p["number"] for p in today["refs"]["prs"]], [25])
+            d._list_repo_prs_via_gh = prev_list
+        finally:
+            if prev is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev
+            time.tzset()
 
     def test_local_day_uses_machine_timezone_not_utc_date(self):
         """UTC early-morning timestamps must follow machine local calendar day."""
