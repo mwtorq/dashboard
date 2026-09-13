@@ -1106,5 +1106,62 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             d._list_repo_prs_via_gh = prev
 
 
+
+    def test_stamp_falls_back_when_gh_list_empty(self):
+        """If `gh pr list` returns nothing, per-PR timestamps still stamp all PRs."""
+        import os, time
+        prev_tz = os.environ.get("TZ")
+        prev_list = d._list_repo_prs_via_gh
+        prev_ts = d._github_pr_timestamps
+        try:
+            os.environ["TZ"] = "America/Chicago"
+            time.tzset()
+            d._list_repo_prs_via_gh = lambda repo, limit=100: []
+            def fake_ts(repo, number):
+                table = {
+                    20: ("2026-09-12T03:18:25Z", "2026-09-12T03:18:55Z"),
+                    24: ("2026-09-12T03:53:46Z", "2026-09-12T12:24:19Z"),
+                    25: ("2026-09-12T12:38:58Z", "2026-09-12T23:13:45Z"),
+                    28: ("2026-09-12T23:47:55Z", "2026-09-12T23:48:35Z"),
+                }
+                return table.get(int(number), ("", ""))
+            d._github_pr_timestamps = fake_ts
+            refs = {"s": {"prs": [
+                {"key": "acme/app#20", "number": 20,
+                 "first_day": "2026-09-12", "last_day": "2026-09-12",
+                 "days": ["2026-09-12"], "day_source": "mention"},
+                {"key": "acme/app#24", "number": 24},
+                {"key": "acme/app#25", "number": 25},
+                {"key": "acme/app#28", "number": 28},
+            ]}}
+            self.assertEqual(d._stamp_pr_github_dates(refs), 4)
+            sess = {
+                "session_id": "s", "first_day": "2026-09-11", "last_day": "2026-09-12",
+                "days": {
+                    "2026-09-11": {"cost_usd": 1, "requests": 1, "total_tokens": 1,
+                        "input_tokens": 1, "output_tokens": 0, "cache_read_tokens": 0,
+                        "cache_write_tokens": 0, "measured_tokens": 1, "est_usd": 0,
+                        "on_demand_usd": 0},
+                    "2026-09-12": {"cost_usd": 1, "requests": 1, "total_tokens": 1,
+                        "input_tokens": 1, "output_tokens": 0, "cache_read_tokens": 0,
+                        "cache_write_tokens": 0, "measured_tokens": 1, "est_usd": 0,
+                        "on_demand_usd": 0},
+                },
+                "by_model_day": {}, "refs": refs["s"], "billed": True,
+            }
+            y = [p["number"] for p in d._clip(sess, "2026-09-11", "2026-09-11")["refs"]["prs"]]
+            today = [p["number"] for p in d._clip(sess, "2026-09-12", "2026-09-12")["refs"]["prs"]]
+            self.assertEqual(y, [20, 24])
+            self.assertEqual(today, [24, 25, 28])
+        finally:
+            d._list_repo_prs_via_gh = prev_list
+            d._github_pr_timestamps = prev_ts
+            if prev_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev_tz
+            time.tzset()
+
+
 if __name__ == "__main__":
     unittest.main()
