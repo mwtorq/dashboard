@@ -2291,6 +2291,10 @@ def _list_repo_prs_via_gh(repo, limit=100):
 
     When `gh pr list` fails/empty, enrichment never added older agent PRs
     (#14–#23), so Yesterday only showed chat-mentioned #20.
+
+    Also: a non-empty gh list with blank `body` fields must not block REST —
+    body-less rows cannot match bc-* footers, which regresses to mention-only
+    badges (Today=#20+#25, Yesterday=#20).
     """
     repo = _normalize_github_repo(repo)
     if not repo:
@@ -2300,8 +2304,58 @@ def _list_repo_prs_via_gh(repo, limit=100):
         "--json", "number,url,createdAt,mergedAt,body,title,state,headRefName",
     ])
     if isinstance(data, list) and data:
+        with_body = sum(1 for x in data if (x.get("body") or "").strip())
+        # No bodies → REST. Sparse bodies → merge REST bodies by number so
+        # sibling matching still sees footers on older PRs gh left blank.
+        if with_body < len(data):
+            rest = _list_repo_prs_via_rest(repo, limit=limit)
+            if rest:
+                if with_body == 0:
+                    return rest
+                by_num = {}
+                for row in data:
+                    try:
+                        by_num[int(row.get("number"))] = dict(row)
+                    except (TypeError, ValueError):
+                        continue
+                for row in rest:
+                    try:
+                        num = int(row.get("number"))
+                    except (TypeError, ValueError):
+                        continue
+                    if num not in by_num:
+                        by_num[num] = dict(row)
+                    elif not (by_num[num].get("body") or "").strip() and (row.get("body") or "").strip():
+                        by_num[num]["body"] = row.get("body") or ""
+                return sorted(by_num.values(), key=lambda r: int(r.get("number") or 0),
+                              reverse=True)[:limit]
         return data
     return _list_repo_prs_via_rest(repo, limit=limit)
+
+
+def _github_pr_body(repo, number):
+    """Fetch one PR body via gh, then REST. Used when list payloads omit bodies."""
+    repo = _normalize_github_repo(repo)
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return ""
+    if not repo or number <= 0:
+        return ""
+    data = _gh_json([
+        "pr", "view", str(number), "--repo", repo, "--json", "body",
+    ])
+    if isinstance(data, dict) and (data.get("body") or "").strip():
+        return data.get("body") or ""
+    url = f"https://api.github.com/repos/{repo}/pulls/{number}"
+    try:
+        req = urllib.request.Request(url, headers=_github_rest_headers())
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.load(resp)
+        return payload.get("body") or ""
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
+            OSError, ValueError, json.JSONDecodeError):
+        return ""
 
 
 _BC_AGENT_RE = re.compile(r"(bc-[0-9a-fA-F-]{20,})")
@@ -2355,20 +2409,29 @@ def _prs_linked_to_cloud_agent(agent_id, repo, catalog=None):
     return out
 
 
-def _infer_agent_id_from_session_prs(prs, catalog_by_number):
+def _infer_agent_id_from_session_prs(prs, catalog_by_number, repo=None):
     """Discover bc-* from bodies of PRs already on the session (e.g. only #20).
 
     Local UUID chats often keep a single chat-mentioned PR while the rest of the
     agent run (#14–#23) only exists as GitHub footers — without this, Yesterday
     stays stuck on #20 even though Today looks correct.
+
+    When the repo catalog omits/blanks a PR body, fetch that PR directly so a
+    body-less `gh pr list` cannot strand enrichment on mention-only badges.
     """
+    repo = _normalize_github_repo(repo or "")
     for p in prs or []:
         try:
             num = int(p.get("number"))
         except (TypeError, ValueError):
             continue
         raw = catalog_by_number.get(num) or {}
-        aid = _agent_id_from_text(raw.get("body") or "")
+        body = raw.get("body") or ""
+        if not body.strip() and repo:
+            body = _github_pr_body(repo, num)
+            if body:
+                catalog_by_number[num] = dict(raw, body=body, number=num)
+        aid = _agent_id_from_text(body)
         if aid:
             return aid
         # Already-stamped session rows may carry a URL/title with the id.
@@ -2437,7 +2500,7 @@ def _enrich_cloud_agent_prs(sessions, refs):
         inferred = False
         if not aid:
             aid = _infer_agent_id_from_session_prs(
-                r_existing.get("prs") or [], catalog_by_number)
+                r_existing.get("prs") or [], catalog_by_number, repo=repo)
             inferred = bool(aid)
         if not aid:
             continue
@@ -2448,7 +2511,16 @@ def _enrich_cloud_agent_prs(sessions, refs):
             continue
         key = (repo, aid)
         if key not in cache:
-            cache[key] = _prs_linked_to_cloud_agent(aid, repo, catalog=catalog)
+            linked = _prs_linked_to_cloud_agent(aid, repo, catalog=catalog)
+            # Catalog may still lack bodies (sparse gh list). Retry via REST so
+            # siblings attach once we know the agent id from a per-PR body fetch.
+            if not linked:
+                rest = _list_repo_prs_via_rest(repo)
+                if rest:
+                    catalog = rest
+                    catalog_cache[repo] = rest
+                    linked = _prs_linked_to_cloud_agent(aid, repo, catalog=catalog)
+            cache[key] = linked
         found = cache[key]
         if not found:
             continue
