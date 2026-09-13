@@ -1162,6 +1162,111 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
                 os.environ["TZ"] = prev_tz
             time.tzset()
 
+    def test_list_repo_prs_falls_back_to_rest_when_gh_empty(self):
+        """Empty/failed `gh pr list` must still return REST catalog for enrichment."""
+        prev_gh = d._gh_json
+        prev_rest = d._list_repo_prs_via_rest
+        try:
+            d._gh_json = lambda args, timeout=60: []
+            d._list_repo_prs_via_rest = lambda repo, limit=100: [
+                {"number": 14, "body": "bc-aaaa", "createdAt": "2026-09-12T01:17:11Z",
+                 "mergedAt": "2026-09-12T01:27:38Z", "url": "https://github.com/acme/app/pull/14"},
+            ]
+            out = d._list_repo_prs_via_gh("acme/app")
+            self.assertEqual([p["number"] for p in out], [14])
+        finally:
+            d._gh_json = prev_gh
+            d._list_repo_prs_via_rest = prev_rest
+
+    def test_enrich_via_rest_fills_yesterday_prs_14_through_23(self):
+        """When bubbles only mention #20, REST enrichment still attaches #14–#23
+        onto Yesterday (local Chicago create/merge of early Sep 12 UTC)."""
+        import os, time
+        prev_tz = os.environ.get("TZ")
+        prev_gh = d._gh_json
+        prev_rest = d._list_repo_prs_via_rest
+        try:
+            os.environ["TZ"] = "America/Chicago"
+            time.tzset()
+            # Simulate broken/empty gh pr list — enrichment must use REST.
+            d._gh_json = lambda args, timeout=60: []
+            agent = "bc-a9f74d1c-2262-4bd5-a3d1-6bc4ad5499b3"
+            # Real create/merge times for #14–#24 from mwtorq/dashboard.
+            times = {
+                14: ("2026-09-12T01:17:11Z", "2026-09-12T01:27:38Z"),
+                15: ("2026-09-12T01:35:25Z", "2026-09-12T01:36:45Z"),
+                16: ("2026-09-12T01:44:45Z", "2026-09-12T01:45:15Z"),
+                17: ("2026-09-12T02:12:32Z", "2026-09-12T02:12:59Z"),
+                18: ("2026-09-12T02:19:26Z", "2026-09-12T03:06:59Z"),
+                19: ("2026-09-12T03:06:37Z", "2026-09-12T03:07:12Z"),
+                20: ("2026-09-12T03:18:25Z", "2026-09-12T03:18:55Z"),
+                21: ("2026-09-12T03:26:53Z", "2026-09-12T03:27:24Z"),
+                22: ("2026-09-12T03:32:46Z", "2026-09-12T03:33:03Z"),
+                23: ("2026-09-12T03:45:42Z", "2026-09-12T03:46:48Z"),
+                24: ("2026-09-12T03:53:46Z", "2026-09-12T12:24:19Z"),
+                25: ("2026-09-12T12:38:58Z", "2026-09-12T23:13:45Z"),
+            }
+            fake_rest = []
+            for num, (c, m) in times.items():
+                fake_rest.append({
+                    "number": num,
+                    "url": f"https://github.com/acme/app/pull/{num}",
+                    "createdAt": c,
+                    "mergedAt": m,
+                    "body": f"Cloud agent footer {agent}",
+                    "title": f"PR {num}",
+                    "state": "closed",
+                    "headRefName": f"cursor/x-{num}",
+                })
+            d._list_repo_prs_via_rest = lambda repo, limit=100: list(fake_rest)
+            # Only #20 was scraped from chat — the Yesterday-only symptom.
+            refs = {"bc-sess": {"jira": [], "repos": [], "prs": [
+                {"key": "acme/app#20", "repo": "acme/app", "number": 20,
+                 "created": True, "first_day": "2026-09-11",
+                 "last_day": "2026-09-11", "days": ["2026-09-11"],
+                 "day_source": "mention"},
+            ]}}
+            sess = {
+                "session_id": "bc-sess",
+                "cloud_agent": True,
+                # Agent id only on cloud_url (common billed-row shape).
+                "cloud_url": f"https://cursor.com/agents/{agent}",
+                "repository": "acme/app",
+                "first_day": "2026-09-11",
+                "last_day": "2026-09-12",
+                "days": {
+                    "2026-09-11": {"cost_usd": 2, "requests": 1, "total_tokens": 10,
+                        "input_tokens": 5, "output_tokens": 5, "cache_read_tokens": 0,
+                        "cache_write_tokens": 0, "measured_tokens": 10, "est_usd": 0,
+                        "on_demand_usd": 0},
+                    "2026-09-12": {"cost_usd": 5, "requests": 1, "total_tokens": 10,
+                        "input_tokens": 5, "output_tokens": 5, "cache_read_tokens": 0,
+                        "cache_write_tokens": 0, "measured_tokens": 10, "est_usd": 0,
+                        "on_demand_usd": 0},
+                },
+                "by_model_day": {},
+                "refs": refs["bc-sess"],
+                "billed": True,
+            }
+            added = d._enrich_cloud_agent_prs([sess], refs)
+            self.assertGreaterEqual(added, 11)  # 14-19,21-25 at least
+            d._stamp_pr_github_dates(refs)
+            sess["refs"] = refs["bc-sess"]
+            yesterday = [p["number"] for p in
+                         d._clip(sess, "2026-09-11", "2026-09-11")["refs"]["prs"]]
+            today = [p["number"] for p in
+                     d._clip(sess, "2026-09-12", "2026-09-12")["refs"]["prs"]]
+            self.assertEqual(yesterday, list(range(14, 25)))  # 14-23 + 24
+            self.assertEqual(today, [24, 25])
+        finally:
+            d._gh_json = prev_gh
+            d._list_repo_prs_via_rest = prev_rest
+            if prev_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev_tz
+            time.tzset()
+
 
 if __name__ == "__main__":
     unittest.main()

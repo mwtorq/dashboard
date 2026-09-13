@@ -2219,8 +2219,79 @@ def _gh_json(args, timeout=60):
         return None
 
 
+def _github_auth_token():
+    """Best-effort GitHub token for REST (env, then `gh auth token`)."""
+    for key in ("GITHUB_TOKEN", "GH_TOKEN"):
+        tok = (os.environ.get(key) or "").strip()
+        if tok:
+            return tok
+    try:
+        r = subprocess.run(
+            ["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return (r.stdout or "").strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ""
+
+
+def _github_rest_headers():
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "cursor-dashboard",
+    }
+    tok = _github_auth_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    return headers
+
+
+def _list_repo_prs_via_rest(repo, limit=100):
+    """List recent PRs via GitHub REST (used when `gh pr list` fails/empty)."""
+    repo = _normalize_github_repo(repo)
+    if not repo or limit <= 0:
+        return []
+    out = []
+    page = 1
+    per_page = 100
+    headers = _github_rest_headers()
+    while len(out) < limit:
+        url = (f"https://api.github.com/repos/{repo}/pulls"
+               f"?state=all&per_page={per_page}&page={page}")
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.load(resp)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
+                OSError, ValueError, json.JSONDecodeError):
+            break
+        if not isinstance(payload, list) or not payload:
+            break
+        for item in payload:
+            out.append({
+                "number": item.get("number"),
+                "url": item.get("html_url") or "",
+                "createdAt": item.get("created_at") or "",
+                "mergedAt": item.get("merged_at") or "",
+                "body": item.get("body") or "",
+                "title": item.get("title") or "",
+                "state": item.get("state") or "",
+                "headRefName": ((item.get("head") or {}).get("ref") or ""),
+            })
+            if len(out) >= limit:
+                break
+        if len(payload) < per_page:
+            break
+        page += 1
+    return out[:limit]
+
+
 def _list_repo_prs_via_gh(repo, limit=100):
-    """List recent PRs for owner/repo via the gh CLI (empty list on failure)."""
+    """List recent PRs for owner/repo — gh first, then GitHub REST fallback.
+
+    When `gh pr list` fails/empty, enrichment never added older agent PRs
+    (#14–#23), so Yesterday only showed chat-mentioned #20.
+    """
     repo = _normalize_github_repo(repo)
     if not repo:
         return []
@@ -2228,7 +2299,9 @@ def _list_repo_prs_via_gh(repo, limit=100):
         "pr", "list", "--repo", repo, "--state", "all", "--limit", str(limit),
         "--json", "number,url,createdAt,mergedAt,body,title,state,headRefName",
     ])
-    return data if isinstance(data, list) else []
+    if isinstance(data, list) and data:
+        return data
+    return _list_repo_prs_via_rest(repo, limit=limit)
 
 
 def _prs_linked_to_cloud_agent(agent_id, repo):
@@ -2285,6 +2358,13 @@ def _enrich_cloud_agent_prs(sessions, refs):
     for sess in sessions or []:
         aid = (sess.get("cloud_agent_id") or "").strip()
         sid = (sess.get("session_id") or "").strip()
+        # Prefer explicit agent id, then cloud_url …/agents/bc-…, then bc-* session id.
+        # Do not let a short bc-* stub session_id block the real id on cloud_url.
+        if not aid:
+            curl = sess.get("cloud_url") or ""
+            m = re.search(r"(bc-[0-9a-fA-F-]{20,})", curl)
+            if m:
+                aid = m.group(1)
         if not aid and sid.startswith("bc-"):
             aid = sid
         if not (sess.get("cloud_agent") or (aid or "").startswith("bc-")
@@ -2369,16 +2449,10 @@ def _github_pr_timestamps(repo, number):
     ])
     if isinstance(data, dict) and (data.get("createdAt") or data.get("mergedAt")):
         return data.get("createdAt") or "", data.get("mergedAt") or ""
-    # REST fallback — works without `gh` auth for public repos.
+    # REST fallback — works without `gh` for public repos; uses token when set.
     url = f"https://api.github.com/repos/{repo}/pulls/{number}"
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "cursor-dashboard",
-            },
-        )
+        req = urllib.request.Request(url, headers=_github_rest_headers())
         with urllib.request.urlopen(req, timeout=20) as resp:
             payload = json.load(resp)
         return payload.get("created_at") or "", payload.get("merged_at") or ""
