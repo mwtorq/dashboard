@@ -2304,11 +2304,20 @@ def _list_repo_prs_via_gh(repo, limit=100):
     return _list_repo_prs_via_rest(repo, limit=limit)
 
 
-def _prs_linked_to_cloud_agent(agent_id, repo):
+_BC_AGENT_RE = re.compile(r"(bc-[0-9a-fA-F-]{20,})")
+
+
+def _agent_id_from_text(text):
+    """First Cursor cloud-agent id (bc-…) embedded in text, else ''."""
+    m = _BC_AGENT_RE.search(text or "")
+    return m.group(1) if m else ""
+
+
+def _prs_linked_to_cloud_agent(agent_id, repo, catalog=None):
     """PRs whose body embeds the cloud agent id (Cursor PR footer).
 
     Stamps first_day/last_day from GitHub createdAt/mergedAt via `_local_day`
-    (machine local timezone).
+    (machine local timezone). Optional `catalog` avoids re-listing the repo.
     """
     agent_id = (agent_id or "").strip()
     repo = _normalize_github_repo(repo)
@@ -2320,7 +2329,7 @@ def _prs_linked_to_cloud_agent(agent_id, repo):
     else:
         alts.add("bc-" + agent_id)
     out = []
-    for raw in _list_repo_prs_via_gh(repo):
+    for raw in (catalog if catalog is not None else _list_repo_prs_via_gh(repo)):
         body = raw.get("body") or ""
         if not any(a and a in body for a in alts):
             continue
@@ -2346,14 +2355,62 @@ def _prs_linked_to_cloud_agent(agent_id, repo):
     return out
 
 
+def _infer_agent_id_from_session_prs(prs, catalog_by_number):
+    """Discover bc-* from bodies of PRs already on the session (e.g. only #20).
+
+    Local UUID chats often keep a single chat-mentioned PR while the rest of the
+    agent run (#14–#23) only exists as GitHub footers — without this, Yesterday
+    stays stuck on #20 even though Today looks correct.
+    """
+    for p in prs or []:
+        try:
+            num = int(p.get("number"))
+        except (TypeError, ValueError):
+            continue
+        raw = catalog_by_number.get(num) or {}
+        aid = _agent_id_from_text(raw.get("body") or "")
+        if aid:
+            return aid
+        # Already-stamped session rows may carry a URL/title with the id.
+        aid = _agent_id_from_text(
+            " ".join(str(p.get(k) or "") for k in ("url", "title", "body", "key")))
+        if aid:
+            return aid
+    return ""
+
+
+def _session_repo_for_enrichment(sess, refs_entry):
+    repo = _normalize_github_repo(sess.get("repository") or "")
+    if not repo:
+        for tr in sess.get("tracked_repos") or []:
+            repo = _normalize_github_repo(tr)
+            if repo:
+                break
+    if not repo:
+        for p in (refs_entry or {}).get("prs") or []:
+            repo = _normalize_github_repo(p.get("repo") or "")
+            if repo:
+                break
+            key = p.get("key") or ""
+            if "#" in key:
+                repo = _normalize_github_repo(key.split("#", 1)[0])
+                if repo:
+                    break
+    return repo
+
+
 def _enrich_cloud_agent_prs(sessions, refs):
     """Attach every GitHub PR linked to a cloud agent — not only scraped bubbles.
 
     Cloud agent ManagePullRequest footers embed bc-*; local bubble scans often
-    miss older PRs (#21–#24) while keeping a few recent URLs. GitHub is source
-    of truth for the full set and for create/merge local days.
+    miss older PRs (#14–#23) while keeping a single chat mention (#20). GitHub is
+    source of truth for the full sibling set and for create/merge local days.
+
+    Agent id may come from session metadata OR from the body of a PR already on
+    the session — so plain UUID billed rows that only scraped #20 still expand.
     """
     cache = {}
+    catalog_cache = {}
     added = 0
     for sess in sessions or []:
         aid = (sess.get("cloud_agent_id") or "").strip()
@@ -2361,34 +2418,37 @@ def _enrich_cloud_agent_prs(sessions, refs):
         # Prefer explicit agent id, then cloud_url …/agents/bc-…, then bc-* session id.
         # Do not let a short bc-* stub session_id block the real id on cloud_url.
         if not aid:
-            curl = sess.get("cloud_url") or ""
-            m = re.search(r"(bc-[0-9a-fA-F-]{20,})", curl)
-            if m:
-                aid = m.group(1)
-        if not aid and sid.startswith("bc-"):
+            aid = _agent_id_from_text(sess.get("cloud_url") or "")
+        if not aid and sid.startswith("bc-") and len(sid) >= 20:
             aid = sid
-        if not (sess.get("cloud_agent") or (aid or "").startswith("bc-")
-                or sid.startswith("bc-")):
+        r_existing = refs.get(sid) or sess.get("refs") or {}
+        repo = _session_repo_for_enrichment(sess, r_existing)
+        if not repo:
             continue
+        if repo not in catalog_cache:
+            catalog_cache[repo] = _list_repo_prs_via_gh(repo)
+        catalog = catalog_cache[repo]
+        catalog_by_number = {}
+        for raw in catalog:
+            try:
+                catalog_by_number[int(raw.get("number"))] = raw
+            except (TypeError, ValueError):
+                continue
+        inferred = False
+        if not aid:
+            aid = _infer_agent_id_from_session_prs(
+                r_existing.get("prs") or [], catalog_by_number)
+            inferred = bool(aid)
         if not aid:
             continue
-        repo = _normalize_github_repo(sess.get("repository") or "")
-        if not repo:
-            for tr in sess.get("tracked_repos") or []:
-                repo = _normalize_github_repo(tr)
-                if repo:
-                    break
-        if not repo:
-            # Fall back to repo already present on session PR refs.
-            for p in (refs.get(sid) or {}).get("prs") or []:
-                repo = _normalize_github_repo(p.get("repo") or "")
-                if repo:
-                    break
-        if not repo:
+        # Metadata cloud sessions OR any row where we recovered the agent from a
+        # PR footer — local UUID chats with only #20 take the inferred path.
+        if not (sess.get("cloud_agent") or (aid or "").startswith("bc-")
+                or sid.startswith("bc-") or inferred):
             continue
         key = (repo, aid)
         if key not in cache:
-            cache[key] = _prs_linked_to_cloud_agent(aid, repo)
+            cache[key] = _prs_linked_to_cloud_agent(aid, repo, catalog=catalog)
         found = cache[key]
         if not found:
             continue
@@ -2410,6 +2470,8 @@ def _enrich_cloud_agent_prs(sessions, refs):
                 e["source"] = e.get("source") or p.get("source")
         r["prs"] = sorted(existing.values(), key=lambda p: (p["repo"], p["number"]))
         sess["refs"] = r
+        if inferred and not sess.get("cloud_agent_id"):
+            sess["cloud_agent_id"] = aid
         # Ensure primary repo badge exists.
         repos = {x.get("name"): dict(x) for x in r.get("repos") or []}
         if repo not in repos:
