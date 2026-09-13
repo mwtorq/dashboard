@@ -1351,6 +1351,98 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
                 os.environ["TZ"] = prev_tz
             time.tzset()
 
+    def test_enrich_recovers_when_gh_list_has_empty_bodies(self):
+        """Body-less gh pr list must not regress to Today=#20+#25 / Yesterday=#20.
+
+        Non-empty gh results with blank bodies used to skip REST, so sibling
+        attach failed and only mention stamps survived.
+        """
+        import os, time
+        prev_tz = os.environ.get("TZ")
+        prev_gh = d._gh_json
+        prev_rest = d._list_repo_prs_via_rest
+        prev_body = d._github_pr_body
+        try:
+            os.environ["TZ"] = "America/Chicago"
+            time.tzset()
+            agent = "bc-a9f74d1c-2262-4bd5-a3d1-6bc4ad5499b3"
+            times = {
+                20: ("2026-09-12T03:18:25Z", "2026-09-12T03:18:55Z"),
+                21: ("2026-09-12T03:26:53Z", "2026-09-12T03:27:24Z"),
+                22: ("2026-09-12T03:32:46Z", "2026-09-12T03:33:03Z"),
+                23: ("2026-09-12T03:45:42Z", "2026-09-12T03:46:48Z"),
+                24: ("2026-09-12T03:53:46Z", "2026-09-12T12:24:19Z"),
+                25: ("2026-09-12T12:38:58Z", "2026-09-12T23:13:45Z"),
+            }
+            # gh returns rows but blank bodies (blocks naive non-empty short-circuit).
+            def fake_gh(args, timeout=60):
+                if args[:2] == ["pr", "list"]:
+                    return [{
+                        "number": n, "url": f"https://github.com/acme/app/pull/{n}",
+                        "createdAt": c, "mergedAt": m, "body": "",
+                        "title": f"PR {n}", "state": "closed", "headRefName": "",
+                    } for n, (c, m) in times.items()]
+                return None
+            d._gh_json = fake_gh
+            d._list_repo_prs_via_rest = lambda repo, limit=100: [{
+                "number": n, "url": f"https://github.com/acme/app/pull/{n}",
+                "createdAt": c, "mergedAt": m,
+                "body": f"Cloud agent footer {agent}",
+                "title": f"PR {n}", "state": "closed", "headRefName": "",
+            } for n, (c, m) in times.items()]
+            d._github_pr_body = lambda repo, number: f"footer {agent}"
+            sid = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+            refs = {sid: {"jira": [], "repos": [], "prs": [
+                {"key": "acme/app#20", "repo": "acme/app", "number": 20,
+                 "created": True, "first_day": "2026-09-11",
+                 "last_day": "2026-09-12", "days": ["2026-09-11", "2026-09-12"],
+                 "day_source": "mention"},
+                {"key": "acme/app#25", "repo": "acme/app", "number": 25,
+                 "created": True, "first_day": "2026-09-12",
+                 "last_day": "2026-09-12", "days": ["2026-09-12"],
+                 "day_source": "mention"},
+            ]}}
+            sess = {
+                "session_id": sid, "repository": "acme/app",
+                "first_day": "2026-09-11", "last_day": "2026-09-12",
+                "days": {
+                    "2026-09-11": {"cost_usd": 1, "requests": 1, "total_tokens": 1,
+                        "input_tokens": 1, "output_tokens": 0, "cache_read_tokens": 0,
+                        "cache_write_tokens": 0, "measured_tokens": 1, "est_usd": 0,
+                        "on_demand_usd": 0},
+                    "2026-09-12": {"cost_usd": 1, "requests": 1, "total_tokens": 1,
+                        "input_tokens": 1, "output_tokens": 0, "cache_read_tokens": 0,
+                        "cache_write_tokens": 0, "measured_tokens": 1, "est_usd": 0,
+                        "on_demand_usd": 0},
+                },
+                "by_model_day": {}, "refs": refs[sid], "billed": True,
+            }
+            # Before fix this stayed mention-only.
+            y0 = [p["number"] for p in d._clip(sess, "2026-09-11", "2026-09-11")["refs"]["prs"]]
+            t0 = [p["number"] for p in d._clip(sess, "2026-09-12", "2026-09-12")["refs"]["prs"]]
+            self.assertEqual(y0, [20])
+            self.assertEqual(t0, [20, 25])
+            added = d._enrich_cloud_agent_prs([sess], refs)
+            self.assertGreaterEqual(added, 4)
+            d._stamp_pr_github_dates(refs)
+            sess["refs"] = refs[sid]
+            yesterday = [p["number"] for p in
+                         d._clip(sess, "2026-09-11", "2026-09-11")["refs"]["prs"]]
+            today = [p["number"] for p in
+                     d._clip(sess, "2026-09-12", "2026-09-12")["refs"]["prs"]]
+            self.assertEqual(yesterday, [20, 21, 22, 23, 24])
+            self.assertEqual(today, [24, 25])
+            self.assertNotIn(20, today)
+        finally:
+            d._gh_json = prev_gh
+            d._list_repo_prs_via_rest = prev_rest
+            d._github_pr_body = prev_body
+            if prev_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev_tz
+            time.tzset()
+
 
 if __name__ == "__main__":
     unittest.main()
