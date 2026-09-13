@@ -2094,8 +2094,16 @@ def _link_matches_pr_key(link, key):
         return False
     if link in (f"PR #{num}", f"PR#{num}", f"pull/{num}", f"pulls/{num}"):
         return True
-    return (f"/{repo}/pull/{num}" in link or f"/{repo}/pulls/{num}" in link
-            or link.endswith(f"#{num}") and repo.split("/")[-1] in link)
+    if f"/{repo}/pull/{num}" in link or f"/{repo}/pulls/{num}" in link:
+        return True
+    if link.endswith(f"#{num}") and repo.split("/")[-1] in link:
+        return True
+    # Tool payloads often store bare github.com/.../pull/N without owner match quirks.
+    if f"/pull/{num}" in link or f"/pulls/{num}" in link:
+        short = repo.split("/")[-1]
+        if short and short in link:
+            return True
+    return False
 
 
 def _set_pr_github_days(pr, created_at, merged_at):
@@ -2331,32 +2339,91 @@ def _enrich_cloud_agent_prs(sessions, refs):
     return added
 
 
+def _ensure_pr_repo(pr):
+    """Fill pr['repo'] from key owner/repo#N when missing."""
+    repo = _normalize_github_repo(pr.get("repo") or "")
+    if not repo:
+        key = pr.get("key") or ""
+        if "#" in key:
+            repo = _normalize_github_repo(key.split("#", 1)[0])
+    if repo:
+        pr["repo"] = repo
+    return repo
+
+
+def _github_pr_timestamps(repo, number):
+    """Return (createdAt, mergedAt) ISO strings for one PR.
+
+    Tries `gh pr view`, then public GitHub REST. Empty strings on failure.
+    """
+    repo = _normalize_github_repo(repo)
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return "", ""
+    if not repo or number <= 0:
+        return "", ""
+    data = _gh_json([
+        "pr", "view", str(number), "--repo", repo,
+        "--json", "createdAt,mergedAt",
+    ])
+    if isinstance(data, dict) and (data.get("createdAt") or data.get("mergedAt")):
+        return data.get("createdAt") or "", data.get("mergedAt") or ""
+    # REST fallback — works without `gh` auth for public repos.
+    url = f"https://api.github.com/repos/{repo}/pulls/{number}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "cursor-dashboard",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.load(resp)
+        return payload.get("created_at") or "", payload.get("merged_at") or ""
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError,
+            OSError, ValueError, json.JSONDecodeError):
+        return "", ""
+
+
 def _stamp_pr_github_dates(refs):
     """Stamp every resolvable PR from GitHub createdAt/mergedAt (local days).
 
-    Always overwrites mention-based days. Otherwise a Today chat that re-mentions
-    #20 (created yesterday local) stamps first_day=today, GitHub is skipped, and
-    the day filter drops undated #25–#28 — Today shows only #20.
+    Always overwrites mention-based days. Uses repo list when available, then
+    per-PR `gh`/REST fallback — otherwise day-filter keeps only the few PRs that
+    got chat mention stamps (Today=#20+#25, Yesterday=#20).
     """
     need = collections.defaultdict(list)  # repo -> [pr dicts]
     for r in (refs or {}).values():
         for p in (r or {}).get("prs") or []:
-            repo = _normalize_github_repo(p.get("repo") or "")
+            repo = _ensure_pr_repo(p)
             if repo and p.get("number") is not None:
                 need[repo].append(p)
     if not need:
         return 0
     stamped = 0
     for repo, prs in need.items():
-        catalog = {int(x["number"]): x for x in _list_repo_prs_via_gh(repo)
-                   if x.get("number") is not None}
+        catalog = {}
+        for x in _list_repo_prs_via_gh(repo) or []:
+            try:
+                catalog[int(x["number"])] = x
+            except (TypeError, ValueError, KeyError):
+                continue
         for p in prs:
-            meta = catalog.get(int(p["number"]))
-            if not meta:
+            try:
+                num = int(p["number"])
+            except (TypeError, ValueError):
+                continue
+            meta = catalog.get(num) or {}
+            created = meta.get("createdAt") or ""
+            merged = meta.get("mergedAt") or ""
+            if not created and not merged:
+                created, merged = _github_pr_timestamps(repo, num)
+            if not created and not merged:
                 continue
             before = p.get("first_day"), p.get("last_day"), p.get("day_source")
-            if _set_pr_github_days(p, meta.get("createdAt") or "",
-                                   meta.get("mergedAt") or ""):
+            if _set_pr_github_days(p, created, merged):
                 if (p.get("first_day"), p.get("last_day"), p.get("day_source")) != before:
                     stamped += 1
     return stamped
