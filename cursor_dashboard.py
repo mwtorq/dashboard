@@ -2363,14 +2363,31 @@ def _stamp_pr_github_dates(refs):
 
 
 def _filter_refs_to_day_range(refs_entry, start, end):
-    """Return refs unchanged.
+    """Keep PRs whose local first_day/last_day overlap [start, end].
 
-    Day-filtering PR badges was the regression. Pre-#27 (and Copilot) clip spend
-    only and leave refs.prs intact. Filtering hid undated PRs or, after GitHub
-    stamps, left Today with a single wrong badge (#20 only).
+    All-time keeps everything. Bounded day views require stamps (GitHub
+    create/merge via `_local_day`, else mention). Undated PRs are omitted on
+    day views so Yesterday/Today do not share one dump — capture still keeps
+    them on the session for All-time after enrichment.
     """
-    del start, end
-    return refs_entry
+    if not refs_entry:
+        return refs_entry
+    if start <= MIN_DAY and end >= MAX_DAY:
+        return refs_entry
+    prs = []
+    for p in refs_entry.get("prs") or []:
+        fd = p.get("first_day") or ""
+        ld = p.get("last_day") or fd
+        if not fd or not ld:
+            continue
+        if ld < start or fd > end:
+            continue
+        prs.append(p)
+    if prs == (refs_entry.get("prs") or []):
+        return refs_entry
+    out = dict(refs_entry)
+    out["prs"] = prs
+    return out
 
 
 
@@ -5688,26 +5705,58 @@ def _fill_totals(base):
 
 
 def _clip(session, start, end):
-    """Restrict one chat to a date range — same contract as Copilot `_vs_clip`.
+    """Restrict one chat to a date range.
 
-    Clip spend/days only. Keep refs.prs intact. This is how Cursor behaved before
-    the day-filter experiments (#27–#29) and how github_copilot_dashboard still
-    behaves.
+    Spend/days clip like Copilot. PR badges are scoped by each PR's local
+    first_day/last_day (GitHub create/merge via `_local_day`) so Yesterday and
+    Today do not list the same badges. Session titles / orphan naming are
+    untouched.
     """
+    def _with_day_scoped_prs(sess):
+        refs = sess.get("refs")
+        if not refs:
+            return sess
+        scoped = _filter_refs_to_day_range(refs, start, end)
+        if scoped is refs:
+            return sess
+        out = dict(sess)
+        out["refs"] = scoped
+        return out
+
     first, last = session.get("first_day") or "", session.get("last_day") or ""
     # Undated sessions (common for brand-new cloud agents) must not disappear on
     # All-time views: empty strings fail start<=first string compares.
     if not first and not last:
         if start <= MIN_DAY and end >= MAX_DAY:
-            return session
+            return _with_day_scoped_prs(session)
         if session.get("cloud_agent") and start <= MIN_DAY:
-            return session
+            return _with_day_scoped_prs(session)
     if first and last and start <= first and last <= end:
-        return session
+        # Session spend fits the range, but PR create/merge days may not —
+        # always day-scope badges on bounded views.
+        return _with_day_scoped_prs(session)
     days = {d: c for d, c in (session.get("days") or {}).items()
             if d and start <= d <= end}
     if not days:
-        return None
+        # Still surface the chat on days it created/merged a PR even if billing
+        # for that day has not landed yet.
+        mention_days = []
+        for p in (session.get("refs") or {}).get("prs") or []:
+            for d in p.get("days") or []:
+                if start <= d <= end:
+                    mention_days.append(d)
+            fd = p.get("first_day") or ""
+            ld = p.get("last_day") or fd
+            if fd and ld and not (ld < start or fd > end):
+                if start <= fd <= end:
+                    mention_days.append(fd)
+                if start <= ld <= end:
+                    mention_days.append(ld)
+        mention_days = sorted(set(mention_days))
+        if not mention_days:
+            return None
+        days = {d: {"cost_usd": 0.0, "on_demand_usd": 0.0, "total_tokens": 0,
+                    "requests": 0, "est_usd": 0.0} for d in mention_days}
     bmd = {d: c for d, c in (session.get("by_model_day") or {}).items() if d in days}
     keep = {"session_id", "title", "repository", "workspace", "branch", "subtitle",
             "text", "subagent", "draft", "refs", "billed", "source", "account_label",
@@ -5720,7 +5769,7 @@ def _clip(session, start, end):
     base = {k: session[k] for k in keep if k in session}
     base["days"] = days
     base["by_model_day"] = bmd
-    # Do not filter refs — same as github_copilot_dashboard._vs_clip / pre-#27.
+    base["refs"] = _filter_refs_to_day_range(session.get("refs") or {}, start, end)
     return _fill_totals(base)
 
 
