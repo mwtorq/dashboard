@@ -904,7 +904,7 @@ class AdaptiveComposerHeadersTests(unittest.TestCase):
 
 
 class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
-    """Full-composer PR scan + local-day PR scoping on clip."""
+    """Full-composer PR scan; clip keeps refs like Copilot (pre-#27)."""
 
     def test_full_scan_keeps_all_tool_prs_not_only_latest_two(self):
         import json, os, sqlite3, tempfile
@@ -943,8 +943,8 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             self.assertEqual(keys, {"acme/app#10", "acme/app#11", "acme/app#12", "acme/app#13"})
             self.assertIn(cid, hints)
 
-    def test_clip_scopes_prs_by_local_first_last_day(self):
-        """Yesterday/Today must not share the same PR dump."""
+    def test_clip_keeps_all_session_prs_like_before(self):
+        """Match pre-#27 / Copilot: clip spend, never strip refs.prs."""
         sess = {
             "session_id": "s1",
             "title": "multi-day agent",
@@ -968,32 +968,17 @@ class MultiPrCaptureAndDayScopeTests(unittest.TestCase):
             "refs": {
                 "jira": [], "repos": [],
                 "prs": [
-                    # local-yesterday only
-                    {"key": "acme/app#20", "repo": "acme/app", "number": 20,
-                     "created": True, "first_day": "2026-09-11",
-                     "last_day": "2026-09-11", "days": ["2026-09-11"]},
-                    # create yesterday, merge today → both days
-                    {"key": "acme/app#24", "repo": "acme/app", "number": 24,
-                     "created": True, "first_day": "2026-09-11",
-                     "last_day": "2026-09-12",
-                     "days": ["2026-09-11", "2026-09-12"]},
-                    # today only
-                    {"key": "acme/app#25", "repo": "acme/app", "number": 25,
-                     "created": True, "first_day": "2026-09-12",
-                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
-                    {"key": "acme/app#28", "repo": "acme/app", "number": 28,
-                     "created": True, "first_day": "2026-09-12",
-                     "last_day": "2026-09-12", "days": ["2026-09-12"]},
+                    {"key": "acme/app#20", "repo": "acme/app", "number": 20, "created": True},
+                    {"key": "acme/app#24", "repo": "acme/app", "number": 24, "created": True},
+                    {"key": "acme/app#25", "repo": "acme/app", "number": 25, "created": True},
+                    {"key": "acme/app#28", "repo": "acme/app", "number": 28, "created": True},
                 ],
             },
             "billed": True,
         }
-        yesterday = d._clip(sess, "2026-09-11", "2026-09-11")
         today = d._clip(sess, "2026-09-12", "2026-09-12")
         self.assertEqual(
-            [p["number"] for p in yesterday["refs"]["prs"]], [20, 24])
-        self.assertEqual(
-            [p["number"] for p in today["refs"]["prs"]], [24, 25, 28])
+            [p["number"] for p in today["refs"]["prs"]], [20, 24, 25, 28])
 
     def test_local_day_uses_machine_timezone_not_utc_date(self):
         """UTC early-morning timestamps must follow machine local calendar day."""
