@@ -2219,20 +2219,37 @@ def _gh_json(args, timeout=60):
         return None
 
 
+_GITHUB_TOKEN_CACHE = {"at": 0.0, "token": None}
+_GH_PR_LIST_CACHE = {}  # repo -> {"at": ts, "rows": [...]}
+_GH_PR_LIST_TTL = 300.0
+
+
 def _github_auth_token():
-    """Best-effort GitHub token for REST (env, then `gh auth token`)."""
+    """Best-effort GitHub token for REST (env, then `gh auth token`).
+
+    Cached — `_github_rest_headers` used to shell out to `gh auth token` on
+    every REST call during PR enrichment.
+    """
+    now = time.time()
+    cached = _GITHUB_TOKEN_CACHE.get("token")
+    if cached is not None and now - (_GITHUB_TOKEN_CACHE.get("at") or 0) < 600:
+        return cached
+    tok = ""
     for key in ("GITHUB_TOKEN", "GH_TOKEN"):
         tok = (os.environ.get(key) or "").strip()
         if tok:
-            return tok
-    try:
-        r = subprocess.run(
-            ["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
-        if r.returncode == 0:
-            return (r.stdout or "").strip()
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return ""
+            break
+    if not tok:
+        try:
+            r = subprocess.run(
+                ["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                tok = (r.stdout or "").strip()
+        except (OSError, subprocess.TimeoutExpired):
+            tok = ""
+    _GITHUB_TOKEN_CACHE["token"] = tok
+    _GITHUB_TOKEN_CACHE["at"] = now
+    return tok
 
 
 def _github_rest_headers():
@@ -2299,10 +2316,15 @@ def _list_repo_prs_via_gh(repo, limit=100):
     repo = _normalize_github_repo(repo)
     if not repo:
         return []
+    cache_key = f"{repo}|{limit}"
+    hit = _GH_PR_LIST_CACHE.get(cache_key)
+    if hit and time.time() - (hit.get("at") or 0) < _GH_PR_LIST_TTL:
+        return list(hit.get("rows") or [])
     data = _gh_json([
         "pr", "list", "--repo", repo, "--state", "all", "--limit", str(limit),
         "--json", "number,url,createdAt,mergedAt,body,title,state,headRefName",
     ])
+    rows = []
     if isinstance(data, list) and data:
         with_body = sum(1 for x in data if (x.get("body") or "").strip())
         # No bodies → REST. Sparse bodies → merge REST bodies by number so
@@ -2311,26 +2333,36 @@ def _list_repo_prs_via_gh(repo, limit=100):
             rest = _list_repo_prs_via_rest(repo, limit=limit)
             if rest:
                 if with_body == 0:
-                    return rest
-                by_num = {}
-                for row in data:
-                    try:
-                        by_num[int(row.get("number"))] = dict(row)
-                    except (TypeError, ValueError):
-                        continue
-                for row in rest:
-                    try:
-                        num = int(row.get("number"))
-                    except (TypeError, ValueError):
-                        continue
-                    if num not in by_num:
-                        by_num[num] = dict(row)
-                    elif not (by_num[num].get("body") or "").strip() and (row.get("body") or "").strip():
-                        by_num[num]["body"] = row.get("body") or ""
-                return sorted(by_num.values(), key=lambda r: int(r.get("number") or 0),
-                              reverse=True)[:limit]
-        return data
-    return _list_repo_prs_via_rest(repo, limit=limit)
+                    rows = rest
+                else:
+                    by_num = {}
+                    for row in data:
+                        try:
+                            by_num[int(row.get("number"))] = dict(row)
+                        except (TypeError, ValueError):
+                            continue
+                    for row in rest:
+                        try:
+                            num = int(row.get("number"))
+                        except (TypeError, ValueError):
+                            continue
+                        if num not in by_num:
+                            by_num[num] = dict(row)
+                        elif not (by_num[num].get("body") or "").strip() and (
+                                row.get("body") or "").strip():
+                            by_num[num]["body"] = row.get("body") or ""
+                    rows = sorted(
+                        by_num.values(),
+                        key=lambda r: int(r.get("number") or 0),
+                        reverse=True)[:limit]
+            else:
+                rows = data
+        else:
+            rows = data
+    else:
+        rows = _list_repo_prs_via_rest(repo, limit=limit)
+    _GH_PR_LIST_CACHE[cache_key] = {"at": time.time(), "rows": list(rows or [])}
+    return list(rows or [])
 
 
 def _github_pr_body(repo, number):
@@ -2627,7 +2659,9 @@ def _stamp_pr_github_dates(refs):
         for repo, catalog in pool.map(_catalog_for, repos):
             catalogs[repo] = catalog
 
-    stamped = 0
+    # Collect PRs missing catalog timestamps and fetch them in parallel
+    # (sequential gh/REST fallbacks were a multi-minute cold-load tax).
+    missing = []
     for repo, prs in need.items():
         catalog = catalogs.get(repo) or {}
         for p in prs:
@@ -2636,10 +2670,42 @@ def _stamp_pr_github_dates(refs):
             except (TypeError, ValueError):
                 continue
             meta = catalog.get(num) or {}
-            created = meta.get("createdAt") or ""
-            merged = meta.get("mergedAt") or ""
-            if not created and not merged:
-                created, merged = _github_pr_timestamps(repo, num)
+            created = meta.get("createdAt") or meta.get("created_at") or ""
+            merged = meta.get("mergedAt") or meta.get("merged_at") or ""
+            if created or merged:
+                p["_gh_created"] = created
+                p["_gh_merged"] = merged
+            else:
+                missing.append((repo, num, p))
+
+    if missing:
+        # Cap per-PR network fallbacks — each is a gh/REST round-trip. Catalog
+        # hits above already stamped most PRs; the long tail was a cold-load cliff.
+        missing_fetch = missing[:40]
+        if len(missing) > len(missing_fetch):
+            print(f"  pr day-stamps: fetching {len(missing_fetch)}/{len(missing)} "
+                  f"missing via gh/REST (capped)", flush=True)
+
+        def _fetch_one(item):
+            repo, num, _pr = item
+            created, merged = _github_pr_timestamps(repo, num)
+            return (repo, num), (created, merged)
+
+        fetched = {}
+        workers = min(8, max(1, len(missing_fetch)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for key, stamps in pool.map(_fetch_one, missing_fetch):
+                fetched[key] = stamps
+        for repo, num, p in missing_fetch:
+            created, merged = fetched.get((repo, num), ("", ""))
+            p["_gh_created"] = created
+            p["_gh_merged"] = merged
+
+    stamped = 0
+    for repo, prs in need.items():
+        for p in prs:
+            created = p.pop("_gh_created", "") or ""
+            merged = p.pop("_gh_merged", "") or ""
             if not created and not merged:
                 continue
             before = p.get("first_day"), p.get("last_day"), p.get("day_source")
@@ -4375,6 +4441,13 @@ def _normalize_cloud_agent(raw):
                 name = _title_from_text(val) or val.strip()[:90]
                 break
     url = (raw.get("url") or f"https://cursor.com/agents/{aid}").strip()
+    project_meta = raw.get("projectMetadata") or raw.get("project_metadata") or {}
+    if not isinstance(project_meta, dict):
+        project_meta = {}
+    # Cursor marks Projects with a projectMetadata object on background-composer
+    # list rows (appearance icon/color). Workers usually lack this field.
+    is_project = bool(project_meta) or bool(
+        raw.get("isProject") or raw.get("is_project"))
     return {
         "id": aid,
         "name": name or aid,
@@ -4385,8 +4458,13 @@ def _normalize_cloud_agent(raw):
         "branch": (raw.get("branchName") or raw.get("branch") or "").strip(),
         "created_at": created,
         "updated_at": updated,
-        "model": (raw.get("originalModelName") or raw.get("model") or "auto"),
+        "model": (raw.get("originalModelName") or raw.get("model")
+                  or ((raw.get("modelDetails") or {}).get("modelName")) or "auto"),
         "usage": raw.get("usage") or raw.get("totalUsage") or {},
+        "project_metadata": project_meta,
+        "is_project": is_project,
+        "uses_tracked_tasks": bool(raw.get("usesTrackedTasks")
+                                   or raw.get("uses_tracked_tasks")),
     }
 
 
@@ -4474,6 +4552,237 @@ def _fetch_agent_usage(agent_id):
         print(f"  cloud agent usage {agent_id}: {exc}", flush=True)
         return {}
     return data.get("totalUsage") or {}
+
+
+RE_BC_ID = re.compile(
+    r"\bbc-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+
+
+def _agent_stores_root():
+    """Local Cursor AgentStores root (Project Context + worker stores)."""
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        path = os.path.join(local, "Cursor", "AgentStores", "cursor_agent_stores")
+        if os.path.isdir(path):
+            return path
+    home = os.path.expanduser("~")
+    for cand in (
+        os.path.join(home, ".cursor", "AgentStores", "cursor_agent_stores"),
+        os.path.join(home, "Library", "Application Support", "Cursor",
+                     "AgentStores", "cursor_agent_stores"),
+    ):
+        if os.path.isdir(cand):
+            return cand
+    return os.path.join(local or home, "Cursor", "AgentStores", "cursor_agent_stores")
+
+
+def _bc_ids_in_text(text):
+    return sorted(set(RE_BC_ID.findall(text or "")))
+
+
+def _project_store_worker_ids(project_id, max_files=400):
+    """bc-* ids linked from a Project's local Agent Store files (notes/tasks).
+
+    Background-composer list exposes Projects via `projectMetadata`, but spawned
+    workers often only appear as bc-* links inside that Project's Context store.
+    """
+    project_id = (project_id or "").strip()
+    if not project_id.startswith("bc-"):
+        return []
+    root = _agent_stores_root()
+    files_dir = os.path.join(root, project_id, "files")
+    if not os.path.isdir(files_dir):
+        # Some mounts use the bare uuid without bc- prefix.
+        files_dir = os.path.join(root, project_id[3:], "files")
+    if not os.path.isdir(files_dir):
+        return []
+    found = set()
+    n = 0
+    for dirpath, _dirnames, filenames in os.walk(files_dir):
+        for name in filenames:
+            n += 1
+            if n > max_files:
+                break
+            path = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(path) > 2_000_000:
+                    continue
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            for aid in _bc_ids_in_text(text):
+                if aid != project_id:
+                    found.add(aid)
+        if n > max_files:
+            break
+    return sorted(found)
+
+
+def _discover_cursor_projects(agents=None, cookie=None):
+    """Projects (coordinator agents) + spawned worker agent ids.
+
+    Signal: cookie/API composer rows with `projectMetadata` are Projects.
+    Workers: bc-* ids referenced from each Project's local Agent Store files.
+    """
+    agents = list(agents or [])
+    by_id = {a.get("id"): a for a in agents if a.get("id")}
+    # Prefer a fresh cookie list so projectMetadata is present even when the
+    # cached normalize path dropped it on older runs.
+    if cookie:
+        try:
+            listed = _list_background_composers_cookie(cookie)
+            for a in listed:
+                aid = a.get("id")
+                if not aid:
+                    continue
+                prev = by_id.get(aid) or {}
+                merged = dict(prev)
+                merged.update({k: v for k, v in a.items() if v or k not in merged})
+                by_id[aid] = merged
+        except Exception as exc:
+            print(f"  project list refresh skipped ({exc})", flush=True)
+    projects = []
+    for aid, agent in sorted(by_id.items(), key=lambda kv: -(
+            _parse_iso_ms(kv[1].get("updated_at")) or 0)):
+        if not (agent.get("is_project") or agent.get("project_metadata")):
+            continue
+        worker_ids = _project_store_worker_ids(aid)
+        workers = []
+        # Coordinator itself first (its own billed turns).
+        workers.append({
+            "id": aid,
+            "name": agent.get("name") or aid,
+            "role": "coordinator",
+            "url": agent.get("url") or f"https://cursor.com/agents/{aid}",
+            "repository": agent.get("repository") or "",
+        })
+        for wid in worker_ids:
+            w = by_id.get(wid) or {}
+            workers.append({
+                "id": wid,
+                "name": w.get("name") or wid,
+                "role": "worker",
+                "url": w.get("url") or f"https://cursor.com/agents/{wid}",
+                "repository": w.get("repository") or agent.get("repository") or "",
+            })
+        projects.append({
+            "id": aid,
+            "name": agent.get("name") or aid,
+            "url": agent.get("url") or f"https://cursor.com/agents/{aid}",
+            "repository": agent.get("repository") or "",
+            "project_metadata": agent.get("project_metadata") or {},
+            "uses_tracked_tasks": bool(agent.get("uses_tracked_tasks")),
+            "workers": workers,
+            "worker_ids": [w["id"] for w in workers],
+        })
+    return projects
+
+
+def _session_agent_ids(sess):
+    """Possible bc-* / conversation ids that attribute a session to an agent."""
+    ids = set()
+    for key in ("session_id", "cloud_agent_id", "matched_local_id"):
+        val = (sess.get(key) or "").strip()
+        if val:
+            ids.add(val)
+            if val.startswith("bc-"):
+                ids.add(val[3:])
+            elif re.match(
+                    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", val):
+                ids.add("bc-" + val)
+    return ids
+
+
+def _rollup_projects(sessions, projects):
+    """Spend by Cursor Project, with per-agent (coordinator + spawned workers) detail."""
+    sessions = sessions or []
+    projects = projects or []
+    # Pre-index sessions by agent id for fast membership tests.
+    by_agent = collections.defaultdict(list)
+    for sess in sessions:
+        for aid in _session_agent_ids(sess):
+            by_agent[aid].append(sess)
+
+    out = []
+    attributed = set()
+    for proj in projects:
+        agent_rows = []
+        seen_sess = set()
+        total_cost = total_od = total_tok = 0.0
+        total_req = 0
+        for worker in proj.get("workers") or []:
+            wid = worker.get("id") or ""
+            alts = {wid}
+            if wid.startswith("bc-"):
+                alts.add(wid[3:])
+            else:
+                alts.add("bc-" + wid)
+            matched = []
+            for alt in alts:
+                matched.extend(by_agent.get(alt) or [])
+            # De-dupe sessions for this worker.
+            uniq = []
+            seen_w = set()
+            for s in matched:
+                sid = s.get("session_id")
+                if sid in seen_w:
+                    continue
+                seen_w.add(sid)
+                uniq.append(s)
+                seen_sess.add(sid)
+                attributed.add(sid)
+            cost = sum(float(s.get("cost_usd") or 0) for s in uniq)
+            od = sum(float(s.get("on_demand_usd") or 0) for s in uniq)
+            tok = sum(int(s.get("total_tokens") or 0) for s in uniq)
+            req = sum(int(s.get("requests") or 0) for s in uniq)
+            total_cost += cost
+            total_od += od
+            total_tok += tok
+            total_req += req
+            agent_rows.append({
+                "id": wid,
+                "name": worker.get("name") or wid,
+                "role": worker.get("role") or "worker",
+                "url": worker.get("url") or "",
+                "repository": worker.get("repository") or "",
+                "sessions": len(uniq),
+                "requests": req,
+                "total_tokens": tok,
+                "cost_usd": round(cost, 4),
+                "on_demand_usd": round(od, 4),
+                "included_usd": round(max(0.0, cost - od), 4),
+            })
+        out.append({
+            "id": proj.get("id"),
+            "name": proj.get("name") or proj.get("id"),
+            "url": proj.get("url") or "",
+            "repository": proj.get("repository") or "",
+            "sessions": len(seen_sess),
+            "requests": total_req,
+            "total_tokens": int(total_tok),
+            "cost_usd": round(total_cost, 4),
+            "on_demand_usd": round(total_od, 4),
+            "included_usd": round(max(0.0, total_cost - total_od), 4),
+            "agents": agent_rows,
+            "agent_count": len(agent_rows),
+            "worker_count": sum(1 for a in agent_rows if a.get("role") == "worker"),
+        })
+    out.sort(key=lambda p: -p.get("cost_usd", 0))
+    unattributed = [
+        s for s in sessions
+        if s.get("session_id") not in attributed
+        and (_is_cloud_session(s) or (s.get("session_id") or "").startswith("bc-"))
+    ]
+    return {
+        "projects": out,
+        "project_count": len(out),
+        "unattributed_cloud_sessions": len(unattributed),
+        "unattributed_cloud_usd": round(
+            sum(float(s.get("cost_usd") or 0) for s in unattributed), 4),
+    }
 
 
 def _attach_cloud_agent_usage(agents, only_ids=None):
@@ -5421,29 +5730,93 @@ def _session_time_window_ms(sess, priced=None):
     return min(times), max(times)
 
 
-def _find_composer_embedding_cid(con, orphan_cid):
-    """Reverse-map: composerData/bubble blob that embeds the billing UUID."""
-    if not con or not orphan_cid or orphan_cid.startswith("_") or len(orphan_cid) < 12:
+def _blob_as_text(raw):
+    if raw is None:
         return ""
-    needle = f"%{orphan_cid}%"
-    try:
-        rows = con.execute(
-            "SELECT key FROM cursorDiskKV WHERE "
-            "(key LIKE 'composerData:%' OR key LIKE 'bubbleId:%') "
-            "AND CAST(value AS TEXT) LIKE ? LIMIT 8",
-            (needle,),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return ""
-    for row in rows:
-        key = row[0] if not isinstance(row, sqlite3.Row) else row["key"]
-        parts = str(key).split(":")
-        if len(parts) < 2:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, memoryview):
+        raw = raw.tobytes()
+    if isinstance(raw, (bytes, bytearray)):
+        return raw.decode("utf-8", "ignore")
+    return str(raw)
+
+
+def _composer_id_from_disk_key(key):
+    parts = str(key or "").split(":")
+    return parts[1] if len(parts) >= 2 else ""
+
+
+def _build_orphan_embed_map(con, orphan_ids):
+    """Map billing UUID → local composerId with ONE store scan (not N LIKE scans).
+
+    Per-orphan `CAST(value AS TEXT) LIKE '%uuid%'` against cursorDiskKV was the
+    dominant cold-load cost (full-table scan × every orphan billed chat).
+    """
+    if not con:
+        return {}
+    needles = []
+    for oid in orphan_ids or []:
+        oid = (oid or "").strip()
+        if (not oid or oid.startswith("_") or oid.startswith("bc-")
+                or len(oid) < 12):
             continue
-        cid = parts[1]
-        if cid and cid != orphan_cid:
-            return cid
-    return ""
+        needles.append(oid)
+    if not needles:
+        return {}
+    remaining = set(needles)
+    found = {}
+
+    def _scan(prefix, limit_rows=None):
+        nonlocal remaining, found
+        if not remaining:
+            return
+        try:
+            sql = "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?"
+            cur = con.execute(sql, (prefix + "%",))
+        except sqlite3.OperationalError:
+            return
+        n = 0
+        while remaining:
+            row = cur.fetchone()
+            if row is None:
+                break
+            n += 1
+            if limit_rows is not None and n > limit_rows:
+                break
+            key = row[0] if not isinstance(row, sqlite3.Row) else row["key"]
+            raw = row[1] if not isinstance(row, sqlite3.Row) else row["value"]
+            text = _blob_as_text(raw)
+            if not text:
+                continue
+            hit = None
+            for oid in remaining:
+                if oid in text:
+                    hit = oid
+                    break
+            if not hit:
+                continue
+            cid = _composer_id_from_disk_key(key)
+            if cid and cid != hit:
+                found[hit] = cid
+                remaining.discard(hit)
+
+    # composerData only — a full bubbleId value scan is multi-minute on large
+    # stores and was the cold-load cliff. Unresolved orphans still go through
+    # fuzzy local matching afterward.
+    _scan("composerData:")
+    return found
+
+
+def _find_composer_embedding_cid(con, orphan_cid, embed_map=None):
+    """Reverse-map: composerData/bubble blob that embeds the billing UUID."""
+    if not orphan_cid or orphan_cid.startswith("_") or len(orphan_cid) < 12:
+        return ""
+    if embed_map is not None:
+        return embed_map.get(orphan_cid) or ""
+    # Legacy single-id path (tests / callers): still avoid unbounded dual LIKE
+    # by preferring the one-pass builder for a singleton set.
+    return _build_orphan_embed_map(con, [orphan_cid]).get(orphan_cid) or ""
 
 
 def _apply_local_context_to_orphan(sess, local, source, note_prefix=""):
@@ -5530,8 +5903,10 @@ def resolve_orphan_sessions(sessions, local_by_id, priced_all=None, local_priced
     billed_ids = {s.get("session_id") for s in sessions if s.get("billed")}
     resolved = 0
 
-    # Exact reverse embedding map.
+    # Exact reverse embedding map — one store scan for all orphans.
     if con is not None:
+        orphan_ids = []
+        orphan_sessions = []
         for sess in sessions:
             if not sess.get("orphan_billed"):
                 continue
@@ -5539,7 +5914,16 @@ def resolve_orphan_sessions(sessions, local_by_id, priced_all=None, local_priced
             if not cid or cid.startswith("bc-") or sess.get("cloud_agent_id"):
                 # Leave bc-* / cloudAgentId orphans for Cloud Agents API enrichment.
                 continue
-            embedded = _find_composer_embedding_cid(con, cid)
+            orphan_ids.append(cid)
+            orphan_sessions.append(sess)
+        t_embed = time.perf_counter()
+        embed_map = _build_orphan_embed_map(con, orphan_ids) if orphan_ids else {}
+        if orphan_ids:
+            print(f"  orphan embed index: {len(embed_map)}/{len(orphan_ids)} "
+                  f"in {time.perf_counter() - t_embed:.2f}s", flush=True)
+        for sess in orphan_sessions:
+            cid = sess.get("session_id") or ""
+            embedded = embed_map.get(cid) or ""
             if not embedded:
                 continue
             local = local_by_id.get(embedded) or {}
@@ -6229,63 +6613,39 @@ def _session_stub_from_meta(cid, meta, ws_names):
     }
 
 
+def _load_bubbles_one(db_path, cid, cap=BUBBLE_CAP_PER_COMPOSER):
+    """Load one composer's bubbles via prefix queries (no full-table scan)."""
+    try:
+        with connect(db_path) as con:
+            bubs, owners = _load_bubbles_for_cid(con, cid, cap=cap)
+        return cid, bubs or [], owners or collections.Counter()
+    except Exception:
+        return cid, [], collections.Counter()
+
+
 def _load_bubbles(con, meta, skip_cids=None, cap=BUBBLE_CAP_PER_COMPOSER):
-    """One pass over bubbleId rows; heavy composers reload head+tail in time order."""
+    """Per-composer bubble load (parallel).
+
+    Older code scanned every `bubbleId:%` key/value twice. On multi-GB
+    state.vscdb stores (~200k+ bubbles) that alone took multiple minutes.
+    """
+    del con  # workers open their own connections for SQLite threading
     skip_cids = skip_cids or set()
-    load_cids = {cid for cid in meta if cid and cid not in skip_cids
-                 and cid != "empty-state-draft"}
-    bubbles = collections.defaultdict(list)
+    load_cids = sorted(
+        cid for cid in meta if cid and cid not in skip_cids
+        and cid != "empty-state-draft")
+    bubbles = {}
     composer_owners = collections.defaultdict(collections.Counter)
-    key_counts = collections.Counter()
     loaded = 0
-    try:
-        bubble_keys = con.execute(
-            "SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
-    except sqlite3.OperationalError:
-        bubble_keys = []
-    for row in bubble_keys:
-        key = row[0]
-        parts = key.split(":")
-        if len(parts) < 3:
-            continue
-        cid = parts[1]
-        if cid not in load_cids:
-            continue
-        key_counts[cid] += 1
-    heavy = {cid for cid, n in key_counts.items() if n > cap}
-    try:
-        bubble_rows = con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'")
-    except sqlite3.OperationalError:
-        bubble_rows = []
-    for key, raw in bubble_rows:
-        parts = key.split(":")
-        if len(parts) < 3:
-            continue
-        cid = parts[1]
-        if cid not in load_cids or cid in heavy:
-            continue
-        row = _bubble_dict_from_raw(key, raw)
-        if not row:
-            continue
-        if row.get("owner_uid"):
-            composer_owners[cid][row["owner_uid"]] += 1
-        bubbles[cid].append({
-            "id": row["id"],
-            "type": row["type"],
-            "created": row["created"],
-            "text": row["text"],
-            "inn": row["inn"],
-            "out": row["out"],
-            "model": row["model"],
-        })
-        loaded += 1
-    for cid in heavy:
-        bubs, owners = _load_bubbles_for_cid(con, cid, cap=cap)
-        if bubs:
-            bubbles[cid] = bubs
-            composer_owners[cid].update(owners)
-            loaded += len(bubs)
+    if load_cids:
+        workers = min(8, max(1, len(load_cids)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for cid, bubs, owners in pool.map(
+                    lambda c: _load_bubbles_one(DB_PATH, c, cap), load_cids):
+                if bubs:
+                    bubbles[cid] = bubs
+                    composer_owners[cid].update(owners)
+                    loaded += len(bubs)
     for cid in load_cids:
         meta.setdefault(cid, {
             "title": "", "subtitle": "", "workspace_id": "", "workspace_path": "",
@@ -6549,9 +6909,9 @@ def scan_cursor(force=False):
                      if other else ""), flush=True)
 
         cloud_agents = []
+        cookie = ((billing or {}).get("cookie") or "").strip()
         if CLOUD_AGENTS_ENABLED:
             try:
-                cookie = ((billing or {}).get("cookie") or "").strip()
                 if not cookie:
                     try:
                         with connect() as c2:
@@ -6597,6 +6957,38 @@ def scan_cursor(force=False):
                         + " " + sess.get("title", "") + " " + (sess.get("subtitle") or "")
                     ).strip()
 
+        projects_catalog = []
+        try:
+            if not cookie:
+                try:
+                    with connect() as c3:
+                        cookie = _cursor_session_cookie(c3) or ""
+                except Exception:
+                    cookie = ""
+            projects_catalog = _discover_cursor_projects(cloud_agents, cookie=cookie)
+            if projects_catalog:
+                print(f"  projects: {len(projects_catalog)} Cursor Project(s), "
+                      f"{sum(max(0, len(p.get('workers') or []) - 1) for p in projects_catalog)} "
+                      f"spawned worker(s) from Agent Stores", flush=True)
+        except Exception as exc:
+            print(f"  projects discovery skipped ({exc})", flush=True)
+
+        # Tag sessions with project_id when they belong to a known project/worker.
+        project_owner = {}
+        for proj in projects_catalog:
+            pid = proj.get("id")
+            for wid in proj.get("worker_ids") or []:
+                project_owner[wid] = pid
+                if wid.startswith("bc-"):
+                    project_owner[wid[3:]] = pid
+                else:
+                    project_owner["bc-" + wid] = pid
+        for sess in sessions:
+            for aid in _session_agent_ids(sess):
+                if aid in project_owner:
+                    sess["project_id"] = project_owner[aid]
+                    break
+
         # Final title pass: ItemTable/SQL names may still be empty while bubble
         # text or agent transcripts exist under the billed conversation id.
         try:
@@ -6615,11 +7007,20 @@ def scan_cursor(force=False):
 
         # Full-composer PR scan (not head/tail sampled) so older tool-only PRs
         # still reach refs — sampling alone kept only the newest visible URLs.
-        pr_cids = list({s["session_id"] for s in sessions if s.get("session_id")}
-                       | set(texts_by_cid))
+        # Skip bc-* / unattributed: those have no local bubbleId rows (cloud PRs
+        # come from GitHub enrichment instead).
+        pr_cids = [
+            cid for cid in (
+                {s["session_id"] for s in sessions if s.get("session_id")}
+                | set(texts_by_cid)
+            )
+            if cid and not cid.startswith("bc-") and cid != "_unattributed"
+        ]
+        t_pr = time.perf_counter()
         n_pr_links, pr_day_hints = _inject_composer_pr_links(con, texts_by_cid, pr_cids)
-        if n_pr_links:
-            print(f"  full-scan PR links: +{n_pr_links} across {len(pr_day_hints)} chat(s)",
+        if n_pr_links or pr_cids:
+            print(f"  full-scan PR links: +{n_pr_links} across {len(pr_day_hints)} chat(s) "
+                  f"({len(pr_cids)} composers, {time.perf_counter() - t_pr:.2f}s)",
                   flush=True)
 
         allow = JIRA_KEY_ALLOW | _dynamic_jira_keys(texts_by_cid.values())
@@ -6687,6 +7088,7 @@ def scan_cursor(force=False):
             "cloud_agents": len(cloud_agents) if CLOUD_AGENTS_ENABLED else 0,
             "cloud_agents_error": (_CLOUD_AGENTS_CACHE.get("error") or ""),
             "cloud_agents_source": (_CLOUD_AGENTS_CACHE.get("source") or ""),
+            "projects_catalog": projects_catalog,
         }
         _CACHE["stamp"], _CACHE["data"], _CACHE["at"] = stamp, data, time.time()
         t_done = time.perf_counter()
@@ -7719,6 +8121,25 @@ def build_payload(start, end, q="", force=False):
             and end <= (mtd.get("end") or MAX_DAY))
         range_allowance = None
     pub = [_public_session(s) for s in (billed_rows + other_rows)]
+    # Prefer titles already joined onto billed sessions when naming workers.
+    name_by_id = {}
+    for s in billed_rows + other_rows:
+        for aid in _session_agent_ids(s):
+            title = (s.get("title") or "").strip()
+            if title and title != "(untitled)" and aid not in name_by_id:
+                name_by_id[aid] = title
+    catalog = []
+    for proj in data.get("projects_catalog") or []:
+        p = dict(proj)
+        workers = []
+        for w in proj.get("workers") or []:
+            ww = dict(w)
+            if (not ww.get("name") or ww.get("name") == ww.get("id")) and ww.get("id") in name_by_id:
+                ww["name"] = name_by_id[ww["id"]]
+            workers.append(ww)
+        p["workers"] = workers
+        catalog.append(p)
+    projects_rollup = _rollup_projects(billed_rows, catalog)
     return {
         "totals": totals,
         "sessions": pub,
@@ -7730,6 +8151,7 @@ def build_payload(start, end, q="", force=False):
         "range_is_current_cycle": range_is_current_cycle,
         "range_allowance": range_allowance,
         "cycle_models": (mtd or {}).get("cycle_models") or [],
+        "projects": projects_rollup,
         "rollup": _enrich_jira_rollup(rollup(billed_rows, refs, turn_prs, turn_cost,
                                             data.get("git_pr_catalog"),
                                             data.get("path_by_github"))),
@@ -8742,6 +9164,12 @@ section.collapsed > *:not(h2){display:none !important}
     <table id="cycleModels"></table>
     <div class="sub" id="cycleModelsFoot"></div>
   </section>
+  <section id="projects">
+    <h2>Projects <span class="sub">· coordinator + spawned agents</span></h2>
+    <div class="sub range-meta" id="projectsMeta">Loading Cursor Projects…</div>
+    <table id="projectsTable"></table>
+    <div class="sub" id="projectsFoot"></div>
+  </section>
   <section id="rangeAllowance" style="display:none">
     <h2 id="rangeAllowHeading">Allowance usage</h2>
     <div class="sub range-meta" id="rangeAllowMeta"></div>
@@ -9367,10 +9795,71 @@ function renderModelUtil(){
     +(incLim?` of ${usd(incLim)}`:'')
     +`. Independent of the date-range filter.`;
 }
+function renderProjects(){
+  const el=document.getElementById('projects');
+  const meta=document.getElementById('projectsMeta');
+  const tbl=document.getElementById('projectsTable');
+  const foot=document.getElementById('projectsFoot');
+  if(!el||!tbl) return;
+  const pr=DATA.projects||{};
+  const rows=pr.projects||[];
+  if(!DATA.billed){
+    meta.textContent='Projects need billed cloud-agent sessions (sign into Cursor; do not pass --no-api).';
+    tbl.innerHTML='';
+    foot.textContent='';
+    return;
+  }
+  if(!rows.length){
+    meta.textContent='No Cursor Projects detected from background-composer list '
+      +'(composers with projectMetadata) on this account.';
+    tbl.innerHTML='';
+    foot.textContent='';
+    return;
+  }
+  meta.textContent=`${rows.length} Project(s) · spend rolls up the coordinator agent plus `
+    +`workers linked from each Project's Agent Store (bc-* ids in notes/tasks). `
+    +`Independent of model-pool % bars above.`;
+  const mx=Math.max(...rows.map(r=>r.cost_usd||0),0.0001);
+  let html='<thead><tr><th>Project / agent</th><th>Role</th><th>Chats</th><th>Tokens</th>'
+    +`<th title="${costThTitle(true)}">Cost</th><th>Share</th></tr></thead><tbody>`;
+  rows.forEach(p=>{
+    const href=p.url?`<a href="${esc(p.url)}" target="_blank">${esc(p.name||p.id)}</a>`:esc(p.name||p.id);
+    html+=`<tr class="proj">
+      <td>${href}${p.repository?`<div class="sub">${esc(p.repository)}</div>`:''}
+        <div class="sub">${num(p.agent_count||0)} agent(s)`
+        +`${p.worker_count?` · ${num(p.worker_count)} spawned worker(s)`:''}</div></td>
+      <td><span class="b cloud">project</span></td>
+      <td>${num(p.sessions||0)}</td><td>${kt(p.total_tokens||0)}</td>
+      <td class="cost">${costCell(p,true)}</td>
+      <td style="width:160px"><div class="bar" style="width:${(p.cost_usd||0)/mx*100}%"></div></td></tr>`;
+    (p.agents||[]).forEach(a=>{
+      const ah=a.url?`<a href="${esc(a.url)}" target="_blank">${esc(a.name||a.id)}</a>`:esc(a.name||a.id);
+      const role=a.role==='coordinator'
+        ? '<span class="b cloud" title="Project coordinator">coordinator</span>'
+        : '<span class="b local" title="Agent spawned by this Project">worker</span>';
+      html+=`<tr class="proj-agent">
+        <td style="padding-left:28px">${ah}<div class="sub">${esc(a.id||'')}</div></td>
+        <td>${role}</td>
+        <td>${num(a.sessions||0)}</td><td>${kt(a.total_tokens||0)}</td>
+        <td class="cost">${costCell(a,true)}</td>
+        <td style="width:160px"><div class="bar dim" style="width:${(a.cost_usd||0)/mx*100}%"></div></td></tr>`;
+    });
+  });
+  html+='</tbody>';
+  tbl.innerHTML=html;
+  const tot=rows.reduce((a,b)=>a+(b.cost_usd||0),0);
+  let footTxt=`${rows.length} project(s) · ${usd(tot)} in selected range`;
+  if(pr.unattributed_cloud_usd>0.004){
+    footTxt+=` · ${usd(pr.unattributed_cloud_usd)} cloud spend not linked to a Project `
+      +`(${num(pr.unattributed_cloud_sessions||0)} session(s))`;
+  }
+  foot.textContent=footTxt;
+}
 function render(){
   const t=DATA.totals;
   // Plan & Usage pools first — do not let later render steps abort them.
   try{ renderModelUtil(); }catch(err){ console.error('renderModelUtil', err); }
+  try{ renderProjects(); }catch(err){ console.error('renderProjects', err); }
   try{ renderDigest(); }catch(err){ console.error('renderDigest', err); }
   try{ renderRangeAllowance(); }catch(err){ console.error('renderRangeAllowance', err); }
   const budget=DATA.range_is_current_cycle?(DATA.mtd||{}).budget:null;
