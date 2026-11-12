@@ -258,8 +258,66 @@ class PageMarkupTests(unittest.TestCase):
         self.assertIn("Never hide this section", html)
         self.assertIn("Includes Cursor Grok and Composer", html)
         self.assertIn("toFixed(2)", html)
+        self.assertIn('id="projects"', html)
+        self.assertIn("function renderProjects()", html)
+        self.assertIn("spawned worker", html)
         # Placed above plan-allowance so it is not missed.
         self.assertLess(html.find('id="modelUtil"'), html.find('id="mtd"'))
+        self.assertLess(html.find('id="projects"'), html.find('id="mtd"'))
+
+
+class ProjectsRollupTests(unittest.TestCase):
+    def test_normalize_marks_project_metadata(self):
+        agent = d._normalize_cloud_agent({
+            "bcId": "bc-11111111-1111-1111-1111-111111111111",
+            "name": "Cost Dashboard",
+            "projectMetadata": {"appearance": {"icon": "chart-bars"}},
+            "repoUrl": "https://github.com/acme/app",
+        })
+        self.assertTrue(agent["is_project"])
+        self.assertEqual(agent["project_metadata"]["appearance"]["icon"], "chart-bars")
+        plain = d._normalize_cloud_agent({
+            "bcId": "bc-22222222-2222-2222-2222-222222222222",
+            "name": "One-off agent",
+        })
+        self.assertFalse(plain["is_project"])
+
+    def test_rollup_projects_lists_coordinator_and_workers(self):
+        proj_id = "bc-aaaaaaa1-aaaa-aaaa-aaaa-aaaaaaaaaaa1"
+        worker_id = "bc-bbbbbbb2-bbbb-bbbb-bbbb-bbbbbbbbbbb2"
+        other_id = "bc-ccccccc3-cccc-cccc-cccc-ccccccccccc3"
+        catalog = [{
+            "id": proj_id,
+            "name": "Cost Dashboard",
+            "url": f"https://cursor.com/agents/{proj_id}",
+            "repository": "acme/dashboard",
+            "workers": [
+                {"id": proj_id, "name": "Cost Dashboard", "role": "coordinator",
+                 "url": f"https://cursor.com/agents/{proj_id}"},
+                {"id": worker_id, "name": "Cycle usage display", "role": "worker",
+                 "url": f"https://cursor.com/agents/{worker_id}"},
+            ],
+            "worker_ids": [proj_id, worker_id],
+        }]
+        sessions = [
+            {"session_id": proj_id, "cloud_agent": True, "cost_usd": 10.0,
+             "on_demand_usd": 1.0, "total_tokens": 100, "requests": 2},
+            {"session_id": "local-uuid", "cloud_agent_id": worker_id,
+             "cost_usd": 5.5, "on_demand_usd": 0.0, "total_tokens": 50, "requests": 1},
+            {"session_id": other_id, "cloud_agent": True, "cost_usd": 9.0,
+             "on_demand_usd": 0, "total_tokens": 20, "requests": 1},
+        ]
+        roll = d._rollup_projects(sessions, catalog)
+        self.assertEqual(roll["project_count"], 1)
+        p = roll["projects"][0]
+        self.assertEqual(p["name"], "Cost Dashboard")
+        self.assertAlmostEqual(p["cost_usd"], 15.5, places=2)
+        self.assertEqual(p["worker_count"], 1)
+        roles = {a["role"]: a for a in p["agents"]}
+        self.assertEqual(roles["coordinator"]["cost_usd"], 10.0)
+        self.assertEqual(roles["worker"]["cost_usd"], 5.5)
+        self.assertEqual(roll["unattributed_cloud_sessions"], 1)
+        self.assertAlmostEqual(roll["unattributed_cloud_usd"], 9.0, places=2)
 
 
 
@@ -466,6 +524,37 @@ class OrphanUuidResolutionTests(unittest.TestCase):
             self.assertEqual(sess["title"], "Embedded reverse map chat")
             self.assertEqual(sess.get("title_source"), "embedded-id")
             self.assertFalse(sess.get("orphan_billed"))
+
+    def test_orphan_embed_map_resolves_many_ids_in_one_pass(self):
+        import json, os, sqlite3, tempfile
+        pairs = [
+            ("aaaaaaaa-1111-2222-3333-000000000001", "local-aaaa-1111-2222-3333-0001"),
+            ("bbbbbbbb-1111-2222-3333-000000000002", "local-bbbb-1111-2222-3333-0002"),
+            ("cccccccc-1111-2222-3333-000000000003", "local-cccc-1111-2222-3333-0003"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "state.vscdb")
+            con = sqlite3.connect(db)
+            con.execute("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)")
+            for orphan_id, local_id in pairs:
+                con.execute(
+                    "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+                    (f"composerData:{local_id}",
+                     json.dumps({"billingConversationId": orphan_id, "name": local_id})),
+                )
+            # Noise rows that must not force per-orphan table scans to succeed.
+            for i in range(50):
+                con.execute(
+                    "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+                    (f"bubbleId:noise-{i}:b0", json.dumps({"text": f"noise {i}"})),
+                )
+            con.commit()
+            embed = d._build_orphan_embed_map(con, [p[0] for p in pairs] + [
+                "bc-should-be-skipped", "_unattributed", "short"])
+            con.close()
+            self.assertEqual(len(embed), 3)
+            for orphan_id, local_id in pairs:
+                self.assertEqual(embed[orphan_id], local_id)
 
     def test_agent_id_bc_prefix_counts_as_cloud_agent_id(self):
         ev = {"agentId": "bc-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}
