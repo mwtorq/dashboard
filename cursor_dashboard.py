@@ -592,10 +592,15 @@ BUBBLE_TAIL_PER_COMPOSER = 150
 # Cold /api/data cliffs: billed costs come from the API, but titles/PR refs used
 # to pull bubble values for every billed composer (200+) and then re-scan each
 # for PR URLs. Cap those SQLite value reads; GitHub/git enrichment covers the rest.
-BUBBLE_TEXT_CID_CAP = 40
-BUBBLE_TEXT_SAMPLE_CAP = 80
-PR_FULLSCAN_CID_CAP = 40
-_TITLE_BUBBLE_CID_CAP = 40
+BUBBLE_TEXT_CID_CAP = 24
+BUBBLE_TEXT_SAMPLE_CAP = 60
+# 0 = skip extra per-composer PR value samples on cold load (bubble text + git/gh
+# enrichment still attach PRs; the extra pass was multi-minute on large stores).
+PR_FULLSCAN_CID_CAP = 0
+# 0 = skip bubble-derived title backfill (ItemTable/meta/transcripts still apply).
+_TITLE_BUBBLE_CID_CAP = 0
+# Cap how many repos get a cold-load `gh pr list` / REST catalog stamp.
+_GH_PR_LIST_REPO_CAP = 8
 _BILLING_CACHE = {"at": 0, "data": None, "turns": {}}
 
 DB_PATH = DEFAULT_DB
@@ -821,7 +826,7 @@ def _repo_first_commit_ts(repo_path):
         try:
             r = subprocess.run(
                 ["git", "-C", repo_path, "log", "--reverse", "--format=%at", "-1"],
-                capture_output=True, text=True, timeout=15, check=False)
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
             line = (r.stdout or "").strip().splitlines()
             if line:
                 ts = int(line[0])
@@ -1592,7 +1597,7 @@ def _repo_file_basenames(repo_path):
     try:
         r = subprocess.run(
             ["git", "-C", repo_path, "ls-files"],
-            capture_output=True, text=True, timeout=90, check=False)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90, check=False)
         for line in (r.stdout or "").splitlines():
             base = os.path.basename(line.strip())
             if base:
@@ -1776,7 +1781,7 @@ def _git_remote_github(repo_path):
     try:
         r = subprocess.run(
             ["git", "-C", repo_path, "remote", "get-url", "origin"],
-            capture_output=True, text=True, timeout=10, check=False)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
         url = (r.stdout or "").strip()
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -2075,6 +2080,10 @@ def _inject_composer_pr_links(con, texts_by_cid, cids, meta=None, limit=PR_FULLS
         info = meta.get(cid) or {}
         candidates.append((int(info.get("updated_ms") or 0), cid))
     candidates.sort(reverse=True)
+    if limit is not None and limit <= 0:
+        print(f"  PR link scan: skipped ({len(candidates)} candidates; "
+              f"using sampled chat text + git/gh enrichment)", flush=True)
+        return 0, {}
     if limit and len(candidates) > limit:
         print(f"  PR link scan: capping {limit}/{len(candidates)} composers "
               f"(skip chats that already expose a PR URL in sampled text)", flush=True)
@@ -2220,11 +2229,28 @@ def _normalize_github_repo(repo):
     return repo
 
 
-def _gh_json(args, timeout=60):
+def _run_capture(argv, timeout=60):
+    """subprocess.run with UTF-8 replace.
+
+    On Windows, text=True alone uses the locale encoding (often cp1252). A single
+    non-decodable byte in `gh`/`git` JSON then crashes the stdout reader thread
+    and can leave the parent hung inside subprocess.run. Always decode as UTF-8.
+    """
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _gh_json(args, timeout=25):
     """Run `gh … --json` and parse stdout; return None on failure."""
     try:
-        r = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, timeout=timeout)
+        r = _run_capture(["gh", *args], timeout=timeout)
         if r.returncode != 0:
             return None
         return json.loads(r.stdout or "null")
@@ -2254,8 +2280,7 @@ def _github_auth_token():
             break
     if not tok:
         try:
-            r = subprocess.run(
-                ["gh", "auth", "token"], capture_output=True, text=True, timeout=10)
+            r = _run_capture(["gh", "auth", "token"], timeout=10)
             if r.returncode == 0:
                 tok = (r.stdout or "").strip()
         except (OSError, subprocess.TimeoutExpired):
@@ -2666,8 +2691,13 @@ def _stamp_pr_github_dates(refs):
         return repo, catalog
 
     catalogs = {}
-    repos = list(need.keys())
-    workers = min(6, max(1, len(repos)))
+    # Prefer repos with the most PRs; hard-cap cold-load gh/REST catalog calls.
+    repos = sorted(need.keys(), key=lambda r: -len(need[r]))
+    if len(repos) > _GH_PR_LIST_REPO_CAP:
+        print(f"  pr day-stamps: capping catalog to {_GH_PR_LIST_REPO_CAP}/"
+              f"{len(repos)} repos", flush=True)
+        repos = repos[:_GH_PR_LIST_REPO_CAP]
+    workers = min(4, max(1, len(repos)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for repo, catalog in pool.map(_catalog_for, repos):
             catalogs[repo] = catalog
@@ -2692,9 +2722,9 @@ def _stamp_pr_github_dates(refs):
                 missing.append((repo, num, p))
 
     if missing:
-        # Cap per-PR network fallbacks — each is a gh/REST round-trip. Catalog
+        # Cap per-PR network fallbacks; each is a gh/REST round-trip. Catalog
         # hits above already stamped most PRs; the long tail was a cold-load cliff.
-        missing_fetch = missing[:40]
+        missing_fetch = missing[:16]
         if len(missing) > len(missing_fetch):
             print(f"  pr day-stamps: fetching {len(missing_fetch)}/{len(missing)} "
                   f"missing via gh/REST (capped)", flush=True)
@@ -3099,7 +3129,7 @@ def _fetch_git_activities(repos, since_day, until_day):
                 ["git", "-C", path, "log",
                  f"--since={since}", f"--until={until}",
                  "--format=%H|%at|%s|%ae"],
-                capture_output=True, text=True, timeout=90, check=False)
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90, check=False)
         except (OSError, subprocess.TimeoutExpired):
             return out
         for line in (r.stdout or "").splitlines():
@@ -5722,7 +5752,7 @@ def _fill_titles_from_local_content(con, sessions, meta=None, limit=_TITLE_BUBBL
         if meta.get(cid) and not _is_untitled(meta[cid].get("title")):
             title = meta[cid]["title"]
             src = meta[cid].get("title_source") or "meta"
-        if not title and bubble_lookups < limit:
+        if not title and limit and bubble_lookups < limit:
             title = _first_user_bubble_title(con, cid)
             if title:
                 src = "bubble"
@@ -5731,7 +5761,7 @@ def _fill_titles_from_local_content(con, sessions, meta=None, limit=_TITLE_BUBBL
             title = _title_from_agent_transcripts(cid)
             if title:
                 src = "transcript"
-        if not title and bubble_lookups <= limit:
+        if not title and limit and bubble_lookups < limit:
             # conversationMap fallback
             title = _title_from_text(_composer_data_fallback_text(con, cid))
             if title:
@@ -5954,10 +5984,16 @@ def resolve_orphan_sessions(sessions, local_by_id, priced_all=None, local_priced
             orphan_ids.append(cid)
             orphan_sessions.append(sess)
         t_embed = time.perf_counter()
-        embed_map = _build_orphan_embed_map(con, orphan_ids) if orphan_ids else {}
-        if orphan_ids:
+        # composerData value scan is expensive and often finds nothing on modern
+        # stores; skip when the orphan set is large and rely on fuzzy matching.
+        embed_map = {}
+        if orphan_ids and len(orphan_ids) <= 20:
+            embed_map = _build_orphan_embed_map(con, orphan_ids)
             print(f"  orphan embed index: {len(embed_map)}/{len(orphan_ids)} "
                   f"in {time.perf_counter() - t_embed:.2f}s", flush=True)
+        elif orphan_ids:
+            print(f"  orphan embed index: skipped ({len(orphan_ids)} orphans; "
+                  f"using fuzzy match)", flush=True)
         for sess in orphan_sessions:
             cid = sess.get("session_id") or ""
             embedded = embed_map.get(cid) or ""
@@ -7319,7 +7355,7 @@ def _jira_credentials():
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
-            capture_output=True, text=True, timeout=15, check=False)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
         if out.returncode != 0:
             return "", ""
         raw = out.stdout.strip()
