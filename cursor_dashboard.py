@@ -592,15 +592,22 @@ BUBBLE_TAIL_PER_COMPOSER = 150
 # Cold /api/data cliffs: billed costs come from the API, but titles/PR refs used
 # to pull bubble values for every billed composer (200+) and then re-scan each
 # for PR URLs. Cap those SQLite value reads; GitHub/git enrichment covers the rest.
-BUBBLE_TEXT_CID_CAP = 24
-BUBBLE_TEXT_SAMPLE_CAP = 60
-# 0 = skip extra per-composer PR value samples on cold load (bubble text + git/gh
-# enrichment still attach PRs; the extra pass was multi-minute on large stores).
+# When billed usage is available, cold load skips ALL bubbleId value reads.
+# Those SQLite pulls were I/O-bound (near-zero CPU, multi-minute waits) on large
+# state.vscdb stores. Costs/titles still come from the billing API + ItemTable.
+BUBBLE_TEXT_CID_CAP = 0
+BUBBLE_TEXT_SAMPLE_CAP = 40
+# 0 = skip extra per-composer PR value samples on cold load.
 PR_FULLSCAN_CID_CAP = 0
 # 0 = skip bubble-derived title backfill (ItemTable/meta/transcripts still apply).
 _TITLE_BUBBLE_CID_CAP = 0
 # Cap how many repos get a cold-load `gh pr list` / REST catalog stamp.
-_GH_PR_LIST_REPO_CAP = 8
+_GH_PR_LIST_REPO_CAP = 6
+SKIP_BUBBLES_WHEN_BILLED = True
+# Skip gh/REST PR catalog + sibling enrichment on cold load. Pulling body-heavy
+# `gh pr list` / REST for every cloud-agent repo was the post-git multi-minute
+# stall (enrich_cloud_agent_prs + stamp_pr_github_dates).
+SKIP_GH_PR_NETWORK = True
 _BILLING_CACHE = {"at": 0, "data": None, "turns": {}}
 
 DB_PATH = DEFAULT_DB
@@ -2542,6 +2549,10 @@ def _enrich_cloud_agent_prs(sessions, refs):
     Agent id may come from session metadata OR from the body of a PR already on
     the session — so plain UUID billed rows that only scraped #20 still expand.
     """
+    if SKIP_GH_PR_NETWORK:
+        print("  cloud-agent GitHub PRs: skipped network catalog (cold-load fast path)",
+              flush=True)
+        return 0
     cache = {}
     catalog_cache = {}
     added = 0
@@ -2672,6 +2683,8 @@ def _stamp_pr_github_dates(refs):
     per-PR `gh`/REST fallback — otherwise day-filter keeps only the few PRs that
     got chat mention stamps (Today=#20+#25, Yesterday=#20).
     """
+    if SKIP_GH_PR_NETWORK:
+        return 0
     need = collections.defaultdict(list)  # repo -> [pr dicts]
     for r in (refs or {}).values():
         for p in (r or {}).get("prs") or []:
@@ -5738,7 +5751,12 @@ def _title_from_agent_transcripts(cid):
 
 
 def _fill_titles_from_local_content(con, sessions, meta=None, limit=_TITLE_BUBBLE_CID_CAP):
-    """Last-resort titles for billed/(untitled) rows using bubbles + transcripts."""
+    """Last-resort titles for billed/(untitled) rows using bubbles + transcripts.
+
+    When limit<=0 (cold billed path), only apply ItemTable/meta titles. Walking
+    agent-transcript trees for every untitled billed UUID was another
+    multi-minute, near-zero-CPU stall on OneDrive-backed stores.
+    """
     meta = meta or {}
     filled = 0
     bubble_lookups = 0
@@ -5757,7 +5775,7 @@ def _fill_titles_from_local_content(con, sessions, meta=None, limit=_TITLE_BUBBL
             if title:
                 src = "bubble"
             bubble_lookups += 1
-        if not title:
+        if not title and limit:
             title = _title_from_agent_transcripts(cid)
             if title:
                 src = "transcript"
@@ -6832,24 +6850,30 @@ def scan_cursor(force=False):
                           flush=True)
             t_billing = time.perf_counter()
             skip_bubbles = _billed_composer_ids(billing) if billing else set()
-            bubbles, composer_owners, bubble_rows = _load_bubbles(
-                con, meta, skip_cids=skip_bubbles)
+            bubbles, composer_owners, bubble_rows = {}, {}, 0
             billed_texts, billed_rows, billed_text_rows = {}, {}, 0
-            if skip_bubbles:
-                text_cids = _prioritize_cids_for_local_text(
-                    skip_bubbles, meta, limit=BUBBLE_TEXT_CID_CAP)
-                billed_texts, billed_rows, billed_text_rows = _load_bubble_texts_for_cids(
-                    con, text_cids, meta=None, limit=None)
-                # Legacy / sparse chats: pull text from composerData.conversationMap
-                # when bubbleId rows are missing so titles/PRs can still resolve.
-                for cid in text_cids:
-                    if billed_texts.get(cid):
-                        continue
-                    fallback = _composer_data_fallback_text(con, cid)
-                    if fallback:
-                        billed_texts[cid] = fallback
+            if billing and SKIP_BUBBLES_WHEN_BILLED:
+                # Fast path: invoice/events already have costs. Bubble value I/O
+                # against multi-GB state.vscdb was the remaining multi-minute hang
+                # (processes sat at ~0 CPU waiting on disk/locks).
+                print(f"  bubble SQLite: skipped ({len(skip_bubbles)} billed chats; "
+                      f"costs from API, titles from ItemTable/meta)", flush=True)
+            else:
+                bubbles, composer_owners, bubble_rows = _load_bubbles(
+                    con, meta, skip_cids=skip_bubbles)
+                if skip_bubbles and BUBBLE_TEXT_CID_CAP:
+                    text_cids = _prioritize_cids_for_local_text(
+                        skip_bubbles, meta, limit=BUBBLE_TEXT_CID_CAP)
+                    billed_texts, billed_rows, billed_text_rows = _load_bubble_texts_for_cids(
+                        con, text_cids, meta=None, limit=None)
+                    for cid in text_cids:
+                        if billed_texts.get(cid):
+                            continue
+                        fallback = _composer_data_fallback_text(con, cid)
+                        if fallback:
+                            billed_texts[cid] = fallback
         t_bubbles = time.perf_counter()
-        if skip_bubbles:
+        if skip_bubbles and not (billing and SKIP_BUBBLES_WHEN_BILLED):
             print(f"  billed chat text: {len(billed_texts)} composer(s), "
                   f"{billed_text_rows} bubble rows (costs from API; "
                   f"{len(skip_bubbles)} billed chats total)", flush=True)
