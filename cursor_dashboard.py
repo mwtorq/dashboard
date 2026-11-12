@@ -2610,14 +2610,26 @@ def _stamp_pr_github_dates(refs):
                 need[repo].append(p)
     if not need:
         return 0
-    stamped = 0
-    for repo, prs in need.items():
+
+    def _catalog_for(repo):
         catalog = {}
         for x in _list_repo_prs_via_gh(repo) or []:
             try:
                 catalog[int(x["number"])] = x
             except (TypeError, ValueError, KeyError):
                 continue
+        return repo, catalog
+
+    catalogs = {}
+    repos = list(need.keys())
+    workers = min(6, max(1, len(repos)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for repo, catalog in pool.map(_catalog_for, repos):
+            catalogs[repo] = catalog
+
+    stamped = 0
+    for repo, prs in need.items():
+        catalog = catalogs.get(repo) or {}
         for p in prs:
             try:
                 num = int(p["number"])
@@ -3541,8 +3553,8 @@ def _pool_row(pool_id, label, detail, used_pct, message, unlimited):
         "label": label,
         "detail": detail,
         "unlimited": False,
-        "used_pct": round(used, 1),
-        "remaining_pct": round(max(0.0, 100.0 - used), 1),
+        "used_pct": round(used, 2),
+        "remaining_pct": round(max(0.0, 100.0 - used), 2),
         "allocated_pct": 100.0,
         "message": message or "",
     }
@@ -3743,24 +3755,20 @@ def _fetch_aggregated_usage(cookie, summary):
         {"teamId": 0, "startDate": str(start_ms), "endDate": str(end_ms)},
         {"teamId": 0, "startDate": start_ms, "endDate": end_ms},
     ]
-    paths = (
-        "/api/dashboard/get-aggregated-usage-events",
-        "/api/dashboard/get-aggregated-usage-events",
-    )
+    path = "/api/dashboard/get-aggregated-usage-events"
     last_exc = None
-    for path in paths:
-        for body in bodies:
-            try:
-                chunk = _api(cookie, "POST", path, body)
-            except Exception as exc:
-                last_exc = exc
-                continue
-            rows = (chunk.get("aggregations")
-                    or chunk.get("usageAggregations")
-                    or chunk.get("aggregatedUsage")
-                    or [])
-            if rows:
-                return rows
+    for body in bodies:
+        try:
+            chunk = _api(cookie, "POST", path, body)
+        except Exception as exc:
+            last_exc = exc
+            continue
+        rows = (chunk.get("aggregations")
+                or chunk.get("usageAggregations")
+                or chunk.get("aggregatedUsage")
+                or [])
+        if rows:
+            return rows
     if last_exc:
         raise last_exc
     return []
@@ -4011,23 +4019,10 @@ def _cached_account_billing(email):
     }
 
 
-def _fetch_account_billing(cookie, fallback_email="", fallback_user_id=""):
-    me = _api(cookie, "GET", "/api/auth/me")
-    email = (me.get("email") or me.get("primaryEmail") or fallback_email).strip()
-    user_id = me.get("id") or me.get("userId") or fallback_user_id
-    if not user_id:
-        raise RuntimeError("Could not resolve Cursor user id.")
-    summary = _api(cookie, "GET", "/api/usage-summary")
-    period = _api(cookie, "POST", "/api/dashboard/get-current-period-usage", {})
-    aggregations = []
-    try:
-        aggregations = _fetch_aggregated_usage(cookie, summary)
-    except Exception as exc:
-        print(f"  aggregated usage unavailable for {email or user_id} ({exc})",
-              flush=True)
-    start = BILLING_START
-    end = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+def _fetch_usage_event_pages(cookie, user_id, start, end):
+    """Page through billed usage events; prefer larger pages to cut round-trips."""
     events, page = [], 1
+    page_size = 500
     while True:
         chunk = _api(cookie, "POST", "/api/dashboard/get-filtered-usage-events", {
             "teamId": 0,
@@ -4035,9 +4030,19 @@ def _fetch_account_billing(cookie, fallback_email="", fallback_user_id=""):
             "startDate": str(int(start.timestamp() * 1000)),
             "endDate": str(int(end.timestamp() * 1000)),
             "page": page,
-            "pageSize": 200,
+            "pageSize": page_size,
         })
         batch = chunk.get("usageEventsDisplay") or []
+        # Some deployments cap pageSize; fall back once if the first page looks truncated.
+        if page == 1 and page_size > 200 and batch and len(batch) < page_size:
+            total = int(chunk.get("totalUsageEventsCount") or 0)
+            if total > len(batch) and len(batch) <= 200:
+                page_size = 200
+                events = list(batch)
+                if len(events) >= total:
+                    return events
+                page = 2
+                continue
         events.extend(batch)
         total = int(chunk.get("totalUsageEventsCount") or 0)
         if not batch or len(events) >= total:
@@ -4045,11 +4050,58 @@ def _fetch_account_billing(cookie, fallback_email="", fallback_user_id=""):
         page += 1
         if page > 100:
             break
-    invoices = []
+    return events
+
+
+def _fetch_account_billing(cookie, fallback_email="", fallback_user_id=""):
+    me = _api(cookie, "GET", "/api/auth/me")
+    email = (me.get("email") or me.get("primaryEmail") or fallback_email).strip()
+    user_id = me.get("id") or me.get("userId") or fallback_user_id
+    if not user_id:
+        raise RuntimeError("Could not resolve Cursor user id.")
+    start = BILLING_START
+    end = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+    summary = period = None
+    invoices, events = [], []
+    agg_exc = inv_exc = None
+
+    def _load_summary():
+        return _api(cookie, "GET", "/api/usage-summary")
+
+    def _load_period():
+        return _api(cookie, "POST", "/api/dashboard/get-current-period-usage", {})
+
+    def _load_invoices():
+        return _fetch_invoices(cookie)
+
+    def _load_events():
+        return _fetch_usage_event_pages(cookie, user_id, start, end)
+
+    # me is done; fan out independent Cursor.com calls.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_summary = pool.submit(_load_summary)
+        f_period = pool.submit(_load_period)
+        f_invoices = pool.submit(_load_invoices)
+        f_events = pool.submit(_load_events)
+        summary = f_summary.result()
+        period = f_period.result()
+        try:
+            invoices = f_invoices.result()
+        except Exception as exc:
+            inv_exc = exc
+            invoices = []
+        events = f_events.result()
+
+    aggregations = []
     try:
-        invoices = _fetch_invoices(cookie)
+        aggregations = _fetch_aggregated_usage(cookie, summary)
     except Exception as exc:
-        print(f"  invoices unavailable for {email or user_id} ({exc})", flush=True)
+        agg_exc = exc
+    if agg_exc:
+        print(f"  aggregated usage unavailable for {email or user_id} ({agg_exc})",
+              flush=True)
+    if inv_exc:
+        print(f"  invoices unavailable for {email or user_id} ({inv_exc})", flush=True)
     for ev in events:
         ev["_account_email"] = email
     for inv in invoices:
@@ -4099,11 +4151,24 @@ def fetch_billing(con, force=False):
     merged_events, merged_invoices = [], []
     emails, stale, cached_used = [], [], []
     primary = None
-    for label, cookie, saved_uid in jobs:
-        one = None
+
+    def _one_account(job):
+        label, cookie, saved_uid = job
         try:
-            one = _fetch_account_billing(cookie, fallback_email=label, fallback_user_id=saved_uid)
+            return label, cookie, _fetch_account_billing(
+                cookie, fallback_email=label, fallback_user_id=saved_uid), None
         except Exception as exc:
+            return label, cookie, None, exc
+
+    # Multiple saved Cursor sessions: fetch in parallel (each is many HTTP round-trips).
+    results = []
+    workers = min(4, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for item in pool.map(_one_account, jobs):
+            results.append(item)
+
+    for label, cookie, one, exc in results:
+        if one is None:
             who = label or "saved session"
             print(f"  billing for {who} failed ({exc})", flush=True)
             if label:
@@ -4411,6 +4476,47 @@ def _fetch_agent_usage(agent_id):
     return data.get("totalUsage") or {}
 
 
+def _attach_cloud_agent_usage(agents, only_ids=None):
+    """Fetch /usage only for the agents that need estimate rows (not every agent)."""
+    if not agents:
+        return agents
+    want = None
+    if only_ids is not None:
+        want = set()
+        for raw in only_ids:
+            aid = (raw or "").strip()
+            if not aid:
+                continue
+            want.add(aid)
+            if aid.startswith("bc-"):
+                want.add(aid[3:])
+            else:
+                want.add("bc-" + aid)
+    targets = []
+    for agent in agents:
+        aid = agent.get("id") or ""
+        if want is not None and aid not in want and aid[3:] not in want and (
+                "bc-" + aid) not in want:
+            continue
+        if agent.get("usage"):
+            continue
+        targets.append(agent)
+    if not targets:
+        return agents
+    print(f"  cloud agents: fetching usage for {len(targets)}/{len(agents)} "
+          f"agent(s)…", flush=True)
+
+    def _one(a):
+        usage = _fetch_agent_usage(a["id"])
+        return dict(a, usage=usage) if usage else a
+
+    by_id = {a["id"]: a for a in agents}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for updated in pool.map(_one, targets):
+            by_id[updated["id"]] = updated
+    return [by_id[a["id"]] for a in agents]
+
+
 def fetch_cloud_agents(force=False, with_usage=False, cookie=None):
     """Return all cloud agents (API key, then IDE cookie, then local cache)."""
     global _CLOUD_AGENTS_CACHE, CLOUD_AGENTS_API_KEY
@@ -4419,7 +4525,10 @@ def fetch_cloud_agents(force=False, with_usage=False, cookie=None):
     now = time.time()
     if (not force and _CLOUD_AGENTS_CACHE["agents"] is not None
             and now - _CLOUD_AGENTS_CACHE["at"] < 300):
-        return _CLOUD_AGENTS_CACHE["agents"]
+        agents = _CLOUD_AGENTS_CACHE["agents"]
+        if with_usage and agents:
+            return _attach_cloud_agent_usage(agents)
+        return agents
     # Refresh module copy so later helpers see the live env value.
     CLOUD_AGENTS_API_KEY = _cloud_api_key()
     agents, err, source = [], "", ""
@@ -4430,13 +4539,7 @@ def fetch_cloud_agents(force=False, with_usage=False, cookie=None):
             agents = _list_cloud_agents_api()
             source = "api"
             if with_usage and agents:
-                def _one(a):
-                    usage = _fetch_agent_usage(a["id"])
-                    if usage:
-                        a = dict(a, usage=usage)
-                    return a
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    agents = list(pool.map(_one, agents))
+                agents = _attach_cloud_agent_usage(agents)
             _save_cloud_agents_cache_file(agents, source="api")
         except Exception as exc:
             err = str(exc)
@@ -6455,11 +6558,36 @@ def scan_cursor(force=False):
                             cookie = _cursor_session_cookie(c2) or ""
                     except Exception:
                         cookie = ""
+                # Titles/repos only first — per-agent /usage is slow and only
+                # needed for agents not already on the invoice.
                 cloud_agents = fetch_cloud_agents(
-                    force=force, with_usage=True, cookie=cookie)
+                    force=force, with_usage=False, cookie=cookie)
             except Exception as exc:
                 print(f"  cloud agents skipped ({exc})", flush=True)
         if cloud_agents:
+            present_ids = {s.get("session_id") for s in sessions}
+            for s in sessions:
+                ca = (s.get("cloud_agent_id") or "").strip()
+                if ca:
+                    present_ids.add(ca)
+            need_usage = []
+            for a in cloud_agents:
+                aid = (a.get("id") or "").strip()
+                if not aid:
+                    continue
+                alts = {aid}
+                if aid.startswith("bc-"):
+                    alts.add(aid[3:])
+                else:
+                    alts.add("bc-" + aid)
+                if alts.isdisjoint(present_ids):
+                    need_usage.append(aid)
+            if need_usage and _cloud_api_key():
+                try:
+                    cloud_agents = _attach_cloud_agent_usage(
+                        cloud_agents, only_ids=need_usage)
+                except Exception as exc:
+                    print(f"  cloud agent usage skipped ({exc})", flush=True)
             sessions, turns_api, priced_all, _n = enrich_sessions_with_cloud_agents(
                 sessions, turns_api, priced_all, cloud_agents)
             for sess in sessions:
@@ -7275,7 +7403,28 @@ def _cycle_mtd(data, today):
             util["total_pct"] = pct
     for pool in util["pools"]:
         if pool["id"] in spend:
-            pool["metered_usd"] = spend[pool["id"]]
+            pool["metered_usd"] = round(float(spend[pool["id"]] or 0), 2)
+        if pool.get("unlimited"):
+            continue
+        if pool["id"] == "total":
+            pool["used_usd"] = round(float(included_used or 0), 2)
+            pool["included_usd"] = (
+                round(float(included_limit), 2) if included_limit else None)
+        elif included_limit and pool.get("used_pct") is not None:
+            # Each Plan & Usage pool is allocated 100% of the included plan
+            # limit; consumed dollars follow the Settings percentage bars.
+            pool["included_usd"] = round(float(included_limit), 2)
+            pool["used_usd"] = round(
+                float(included_limit) * float(pool["used_pct"]) / 100.0, 2)
+        elif pool.get("metered_usd") is not None:
+            pool["used_usd"] = round(float(pool["metered_usd"]), 2)
+    cycle_totals = {
+        "cursor": round(float(spend.get(POOL_CURSOR) or 0), 2),
+        "other": round(float(spend.get(POOL_OTHER) or 0), 2),
+        "total_included": round(float(included_used or 0), 2),
+        "included_limit": (
+            round(float(included_limit), 2) if included_limit else None),
+    }
     return {
         "which": "current",
         "month": f"{start_s} → {end_s}" if start_s else today.strftime("%Y-%m"),
@@ -7304,6 +7453,7 @@ def _cycle_mtd(data, today):
         "unlimited": util.get("unlimited"),
         "pools": util.get("pools") or [],
         "pool_spend": spend,
+        "cycle_totals": cycle_totals,
         "cycle_models": cycle_models,
         "on_demand_enabled": util.get("on_demand_enabled"),
         "budget": budget,
@@ -8050,9 +8200,9 @@ def _digest_html(d):
         cards += [("Included", _money(incl)), ("On-demand", _money(od))]
         mtd = p.get("mtd") or {}
         if mtd.get("auto_pct") is not None:
-            cards.append(("Cursor Models", f"{mtd['auto_pct']:.0f}% used"))
+            cards.append(("Cursor Models", f"{mtd['auto_pct']:.2f}% used"))
         if mtd.get("api_pct") is not None:
-            cards.append(("Other Models", f"{mtd['api_pct']:.0f}% used"))
+            cards.append(("Other Models", f"{mtd['api_pct']:.2f}% used"))
     cards += [("Requests", f"{t['requests']:,}"),
               ("Chats", f"{t['sessions']:,}"),
               ("Tokens", f"{(t.get('total_tokens') or 0):,}")]
@@ -8574,8 +8724,9 @@ section.collapsed > *:not(h2){display:none !important}
   <div id="err"></div>
   <div class="note" id="mixnote"></div>
   <section id="modelUtil">
-    <h2>Included in plan <span class="sub" id="modelUtilBuild">· pools-v3 · titles-v6</span></h2>
+    <h2>Included in plan <span class="sub" id="modelUtilBuild">· pools-v4 · titles-v6</span></h2>
     <div class="sub range-meta" id="modelUtilMeta">Loading Cursor Models / Other Models pools…</div>
+    <div class="sub range-meta" id="cycleTotalsLine">Cycle totals: …</div>
     <div class="allow-grid" id="modelUtilGrid">
       <div class="allow-card primary">
         <div class="k">Cursor Models <span class="sub">— Includes Cursor Grok and Composer</span></div>
@@ -9032,18 +9183,33 @@ function pctBar(pct){
 function renderModelUtil(){
   const el=document.getElementById('modelUtil');
   if(!el) return;
-  // Never hide this section · stamp titles-v6 — if you cannot see "Included in plan · pools-v3",
+  // Never hide this section · stamp titles-v6 — if you cannot see "Included in plan · pools-v4",
   // the browser is not talking to this build of cursor_dashboard.py.
   el.style.display='block';
   const build=document.getElementById('modelUtilBuild');
-  if(build) build.textContent='· pools-v3';
+  if(build) build.textContent='· pools-v4';
   const m=DATA.mtd||DATA.view_cycle||{};
   let pools=m.pools||[];
   const rows=DATA.cycle_models||m.cycle_models||[];
   const metaEl=document.getElementById('modelUtilMeta');
+  const totalsEl=document.getElementById('cycleTotalsLine');
   const grid=document.getElementById('modelUtilGrid');
+  const pct2=n=>Number(n||0).toFixed(2);
+  const poolAmountDetail=p=>{
+    if(p.unlimited) return '';
+    const used=p.used_usd!=null?p.used_usd:null;
+    const lim=p.included_usd!=null?p.included_usd:null;
+    if(used==null && lim==null){
+      return (p.metered_usd||0)>0.004?`${usd(p.metered_usd)} metered this cycle`:'';
+    }
+    if(lim!=null && lim>0)
+      return `${usd(used||0)} used of ${usd(lim)} included`;
+    if(used!=null) return `${usd(used)} used`;
+    return '';
+  };
   if(!DATA || DATA.billed==null){
-    metaEl.textContent='Waiting for /api/data… · build pools-v3';
+    metaEl.textContent='Waiting for /api/data… · build pools-v4';
+    if(totalsEl) totalsEl.textContent='Cycle totals: waiting…';
     return;
   }
   if(!DATA.billed){
@@ -9051,7 +9217,8 @@ function renderModelUtil(){
       ? (`Billed usage not loaded (${DATA.billing_error}). `)
       : 'Billed usage not loaded. ')
       +'Run without --no-api and sign into Cursor so usage-summary can return '
-      +'Cursor Models / Other Models percentages. · build pools-v3';
+      +'Cursor Models / Other Models percentages. · build pools-v4';
+    if(totalsEl) totalsEl.textContent='Cycle totals: unavailable (billed usage not loaded)';
     grid.innerHTML=`<div class="allow-card primary">
       <div class="k">Cursor Models <span class="sub">— Includes Cursor Grok and Composer</span></div>
       <div class="v">unavailable</div>
@@ -9070,17 +9237,26 @@ function renderModelUtil(){
   // Synthesize cards from top-level percents when pools array is empty.
   if(!pools.length){
     const synth=[];
+    const lim=m.included_limit||0;
     const mk=(id,label,detail,pct,msg)=>{
       if(pct==null && !m.unlimited) return;
       const used=pct==null?0:+pct;
-      synth.push({
+      const row={
         id, label, detail, unlimited:!!m.unlimited,
         used_pct:m.unlimited?null:used,
         remaining_pct:m.unlimited?null:Math.max(0,100-used),
         allocated_pct:m.unlimited?null:100,
         message:msg||'',
         metered_usd:(m.pool_spend&&m.pool_spend[id])||0,
-      });
+      };
+      if(!m.unlimited && lim>0){
+        row.included_usd=lim;
+        row.used_usd=id==='total'?(m.included_usd||0):(lim*used/100);
+      } else if(id==='total'){
+        row.used_usd=m.included_usd||0;
+        row.included_usd=lim||null;
+      }
+      synth.push(row);
     };
     mk('cursor','Cursor Models','Includes Cursor Grok and Composer',
       m.auto_pct, m.auto_msg||'Additional usage beyond limits consumes Other Models quota or on-demand spend.');
@@ -9095,13 +9271,25 @@ function renderModelUtil(){
   let meta=plan?(plan+' · '):'';
   meta+=`cycle ${m.start||''} → ${m.end||''}`;
   if(m.reset_date) meta+=` · resets ${m.reset_date}`;
-  meta+=' · build pools-v3';
+  meta+=' · build pools-v4';
   metaEl.textContent=unlim
     ? meta+' · plan reports unlimited included usage — pool percentages are not a cap.'
     : meta+' · same pools as Cursor Settings → Plan & Usage: '
       +'Cursor Models (Grok + Composer) and Other Models. '
       +'Allocated is 100% of each included pool; used % matches the Settings bars '
       +'(autoPercentUsed / apiPercentUsed).';
+  const ct=m.cycle_totals||{};
+  const spend=m.pool_spend||{};
+  const cursorTot=ct.cursor!=null?ct.cursor:(spend.cursor||0);
+  const otherTot=ct.other!=null?ct.other:(spend.other||0);
+  const totalInc=ct.total_included!=null?ct.total_included:(m.included_usd||0);
+  const incLim=ct.included_limit!=null?ct.included_limit:(m.included_limit||0);
+  if(totalsEl){
+    totalsEl.textContent=unlim
+      ? `Cycle totals: ${usd(cursorTot)} Cursor Models · ${usd(otherTot)} Other Models · unlimited included`
+      : `Cycle totals: ${usd(cursorTot)} Cursor Models · ${usd(otherTot)} Other Models · ${usd(totalInc)} total included`
+        +(incLim?` of ${usd(incLim)}`:'');
+  }
   // Prefer the two Plan & Usage pools; keep total as a trailing card if present.
   const showPools=pools.length
     ? [...pools].sort((a,b)=>{
@@ -9111,7 +9299,8 @@ function renderModelUtil(){
     : [];
   if(showPools.length){
     grid.innerHTML=showPools.map(p=>{
-      const metered=(p.metered_usd||0)>0.004
+      const amount=poolAmountDetail(p);
+      const metered=(p.metered_usd||0)>0.004 && !(p.used_usd!=null && p.included_usd!=null)
         ? `${usd(p.metered_usd)} metered this cycle`
         : '';
       const primary=p.id==='cursor'?' primary':'';
@@ -9119,21 +9308,21 @@ function renderModelUtil(){
         return `<div class="allow-card${primary}">
           <div class="k">${esc(p.label)}</div>
           <div class="v">Unlimited <span class="sub">${esc(p.detail||'')}</span></div>
-          <div class="sub">${esc([p.message,metered].filter(Boolean).join(' · '))}</div>
+          <div class="sub">${esc([p.message,amount||metered].filter(Boolean).join(' · '))}</div>
         </div>`;
       }
       const used=p.used_pct||0;
       const rem=p.remaining_pct;
       const remTxt=used>=100
         ? 'Included pool exhausted'
-        : `${(rem||0).toFixed(0)}% remaining`;
+        : `${pct2(rem||0)}% remaining`;
       const alloc=p.allocated_pct==null?100:p.allocated_pct;
       return `<div class="allow-card${primary}">
         <div class="k">${esc(p.label)}${p.detail?` <span class="sub">— ${esc(p.detail)}</span>`:''}</div>
-        <div class="v">${used.toFixed(0)}% used <span class="sub">of ${alloc}% allocated</span></div>
+        <div class="v">${pct2(used)}% used <span class="sub">of ${pct2(alloc)}% allocated</span></div>
         <div class="allow-rem${used>=100?' over':''}">${remTxt}</div>
         ${pctBar(used)}
-        <div class="sub">${esc([p.message,metered].filter(Boolean).join(' · '))}</div>
+        <div class="sub">${esc([amount||metered,p.message].filter(Boolean).join(' · '))}</div>
       </div>`;
     }).join('');
   } else if(m.included_limit>0){
@@ -9141,11 +9330,11 @@ function renderModelUtil(){
     const pct=lim?Math.min(999,(used/lim*100)):0;
     grid.innerHTML=`<div class="allow-card primary">
       <div class="k">Total included</div>
-      <div class="v">${pct.toFixed(0)}% used <span class="sub">of 100% allocated</span></div>
+      <div class="v">${pct2(pct)}% used <span class="sub">of 100.00% allocated</span></div>
       <div class="allow-rem${pct>=100?' over':''}">${pct>=100?'Included pool exhausted'
-        :`${Math.max(0,100-pct).toFixed(0)}% remaining`}</div>
+        :`${pct2(Math.max(0,100-pct))}% remaining`}</div>
       ${pctBar(pct)}
-      <div class="sub">Derived from included spend (${usd(used)} of ${usd(lim)}). Cursor did not return Auto/named pool percentages for this account.</div>
+      <div class="sub">${usd(used)} used of ${usd(lim)} included. Cursor did not return Auto/named pool percentages for this account.</div>
     </div>`;
   } else {
     grid.innerHTML=`<div class="allow-card primary">
@@ -9173,12 +9362,10 @@ function renderModelUtil(){
         +`<td class="cost">${usd(r.cost_usd)}</td>`
         +`<td style="width:160px"><div class="bar" style="width:${(r.cost_usd||0)/max*100}%"></div></td></tr>`;
     }).join('')+'</tbody>';
-  const spend=m.pool_spend||{};
-  const cursorUsd=spend.cursor||0;
-  const otherUsd=spend.other||0;
   foot.textContent=`Official cycle aggregations from Cursor (GetAggregatedUsageEvents) — `
-    +`${usd(cursorUsd)} Cursor Models · ${usd(otherUsd)} Other Models. `
-    +`These are included-subscription totals for the billing cycle, independent of the date-range filter.`;
+    +`${usd(cursorTot)} Cursor Models · ${usd(otherTot)} Other Models · ${usd(totalInc)} total included`
+    +(incLim?` of ${usd(incLim)}`:'')
+    +`. Independent of the date-range filter.`;
 }
 function render(){
   const t=DATA.totals;

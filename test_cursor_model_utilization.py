@@ -115,11 +115,11 @@ class UtilizationTests(unittest.TestCase):
         self.assertFalse(util["unlimited"])
         by_id = {p["id"]: p for p in util["pools"]}
         self.assertEqual(by_id["cursor"]["allocated_pct"], 100.0)
-        self.assertEqual(by_id["cursor"]["used_pct"], 98.1)
-        self.assertEqual(by_id["cursor"]["remaining_pct"], 1.9)
+        self.assertEqual(by_id["cursor"]["used_pct"], 98.11)
+        self.assertEqual(by_id["cursor"]["remaining_pct"], 1.89)
         self.assertEqual(by_id["other"]["used_pct"], 100.0)
         self.assertEqual(by_id["other"]["remaining_pct"], 0.0)
-        self.assertEqual(by_id["total"]["used_pct"], 98.5)
+        self.assertEqual(by_id["total"]["used_pct"], 98.51)
         self.assertTrue(util["on_demand_enabled"])
 
     def test_over_allowance_not_clamped(self):
@@ -229,6 +229,16 @@ class CycleMtdTests(unittest.TestCase):
         by_id = {p["id"]: p for p in mtd["pools"]}
         self.assertEqual(by_id["cursor"]["allocated_pct"], 100.0)
         self.assertGreater(by_id["cursor"]["metered_usd"], 0)
+        self.assertEqual(by_id["cursor"]["used_pct"], 98.11)
+        self.assertAlmostEqual(by_id["cursor"]["used_usd"], 392.44, places=2)
+        self.assertEqual(by_id["cursor"]["included_usd"], 400.0)
+        self.assertEqual(by_id["other"]["used_pct"], 100.0)
+        self.assertEqual(by_id["other"]["used_usd"], 400.0)
+        self.assertEqual(by_id["total"]["used_usd"], 400.0)
+        self.assertEqual(by_id["total"]["included_usd"], 400.0)
+        self.assertIn("cycle_totals", mtd)
+        self.assertAlmostEqual(mtd["cycle_totals"]["cursor"], by_id["cursor"]["metered_usd"], places=2)
+        self.assertEqual(mtd["cycle_totals"]["total_included"], 400.0)
         self.assertEqual(len(mtd["cycle_models"]), 2)
 
 
@@ -243,9 +253,11 @@ class PageMarkupTests(unittest.TestCase):
         self.assertIn("allocated", html)
         # Section must be visible in HTML even before JS runs.
         self.assertNotIn('id="modelUtil" style="display:none"', html)
-        self.assertIn("pools-v3", html)
+        self.assertIn("pools-v4", html)
+        self.assertIn("cycleTotalsLine", html)
         self.assertIn("Never hide this section", html)
         self.assertIn("Includes Cursor Grok and Composer", html)
+        self.assertIn("toFixed(2)", html)
         # Placed above plan-allowance so it is not missed.
         self.assertLess(html.find('id="modelUtil"'), html.find('id="mtd"'))
 
