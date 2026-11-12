@@ -589,6 +589,13 @@ API_ENABLED = True
 BUBBLE_CAP_PER_COMPOSER = 300
 BUBBLE_HEAD_PER_COMPOSER = 150
 BUBBLE_TAIL_PER_COMPOSER = 150
+# Cold /api/data cliffs: billed costs come from the API, but titles/PR refs used
+# to pull bubble values for every billed composer (200+) and then re-scan each
+# for PR URLs. Cap those SQLite value reads; GitHub/git enrichment covers the rest.
+BUBBLE_TEXT_CID_CAP = 40
+BUBBLE_TEXT_SAMPLE_CAP = 80
+PR_FULLSCAN_CID_CAP = 40
+_TITLE_BUBBLE_CID_CAP = 40
 _BILLING_CACHE = {"at": 0, "data": None, "turns": {}}
 
 DB_PATH = DEFAULT_DB
@@ -2015,34 +2022,23 @@ def _pr_links_from_raw(raw):
     return out
 
 
-def _all_pr_links_for_cid(con, cid):
-    """Full-composer PR scan — not head/tail sampled.
+def _all_pr_links_for_cid(con, cid, cap=BUBBLE_TEXT_SAMPLE_CAP):
+    """Bounded PR scan for one composer (head/tail + PR-ish rows, not every bubble).
 
     Returns (links, days_by_link) where days_by_link maps each link string to
-    local calendar days from bubble createdAt. Refs must not depend on the
-    text sample that only keeps recent assistant messages.
+    local calendar days from bubble createdAt. A true full-value scan of every
+    bubbleId row was a multi-minute cold-load cliff; GitHub/git enrichment
+    covers older tool-only PRs the sample misses.
     """
     if not cid:
         return [], {}
-    prefix = f"bubbleId:{cid}:"
     try:
-        rows = con.execute(
-            "SELECT value FROM cursorDiskKV WHERE key LIKE ? AND ("
-            "value LIKE '%/pull/%' OR value LIKE '%/pulls/%' "
-            "OR value LIKE '%pullNumber%' OR value LIKE '%prNumber%' "
-            "OR value LIKE '%pull_number%' OR value LIKE '%pr_number%' "
-            "OR value LIKE '%CreatePullRequest%' OR value LIKE '%create_pull_request%' "
-            "OR value LIKE '%html_url%' OR value LIKE '%PR #%' OR value LIKE '%PR#%' "
-            "OR value LIKE '%pr #%' OR value LIKE '%pull request%' "
-            "OR value LIKE '%Pull request%' OR value LIKE '%Pull Request%' "
-            "OR value LIKE '%gh pr %')",
-            (prefix + "%",)).fetchall()
-    except sqlite3.OperationalError:
+        rows = _sample_cid_bubble_raws(con, cid, cap=cap)
+    except Exception:
         return [], {}
     out, seen = [], set()
     days_by_link = collections.defaultdict(set)
-    for row in rows:
-        raw = row[0] if not isinstance(row, sqlite3.Row) else row["value"]
+    for _key, raw in rows:
         day = ""
         ts = _bubble_ts_from_raw(raw)
         if ts:
@@ -2056,19 +2052,36 @@ def _all_pr_links_for_cid(con, cid):
     return out, {k: sorted(v) for k, v in days_by_link.items()}
 
 
-def _inject_composer_pr_links(con, texts_by_cid, cids):
+def _inject_composer_pr_links(con, texts_by_cid, cids, meta=None, limit=PR_FULLSCAN_CID_CAP):
     """Merge full-scan PR links into per-session text before _build_refs.
 
     Returns (added_link_count, day_hints) where day_hints is
     {cid: {link: [YYYY-MM-DD, ...]}}.
+
+    Each cid is a value-LIKE scan of that composer's bubbles; cap hard on
+    cold load. Prefer chats that don't already show a PR URL in sampled text.
     """
     if not texts_by_cid and not cids:
         return 0, {}
+    meta = meta or {}
+    candidates = []
+    for cid in cids:
+        if (not cid or cid in ("_unattributed", "empty-state-draft")
+                or cid.startswith("bc-") or cid.startswith("draft-")):
+            continue
+        prev = texts_by_cid.get(cid) or ""
+        if "/pull/" in prev or "/pulls/" in prev or "PR #" in prev:
+            continue
+        info = meta.get(cid) or {}
+        candidates.append((int(info.get("updated_ms") or 0), cid))
+    candidates.sort(reverse=True)
+    if limit and len(candidates) > limit:
+        print(f"  PR link scan: capping {limit}/{len(candidates)} composers "
+              f"(skip chats that already expose a PR URL in sampled text)", flush=True)
+        candidates = candidates[:limit]
     added = 0
     hints = {}
-    for cid in cids:
-        if not cid or cid in ("_unattributed", "empty-state-draft"):
-            continue
+    for _updated, cid in candidates:
         links, days_by_link = _all_pr_links_for_cid(con, cid)
         if days_by_link:
             hints[cid] = days_by_link
@@ -2845,59 +2858,48 @@ def _pr_candidate_raw_rows(con, prefix):
 
 
 def _sample_cid_bubble_raws(con, cid, cap=BUBBLE_CAP_PER_COMPOSER):
-    """Return [(key, raw)] — PR mentions kept, then chronological head+tail fill."""
+    """Return [(key, raw)] — PR mentions kept, then chronological head+tail fill.
+
+    Never loads every bubble value for a composer: medium/large chats use
+    head+tail key windows (+ cheap PR-candidate filter) so cold load stays
+    bounded even when a chat has thousands of bubbles.
+    """
     prefix = f"bubbleId:{cid}:"
+    head = min(BUBBLE_HEAD_PER_COMPOSER, max(1, cap // 2))
+    tail = max(0, cap - head)
     try:
-        n = con.execute(
-            "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE ?",
-            (prefix + "%",)).fetchone()[0]
+        # Probe with a capped fetch instead of COUNT(*) + full value SELECT.
+        probe = con.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? "
+            "ORDER BY key LIMIT ?",
+            (prefix + "%", cap + 1)).fetchall()
     except sqlite3.OperationalError:
         return []
-    if n == 0:
+    if not probe:
         return []
-    if n <= cap:
-        rows = con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
-            (prefix + "%",)).fetchall()
-        rows.sort(key=lambda r: (_bubble_ts_from_raw(r[1]), r[0].split(":")[-1]))
-        return rows
-    head = min(BUBBLE_HEAD_PER_COMPOSER, cap // 2)
-    tail = cap - head
-    # Huge composers: avoid loading every value; pull PR candidates via LIKE + ends.
-    if n > cap * 10:
-        by_key = {}
-        for key, raw in _pr_candidate_raw_rows(con, prefix):
-            if _raw_mentions_pr(raw):
-                by_key[key] = raw
-        keys = [r[0] for r in con.execute(
-            "SELECT key FROM cursorDiskKV WHERE key LIKE ? ORDER BY key LIMIT ?",
-            (prefix + "%", head))]
-        keys += [r[0] for r in con.execute(
-            "SELECT key FROM cursorDiskKV WHERE key LIKE ? ORDER BY key DESC LIMIT ?",
-            (prefix + "%", tail))]
-        for key in keys:
-            if key in by_key:
-                continue
-            raw = con.execute(
-                "SELECT value FROM cursorDiskKV WHERE key = ?", (key,)).fetchone()
-            if raw:
-                by_key[key] = raw[0]
-        out = list(by_key.items())
-        out.sort(key=lambda r: (_bubble_ts_from_raw(r[1]), r[0].split(":")[-1]))
-        if len(out) <= cap:
-            return out
-        pr_idx = [i for i, r in enumerate(out) if _raw_mentions_pr(r[1])]
-        keep = _sample_indices_prefer_pr(len(out), cap, pr_idx)
-        return [out[i] for i in keep]
-    entries = []
-    for key, raw in con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?",
-            (prefix + "%",)):
-        entries.append((_bubble_ts_from_raw(raw), key.split(":")[-1], key, raw))
-    entries.sort(key=lambda e: (e[0], e[1]))
-    pr_idx = [i for i, e in enumerate(entries) if _raw_mentions_pr(e[3])]
-    keep = _sample_indices_prefer_pr(len(entries), cap, pr_idx)
-    return [(entries[i][2], entries[i][3]) for i in keep]
+    if len(probe) <= cap:
+        probe.sort(key=lambda r: (_bubble_ts_from_raw(r[1]), r[0].split(":")[-1]))
+        return probe
+    # Over cap: keep the first window we already read + a DESC tail. Do NOT run
+    # value-LIKE PR candidate scans here — those re-read every bubble value for
+    # the composer and recreated the cold-load cliff.
+    by_key = {r[0]: r[1] for r in probe[:head]}
+    if tail:
+        try:
+            for row in con.execute(
+                    "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? "
+                    "ORDER BY key DESC LIMIT ?",
+                    (prefix + "%", tail)):
+                by_key[row[0]] = row[1]
+        except sqlite3.OperationalError:
+            pass
+    out = list(by_key.items())
+    out.sort(key=lambda r: (_bubble_ts_from_raw(r[1]), r[0].split(":")[-1]))
+    if len(out) <= cap:
+        return out
+    pr_idx = [i for i, r in enumerate(out) if _raw_mentions_pr(r[1])]
+    keep = _sample_indices_prefer_pr(len(out), cap, pr_idx)
+    return [out[i] for i in keep]
 
 
 def _bubble_dict_from_raw(key, raw):
@@ -2976,10 +2978,39 @@ def _load_bubble_text_one(db_path, cid, cap=BUBBLE_CAP_PER_COMPOSER):
         return cid, text, kept, len(kept)
 
 
-def _load_bubble_texts_for_cids(con, cids, cap=BUBBLE_CAP_PER_COMPOSER):
+def _prioritize_cids_for_local_text(cids, meta, limit=BUBBLE_TEXT_CID_CAP):
+    """Pick composers worth a bubble-text pull (untitled first, then recent)."""
+    meta = meta or {}
+    untitled, titled = [], []
+    for cid in cids or []:
+        if (not cid or cid in ("_unattributed", "empty-state-draft")
+                or str(cid).startswith("bc-") or str(cid).startswith("draft-")):
+            continue
+        info = meta.get(cid) or {}
+        updated = int(info.get("updated_ms") or info.get("created_ms") or 0)
+        if _is_untitled(info.get("title")):
+            untitled.append((updated, cid))
+        else:
+            titled.append((updated, cid))
+    untitled.sort(reverse=True)
+    titled.sort(reverse=True)
+    ordered = [c for _, c in untitled] + [c for _, c in titled]
+    if limit is not None and limit >= 0 and len(ordered) > limit:
+        print(f"  billed chat text: capping bubble pulls to {limit}/{len(ordered)} "
+              f"composers (untitled+recent; costs still from API)", flush=True)
+        ordered = ordered[:limit]
+    return ordered
+
+
+def _load_bubble_texts_for_cids(con, cids, cap=BUBBLE_TEXT_SAMPLE_CAP,
+                                meta=None, limit=BUBBLE_TEXT_CID_CAP):
     """Chat text for billed composers — per-cid query, no local cost rebuild."""
     del con  # callers hold a connection; workers open their own for SQLite threading
-    work = [c for c in cids if c and c not in ("_unattributed", "empty-state-draft")]
+    # If caller already prioritized, pass limit=None to keep the given order/size.
+    if meta is None and limit is None:
+        work = [c for c in cids if c and c not in ("_unattributed", "empty-state-draft")]
+    else:
+        work = _prioritize_cids_for_local_text(cids, meta, limit=limit)
     if not work:
         return {}, {}, 0
     texts = {}
@@ -5676,29 +5707,35 @@ def _title_from_agent_transcripts(cid):
     return ""
 
 
-def _fill_titles_from_local_content(con, sessions, meta=None):
+def _fill_titles_from_local_content(con, sessions, meta=None, limit=_TITLE_BUBBLE_CID_CAP):
     """Last-resort titles for billed/(untitled) rows using bubbles + transcripts."""
     meta = meta or {}
     filled = 0
+    bubble_lookups = 0
     for sess in sessions or []:
         if not _is_untitled(sess.get("title")):
             continue
         cid = sess.get("session_id") or ""
         title = ""
+        src = ""
         # Prefer meta again (ItemTable may have landed after stub creation).
         if meta.get(cid) and not _is_untitled(meta[cid].get("title")):
             title = meta[cid]["title"]
             src = meta[cid].get("title_source") or "meta"
-        if not title:
+        if not title and bubble_lookups < limit:
             title = _first_user_bubble_title(con, cid)
-            src = "bubble"
+            if title:
+                src = "bubble"
+            bubble_lookups += 1
         if not title:
             title = _title_from_agent_transcripts(cid)
-            src = "transcript"
-        if not title:
+            if title:
+                src = "transcript"
+        if not title and bubble_lookups <= limit:
             # conversationMap fallback
             title = _title_from_text(_composer_data_fallback_text(con, cid))
-            src = "composerData"
+            if title:
+                src = "composerData"
         if title:
             sess["title"] = title
             sess["title_source"] = src
@@ -6066,30 +6103,39 @@ def _header_meta(con):
             "archived": bool(row.get("isArchived") or blob.get("isArchived")),
             "title_source": "sql:composerHeaders" if _composer_display_name(blob) else "",
         }
-    try:
-        composer_rows = con.execute(
-            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
-    except sqlite3.OperationalError:
-        composer_rows = []
-    for key, raw in composer_rows:
-        cid = key.split(":", 1)[-1]
+    # ItemTable index first (fast). Avoid LIKE 'composerData:%' full-value scans
+    # on multi-GB stores (that alone was ~40s+ on cold load). Point-get only for
+    # composers still missing a title/model, newest first, hard-capped.
+    _apply_itemtable_composer_index(con, meta)
+    need = []
+    for cid, entry in meta.items():
+        if entry.get("model") and not _is_untitled(entry.get("title")):
+            continue
+        need.append((int(entry.get("updated_ms") or entry.get("created_ms") or 0), cid))
+    need.sort(reverse=True)
+    for _updated, cid in need[:80]:
+        try:
+            row = con.execute(
+                "SELECT value FROM cursorDiskKV WHERE key = ?",
+                (f"composerData:{cid}",)).fetchone()
+        except sqlite3.OperationalError:
+            break
+        if not row:
+            continue
+        raw = row[0] if not isinstance(row, sqlite3.Row) else row["value"]
         blob = _loads(raw) or {}
+        if not isinstance(blob, dict):
+            continue
         mc = blob.get("modelConfig") or {}
-        entry = meta.setdefault(cid, {
-            "title": "", "subtitle": "", "workspace_id": "", "workspace_path": "",
-            "repository": "", "branch": "", "tracked_repos": [], "tracked_repo_paths": [],
-            "created_ms": 0, "updated_ms": 0,
-            "mode": "", "subagent": False, "draft": False, "archived": False,
-        })
+        entry = meta[cid]
         entry["title"] = entry["title"] or _composer_display_name(blob)
         entry["created_ms"] = entry["created_ms"] or blob.get("createdAt") or 0
         entry["updated_ms"] = entry["updated_ms"] or blob.get("lastUpdatedAt") or 0
         entry["mode"] = entry["mode"] or blob.get("unifiedMode") or ""
-        entry["model"] = _norm_model(mc.get("modelName") or "auto")
+        entry["model"] = _norm_model(mc.get("modelName") or entry.get("model") or "auto")
         entry["max_mode"] = bool(mc.get("maxMode"))
         if blob.get("isAgentic") and not entry["mode"]:
             entry["mode"] = "agent"
-    _apply_itemtable_composer_index(con, meta)
     return meta
 
 
@@ -6754,11 +6800,13 @@ def scan_cursor(force=False):
                 con, meta, skip_cids=skip_bubbles)
             billed_texts, billed_rows, billed_text_rows = {}, {}, 0
             if skip_bubbles:
+                text_cids = _prioritize_cids_for_local_text(
+                    skip_bubbles, meta, limit=BUBBLE_TEXT_CID_CAP)
                 billed_texts, billed_rows, billed_text_rows = _load_bubble_texts_for_cids(
-                    con, skip_bubbles)
+                    con, text_cids, meta=None, limit=None)
                 # Legacy / sparse chats: pull text from composerData.conversationMap
                 # when bubbleId rows are missing so titles/PRs can still resolve.
-                for cid in list(skip_bubbles):
+                for cid in text_cids:
                     if billed_texts.get(cid):
                         continue
                     fallback = _composer_data_fallback_text(con, cid)
@@ -6767,7 +6815,8 @@ def scan_cursor(force=False):
         t_bubbles = time.perf_counter()
         if skip_bubbles:
             print(f"  billed chat text: {len(billed_texts)} composer(s), "
-                  f"{billed_text_rows} bubble rows (costs from API)", flush=True)
+                  f"{billed_text_rows} bubble rows (costs from API; "
+                  f"{len(skip_bubbles)} billed chats total)", flush=True)
 
         sessions, turns_api, priced_all, texts_by_cid = [], {}, {}, {}
         for cid, bubs in bubbles.items():
@@ -6992,7 +7041,9 @@ def scan_cursor(force=False):
         # Final title pass: ItemTable/SQL names may still be empty while bubble
         # text or agent transcripts exist under the billed conversation id.
         try:
-            n_fill = _fill_titles_from_local_content(con, sessions, meta)
+            with connect() as title_con:
+                n_fill = _fill_titles_from_local_content(
+                    title_con, sessions, meta, limit=_TITLE_BUBBLE_CID_CAP)
             if n_fill:
                 print(f"  filled {n_fill} untitled title(s) from local bubbles/transcripts",
                       flush=True)
@@ -7008,7 +7059,8 @@ def scan_cursor(force=False):
         # Full-composer PR scan (not head/tail sampled) so older tool-only PRs
         # still reach refs — sampling alone kept only the newest visible URLs.
         # Skip bc-* / unattributed: those have no local bubbleId rows (cloud PRs
-        # come from GitHub enrichment instead).
+        # come from GitHub enrichment instead). Hard-capped: each cid is a
+        # value-LIKE pass and was a multi-minute cold-load cliff at 200+ chats.
         pr_cids = [
             cid for cid in (
                 {s["session_id"] for s in sessions if s.get("session_id")}
@@ -7017,10 +7069,13 @@ def scan_cursor(force=False):
             if cid and not cid.startswith("bc-") and cid != "_unattributed"
         ]
         t_pr = time.perf_counter()
-        n_pr_links, pr_day_hints = _inject_composer_pr_links(con, texts_by_cid, pr_cids)
+        # Re-open: the earlier `with connect()` may have closed before title fill.
+        with connect() as pr_con:
+            n_pr_links, pr_day_hints = _inject_composer_pr_links(
+                pr_con, texts_by_cid, pr_cids, meta=meta, limit=PR_FULLSCAN_CID_CAP)
         if n_pr_links or pr_cids:
             print(f"  full-scan PR links: +{n_pr_links} across {len(pr_day_hints)} chat(s) "
-                  f"({len(pr_cids)} composers, {time.perf_counter() - t_pr:.2f}s)",
+                  f"({len(pr_cids)} candidates, {time.perf_counter() - t_pr:.2f}s)",
                   flush=True)
 
         allow = JIRA_KEY_ALLOW | _dynamic_jira_keys(texts_by_cid.values())

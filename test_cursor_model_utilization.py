@@ -319,6 +319,16 @@ class ProjectsRollupTests(unittest.TestCase):
         self.assertEqual(roll["unattributed_cloud_sessions"], 1)
         self.assertAlmostEqual(roll["unattributed_cloud_usd"], 9.0, places=2)
 
+    def test_prioritize_bubble_text_skips_drafts_and_caps(self):
+        meta = {
+            "draft-1": {"title": "", "updated_ms": 90},
+            "bc-x": {"title": "", "updated_ms": 80},
+            "u1": {"title": "(untitled)", "updated_ms": 70},
+            "u2": {"title": "(untitled)", "updated_ms": 60},
+            "t1": {"title": "Named", "updated_ms": 50},
+        }
+        got = d._prioritize_cids_for_local_text(list(meta), meta, limit=2)
+        self.assertEqual(got, ["u1", "u2"])
 
 
 class SessionContextMarkupTests(unittest.TestCase):
